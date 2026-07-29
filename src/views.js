@@ -273,6 +273,10 @@ h3.sub-label{font-size:13px;font-weight:600;margin:0 0 8px}
 .code-chip.spent{opacity:.45;text-decoration:line-through}
 .codes-warn{font-size:13px;line-height:1.6;max-width:520px}
 .link-inline{color:var(--red-text);text-decoration:underline;font-weight:600}
+.title-label{font-size:12px;color:var(--red-text);font-weight:600}
+.title-edit{display:flex;gap:6px;margin-top:7px;max-width:290px}
+.title-edit input{font-size:12px;padding:6px 8px}
+.title-edit .btn{padding:6px 10px;font-size:12px;white-space:nowrap}
 .code-big{font-family:var(--font-mono);font-size:19px;letter-spacing:.08em;font-weight:700;display:block;margin:10px 0;padding:14px;background:var(--input-bg);border:1px solid var(--red-text);border-radius:var(--radius);text-align:center;word-break:break-all}
 </style>
 </head>
@@ -927,9 +931,15 @@ export function teamPage({
     .map((u) => {
       const isSelf = u.id === user.id;
       return `<tr>
-      <td class="strong">${esc(u.name)}${isSelf ? ' <span class="hint">(you)</span>' : ""}${
-        u.freelancer_name ? `<br/><span class="hint">profile: ${esc(u.freelancer_name)}</span>` : ""
-      }</td>
+      <td class="strong">${esc(u.name)}${isSelf ? ' <span class="hint">(you)</span>' : ""}
+        ${u.title ? `<br/><span class="title-label">${esc(u.title)}</span>` : ""}
+        ${u.freelancer_name ? `<br/><span class="hint">profile: ${esc(u.freelancer_name)}</span>` : ""}
+        <form method="post" action="/team/${u.id}/title" class="title-edit">
+          ${csrfField(csrf)}
+          <input name="title" value="${esc(u.title || "")}" placeholder="Add a job title" maxlength="60" />
+          <button type="submit" class="btn btn-sm">Save</button>
+        </form>
+      </td>
       <td class="muted">${esc(u.email)}</td>
       <td>${u.role === "founder" ? pill("founder", "green") : pill("freelancer")}</td>
       <td>${statusPill(u)}</td>
@@ -986,7 +996,8 @@ export function teamPage({
         <div class="form-grid">
           <div class="field"><label>Full name</label><input name="name" required placeholder="Somila" /></div>
           <div class="field"><label>Email</label><input name="email" type="email" required placeholder="somila@catalyst7.co.za" /></div>
-          <div class="field"><label>Role</label>
+          <div class="field"><label>Job title (optional)</label><input name="title" maxlength="60" placeholder="CEO / Co-Founder" /></div>
+          <div class="field"><label>Role &mdash; what they can access</label>
             <select name="role">
               <option value="founder">Founder &mdash; full access</option>
               <option value="freelancer">Freelancer &mdash; own weekly log only</option>
@@ -1059,6 +1070,7 @@ export function teamPage({
                 <option value="30">30 days</option>
               </select>
             </div>
+            <div class="field"><label>Job title for the account</label><input name="title" maxlength="60" placeholder="CEO / Co-Founder" /></div>
             <div class="field"><label>Note (who it's for)</label><input name="note" placeholder="Somila" /></div>
           </div>
           <button type="submit" class="btn btn-primary">Generate invite code</button>

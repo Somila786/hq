@@ -718,7 +718,7 @@ async function clearBackupCodes(env, userId) {
 // list has any business holding those in memory.
 async function listUsers(env) {
   const { results } = await env.DB.prepare(
-    `SELECT u.id, u.email, u.name, u.role, u.freelancer_id, u.created_at, u.totp_enabled,
+    `SELECT u.id, u.email, u.name, u.role, u.title, u.freelancer_id, u.created_at, u.totp_enabled,
             u.setup_token IS NOT NULL AS invite_pending,
             u.password_hash IS NOT NULL AS has_password,
             u.google_sub IS NOT NULL AS google_linked,
@@ -749,9 +749,17 @@ async function getFreelancersWithoutUser(env) {
 
 async function createUser(env, u) {
   return env.DB.prepare(
-    "INSERT INTO users (email, name, role, freelancer_id, setup_token) VALUES (?, ?, ?, ?, ?)"
+    "INSERT INTO users (email, name, role, title, freelancer_id, setup_token) VALUES (?, ?, ?, ?, ?, ?)"
   )
-    .bind(u.email, u.name, u.role, u.freelancer_id || null, u.setup_token)
+    .bind(u.email, u.name, u.role, u.title || null, u.freelancer_id || null, u.setup_token)
+    .run();
+}
+
+// Display label only -- deliberately cannot touch `role`, so an edit here can
+// never change what someone is allowed to see.
+async function setUserTitle(env, id, title) {
+  return env.DB.prepare("UPDATE users SET title = ? WHERE id = ?")
+    .bind(title || null, id)
     .run();
 }
 
@@ -792,10 +800,10 @@ async function countActiveFounders(env) {
 // ---- Registration invite codes ----
 async function createInviteCode(env, c) {
   await env.DB.prepare(
-    `INSERT INTO invite_codes (code_hash, role, freelancer_id, note, created_by, expires_at)
-     VALUES (?, ?, ?, ?, ?, ?)`
+    `INSERT INTO invite_codes (code_hash, role, freelancer_id, note, title, created_by, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
   )
-    .bind(c.code_hash, c.role, c.freelancer_id || null, c.note || null, c.created_by || null, c.expires_at)
+    .bind(c.code_hash, c.role, c.freelancer_id || null, c.note || null, c.title || null, c.created_by || null, c.expires_at)
     .run();
 }
 
@@ -823,7 +831,7 @@ async function consumeInviteCode(env, id, userId) {
 
 async function listInviteCodes(env) {
   const { results } = await env.DB.prepare(
-    `SELECT c.id, c.role, c.note, c.created_at, c.expires_at, c.used_at,
+    `SELECT c.id, c.role, c.note, c.title, c.created_at, c.expires_at, c.used_at,
             c.expires_at <= datetime('now') AS expired,
             f.name AS freelancer_name,
             cu.name AS created_by_name,
@@ -962,7 +970,7 @@ async function runRetentionScan(env) {
   return { leadsFlagged: staleLeads.length, freelancersFlagged: staleFreelancers.length };
 }
 
-return { getFreelancers, getFreelancerById, createFreelancer, setFreelancerActive, getClients, createClient, setClientStatus, getLeads, createLead, updateLeadStage, getRevenueEntries, createRevenueEntry, getWeeklyEntry, upsertWeeklyEntry, getFreelancerHistory, getDashboard, replaceBackupCodes, countUnusedBackupCodes, redeemBackupCode, clearBackupCodes, listUsers, getUserById, getFreelancersWithoutUser, createUser, reissueSetupToken, revokeUserAccess, countActiveFounders, createInviteCode, findOpenInviteCode, consumeInviteCode, listInviteCodes, revokeInviteCode, countOpenInviteCodes, getUserByEmail, bindGoogleSub, logAudit, getAuditLog, logError, getErrorLog, flagForRetentionReview, getOpenRetentionFlags, resolveRetentionFlag, eraseLeadPII, eraseFreelancerPII, runRetentionScan };
+return { getFreelancers, getFreelancerById, createFreelancer, setFreelancerActive, getClients, createClient, setClientStatus, getLeads, createLead, updateLeadStage, getRevenueEntries, createRevenueEntry, getWeeklyEntry, upsertWeeklyEntry, getFreelancerHistory, getDashboard, replaceBackupCodes, countUnusedBackupCodes, redeemBackupCode, clearBackupCodes, listUsers, getUserById, getFreelancersWithoutUser, createUser, setUserTitle, reissueSetupToken, revokeUserAccess, countActiveFounders, createInviteCode, findOpenInviteCode, consumeInviteCode, listInviteCodes, revokeInviteCode, countOpenInviteCodes, getUserByEmail, bindGoogleSub, logAudit, getAuditLog, logError, getErrorLog, flagForRetentionReview, getOpenRetentionFlags, resolveRetentionFlag, eraseLeadPII, eraseFreelancerPII, runRetentionScan };
 })();
 
 // ===================== src/views.js ====================
@@ -1243,6 +1251,10 @@ h3.sub-label{font-size:13px;font-weight:600;margin:0 0 8px}
 .code-chip.spent{opacity:.45;text-decoration:line-through}
 .codes-warn{font-size:13px;line-height:1.6;max-width:520px}
 .link-inline{color:var(--red-text);text-decoration:underline;font-weight:600}
+.title-label{font-size:12px;color:var(--red-text);font-weight:600}
+.title-edit{display:flex;gap:6px;margin-top:7px;max-width:290px}
+.title-edit input{font-size:12px;padding:6px 8px}
+.title-edit .btn{padding:6px 10px;font-size:12px;white-space:nowrap}
 .code-big{font-family:var(--font-mono);font-size:19px;letter-spacing:.08em;font-weight:700;display:block;margin:10px 0;padding:14px;background:var(--input-bg);border:1px solid var(--red-text);border-radius:var(--radius);text-align:center;word-break:break-all}
 </style>
 </head>
@@ -1897,9 +1909,15 @@ function teamPage({
     .map((u) => {
       const isSelf = u.id === user.id;
       return `<tr>
-      <td class="strong">${esc(u.name)}${isSelf ? ' <span class="hint">(you)</span>' : ""}${
-        u.freelancer_name ? `<br/><span class="hint">profile: ${esc(u.freelancer_name)}</span>` : ""
-      }</td>
+      <td class="strong">${esc(u.name)}${isSelf ? ' <span class="hint">(you)</span>' : ""}
+        ${u.title ? `<br/><span class="title-label">${esc(u.title)}</span>` : ""}
+        ${u.freelancer_name ? `<br/><span class="hint">profile: ${esc(u.freelancer_name)}</span>` : ""}
+        <form method="post" action="/team/${u.id}/title" class="title-edit">
+          ${csrfField(csrf)}
+          <input name="title" value="${esc(u.title || "")}" placeholder="Add a job title" maxlength="60" />
+          <button type="submit" class="btn btn-sm">Save</button>
+        </form>
+      </td>
       <td class="muted">${esc(u.email)}</td>
       <td>${u.role === "founder" ? pill("founder", "green") : pill("freelancer")}</td>
       <td>${statusPill(u)}</td>
@@ -1956,7 +1974,8 @@ function teamPage({
         <div class="form-grid">
           <div class="field"><label>Full name</label><input name="name" required placeholder="Somila" /></div>
           <div class="field"><label>Email</label><input name="email" type="email" required placeholder="somila@catalyst7.co.za" /></div>
-          <div class="field"><label>Role</label>
+          <div class="field"><label>Job title (optional)</label><input name="title" maxlength="60" placeholder="CEO / Co-Founder" /></div>
+          <div class="field"><label>Role &mdash; what they can access</label>
             <select name="role">
               <option value="founder">Founder &mdash; full access</option>
               <option value="freelancer">Freelancer &mdash; own weekly log only</option>
@@ -2029,6 +2048,7 @@ function teamPage({
                 <option value="30">30 days</option>
               </select>
             </div>
+            <div class="field"><label>Job title for the account</label><input name="title" maxlength="60" placeholder="CEO / Co-Founder" /></div>
             <div class="field"><label>Note (who it's for)</label><input name="note" placeholder="Somila" /></div>
           </div>
           <button type="submit" class="btn btn-primary">Generate invite code</button>
@@ -2622,6 +2642,9 @@ export default {
           email,
           name,
           role: invite.role,
+          // Like the role, the title comes from the code a founder issued,
+          // not from anything the person registering typed.
+          title: invite.title,
           freelancer_id: invite.freelancer_id,
           setup_token: null,
         });
@@ -3044,7 +3067,14 @@ export default {
           }
 
           const token = randomToken();
-          await db.createUser(env, { email, name, role, freelancer_id: freelancerId, setup_token: token });
+          await db.createUser(env, {
+            email,
+            name,
+            role,
+            title: (f.title || "").trim() || null,
+            freelancer_id: freelancerId,
+            setup_token: token,
+          });
           await db.logAudit(env, user, role === "founder" ? "founder_created" : "user_created", "user", null, `${name} <${email}>`);
 
           return html(
@@ -3076,6 +3106,22 @@ export default {
           );
         }
 
+        // Titles are a display label. This route deliberately cannot touch
+        // `role`, so editing one can never change what anyone may see.
+        const teamTitle = path.match(/^\/team\/(\d+)\/title$/);
+        if (teamTitle && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          const target = await db.getUserById(env, teamTitle[1]);
+          if (!target) return html(views.errorPage("That account no longer exists.", 404, theme), 404);
+
+          const title = (f.title || "").trim().slice(0, 60);
+          await db.setUserTitle(env, target.id, title);
+          await db.logAudit(env, user, "title_changed", "user", target.id, `${target.name}: ${title || "(cleared)"}`);
+          return html(await teamPage({ message: `Updated ${target.name}'s title.` }));
+        }
+
         // ---- Invite codes for self-service registration ----
         if (path === "/team/codes" && method === "POST") {
           const f = await readForm(request);
@@ -3105,6 +3151,7 @@ export default {
             role,
             freelancer_id: freelancerId,
             note: (f.note || "").trim() || null,
+            title: (f.title || "").trim() || null,
             created_by: user.id,
             expires_at: new Date(Date.now() + days * 86400000).toISOString(),
           });

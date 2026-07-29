@@ -28,7 +28,9 @@ CREATE TABLE IF NOT EXISTS users (
   totp_enabled INTEGER DEFAULT 0,
   -- Google's stable subject id, bound on first Google sign-in. Email addresses
   -- can be reassigned; `sub` cannot, so this is what we pin identity to.
-  google_sub TEXT
+  google_sub TEXT,
+  -- Display label only ("CEO / Co-Founder"). Access is decided by `role`.
+  title TEXT
 );
 
 CREATE TABLE IF NOT EXISTS clients (
@@ -163,7 +165,8 @@ CREATE TABLE IF NOT EXISTS invite_codes (
   created_at TEXT DEFAULT (datetime('now')),
   expires_at TEXT NOT NULL,
   used_by INTEGER REFERENCES users(id),
-  used_at TEXT
+  used_at TEXT,
+  title TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_invite_codes_open ON invite_codes (used_at, expires_at);

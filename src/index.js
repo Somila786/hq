@@ -454,6 +454,9 @@ export default {
           email,
           name,
           role: invite.role,
+          // Like the role, the title comes from the code a founder issued,
+          // not from anything the person registering typed.
+          title: invite.title,
           freelancer_id: invite.freelancer_id,
           setup_token: null,
         });
@@ -876,7 +879,14 @@ export default {
           }
 
           const token = randomToken();
-          await db.createUser(env, { email, name, role, freelancer_id: freelancerId, setup_token: token });
+          await db.createUser(env, {
+            email,
+            name,
+            role,
+            title: (f.title || "").trim() || null,
+            freelancer_id: freelancerId,
+            setup_token: token,
+          });
           await db.logAudit(env, user, role === "founder" ? "founder_created" : "user_created", "user", null, `${name} <${email}>`);
 
           return html(
@@ -908,6 +918,22 @@ export default {
           );
         }
 
+        // Titles are a display label. This route deliberately cannot touch
+        // `role`, so editing one can never change what anyone may see.
+        const teamTitle = path.match(/^\/team\/(\d+)\/title$/);
+        if (teamTitle && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          const target = await db.getUserById(env, teamTitle[1]);
+          if (!target) return html(views.errorPage("That account no longer exists.", 404, theme), 404);
+
+          const title = (f.title || "").trim().slice(0, 60);
+          await db.setUserTitle(env, target.id, title);
+          await db.logAudit(env, user, "title_changed", "user", target.id, `${target.name}: ${title || "(cleared)"}`);
+          return html(await teamPage({ message: `Updated ${target.name}'s title.` }));
+        }
+
         // ---- Invite codes for self-service registration ----
         if (path === "/team/codes" && method === "POST") {
           const f = await readForm(request);
@@ -937,6 +963,7 @@ export default {
             role,
             freelancer_id: freelancerId,
             note: (f.note || "").trim() || null,
+            title: (f.title || "").trim() || null,
             created_by: user.id,
             expires_at: new Date(Date.now() + days * 86400000).toISOString(),
           });

@@ -246,7 +246,7 @@ export async function clearBackupCodes(env, userId) {
 // list has any business holding those in memory.
 export async function listUsers(env) {
   const { results } = await env.DB.prepare(
-    `SELECT u.id, u.email, u.name, u.role, u.freelancer_id, u.created_at, u.totp_enabled,
+    `SELECT u.id, u.email, u.name, u.role, u.title, u.freelancer_id, u.created_at, u.totp_enabled,
             u.setup_token IS NOT NULL AS invite_pending,
             u.password_hash IS NOT NULL AS has_password,
             u.google_sub IS NOT NULL AS google_linked,
@@ -277,9 +277,17 @@ export async function getFreelancersWithoutUser(env) {
 
 export async function createUser(env, u) {
   return env.DB.prepare(
-    "INSERT INTO users (email, name, role, freelancer_id, setup_token) VALUES (?, ?, ?, ?, ?)"
+    "INSERT INTO users (email, name, role, title, freelancer_id, setup_token) VALUES (?, ?, ?, ?, ?, ?)"
   )
-    .bind(u.email, u.name, u.role, u.freelancer_id || null, u.setup_token)
+    .bind(u.email, u.name, u.role, u.title || null, u.freelancer_id || null, u.setup_token)
+    .run();
+}
+
+// Display label only -- deliberately cannot touch `role`, so an edit here can
+// never change what someone is allowed to see.
+export async function setUserTitle(env, id, title) {
+  return env.DB.prepare("UPDATE users SET title = ? WHERE id = ?")
+    .bind(title || null, id)
     .run();
 }
 
@@ -320,10 +328,10 @@ export async function countActiveFounders(env) {
 // ---- Registration invite codes ----
 export async function createInviteCode(env, c) {
   await env.DB.prepare(
-    `INSERT INTO invite_codes (code_hash, role, freelancer_id, note, created_by, expires_at)
-     VALUES (?, ?, ?, ?, ?, ?)`
+    `INSERT INTO invite_codes (code_hash, role, freelancer_id, note, title, created_by, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
   )
-    .bind(c.code_hash, c.role, c.freelancer_id || null, c.note || null, c.created_by || null, c.expires_at)
+    .bind(c.code_hash, c.role, c.freelancer_id || null, c.note || null, c.title || null, c.created_by || null, c.expires_at)
     .run();
 }
 
@@ -351,7 +359,7 @@ export async function consumeInviteCode(env, id, userId) {
 
 export async function listInviteCodes(env) {
   const { results } = await env.DB.prepare(
-    `SELECT c.id, c.role, c.note, c.created_at, c.expires_at, c.used_at,
+    `SELECT c.id, c.role, c.note, c.title, c.created_at, c.expires_at, c.used_at,
             c.expires_at <= datetime('now') AS expired,
             f.name AS freelancer_name,
             cu.name AS created_by_name,

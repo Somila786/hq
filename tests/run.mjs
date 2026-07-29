@@ -1341,6 +1341,84 @@ await test("team mutations are behind CSRF", async () => {
   assert(stillThere.password_hash, "freelancer's access untouched");
 });
 
+console.log("\nJob titles");
+
+await test("a title can be set when adding someone, and edited afterwards", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+
+  await worker.fetch(
+    req("/team", {
+      method: "POST",
+      cookies: { c7_session: session },
+      form: { name: "Somila Tenza Sogaxa", email: "somila@catalyst7.co.za", role: "founder", title: "CEO / Co-Founder", _csrf: csrf },
+    }),
+    env
+  );
+  const somila = await db.getUserByEmail(env, "somila@catalyst7.co.za");
+  eq(somila.title, "CEO / Co-Founder", "title stored on creation");
+
+  const page = await (await worker.fetch(req("/team", { cookies: { c7_session: session } }), env)).text();
+  has(page, "CEO / Co-Founder", "shown on the team page");
+
+  const edit = await worker.fetch(
+    req(`/team/${somila.id}/title`, { method: "POST", cookies: { c7_session: session }, form: { title: "Chief Executive", _csrf: csrf } }),
+    env
+  );
+  eq(edit.status, 200, "edit accepted");
+  eq((await db.getUserById(env, somila.id)).title, "Chief Executive", "title updated");
+  assert((await auditActions(env)).includes("title_changed"), "audited");
+
+  // Clearing it is allowed and stores NULL rather than an empty string.
+  await worker.fetch(
+    req(`/team/${somila.id}/title`, { method: "POST", cookies: { c7_session: session }, form: { title: "  ", _csrf: csrf } }),
+    env
+  );
+  eq((await db.getUserById(env, somila.id)).title, null, "blank clears the title");
+});
+
+await test("a title is cosmetic — it never changes what someone can access", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const fl = await seedFreelancer(env);
+
+  // Give a freelancer the grandest title available.
+  await worker.fetch(
+    req(`/team/${fl.userId}/title`, { method: "POST", cookies: { c7_session: session }, form: { title: "CEO / Co-Founder", _csrf: csrf } }),
+    env
+  );
+  const after = await db.getUserById(env, fl.userId);
+  eq(after.title, "CEO / Co-Founder", "title applied");
+  eq(after.role, "freelancer", "role untouched by a title edit");
+
+  const { session: theirs } = await login(env, fl.email, FREELANCER_PW);
+  for (const p of ["/dashboard", "/team", "/revenue", "/audit"]) {
+    eq((await worker.fetch(req(p, { cookies: { c7_session: theirs } }), env)).status, 404, `${p} still closed to them`);
+  }
+  eq((await worker.fetch(req("/log", { cookies: { c7_session: theirs } }), env)).status, 200, "their own log still works");
+});
+
+await test("titles are founder-only to edit and behind CSRF", async () => {
+  const env = makeEnv();
+  const { session } = await founderSession(env);
+  const fl = await seedFreelancer(env);
+
+  const noCsrf = await worker.fetch(
+    req(`/team/${fl.userId}/title`, { method: "POST", cookies: { c7_session: session }, form: { title: "Nope" } }),
+    env
+  );
+  eq(noCsrf.status, 403, "CSRF enforced");
+
+  const { session: theirs } = await login(env, fl.email, FREELANCER_PW);
+  const theirCsrf = await csrfFor(env, theirs);
+  const asFreelancer = await worker.fetch(
+    req(`/team/${fl.userId}/title`, { method: "POST", cookies: { c7_session: theirs }, form: { title: "CEO", _csrf: theirCsrf } }),
+    env
+  );
+  eq(asFreelancer.status, 404, "a freelancer cannot retitle themselves");
+  eq((await db.getUserById(env, fl.userId)).title, null, "unchanged");
+});
+
 console.log("\nSelf-service registration (invite codes)");
 
 // Mints a code the way a founder does, and returns the plaintext.
