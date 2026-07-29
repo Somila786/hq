@@ -319,6 +319,30 @@ function looksLikeBackupCode(input) {
   return normalizeBackupCode(input).length === BACKUP_CODE_LEN;
 }
 
+// ---- Registration invite codes ----
+// The code IS the authorisation to create an account, so it's treated like a
+// credential: high entropy, stored hashed, shown to the founder once.
+// Same SHA-256 reasoning as backup codes -- 75 bits of CSPRNG output has no
+// dictionary to stretch against.
+function generateInviteCode() {
+  const bytes = new Uint8Array(15);
+  crypto.getRandomValues(bytes);
+  let out = "";
+  for (const b of bytes) out += BACKUP_ALPHABET[b % BACKUP_ALPHABET.length];
+  return `${out.slice(0, 5)}-${out.slice(5, 10)}-${out.slice(10)}`;
+}
+
+function normalizeInviteCode(code) {
+  return String(code || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+}
+
+async function hashInviteCode(code) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(normalizeInviteCode(code)));
+  return bytesToHex(new Uint8Array(digest));
+}
+
 // ---- Google sign-in (OAuth 2.0 authorization code + PKCE) ----
 // No library: the whole flow is two fetches and some claim checking.
 
@@ -765,6 +789,67 @@ async function countActiveFounders(env) {
   return row.n;
 }
 
+// ---- Registration invite codes ----
+async function createInviteCode(env, c) {
+  await env.DB.prepare(
+    `INSERT INTO invite_codes (code_hash, role, freelancer_id, note, created_by, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  )
+    .bind(c.code_hash, c.role, c.freelancer_id || null, c.note || null, c.created_by || null, c.expires_at)
+    .run();
+}
+
+// Only ever returns a code that is unused AND unexpired -- the two conditions
+// live here rather than at the call site so no route can forget one.
+async function findOpenInviteCode(env, codeHash) {
+  return env.DB.prepare(
+    `SELECT * FROM invite_codes
+     WHERE code_hash = ? AND used_at IS NULL AND expires_at > datetime('now')`
+  )
+    .bind(codeHash)
+    .first();
+}
+
+// The `used_at IS NULL` guard makes redemption single-use even if two
+// registrations race for the same code.
+async function consumeInviteCode(env, id, userId) {
+  const res = await env.DB.prepare(
+    "UPDATE invite_codes SET used_at = datetime('now'), used_by = ? WHERE id = ? AND used_at IS NULL"
+  )
+    .bind(userId, id)
+    .run();
+  return res.meta.changes === 1;
+}
+
+async function listInviteCodes(env) {
+  const { results } = await env.DB.prepare(
+    `SELECT c.id, c.role, c.note, c.created_at, c.expires_at, c.used_at,
+            c.expires_at <= datetime('now') AS expired,
+            f.name AS freelancer_name,
+            cu.name AS created_by_name,
+            uu.name AS used_by_name
+     FROM invite_codes c
+     LEFT JOIN freelancers f ON f.id = c.freelancer_id
+     LEFT JOIN users cu ON cu.id = c.created_by
+     LEFT JOIN users uu ON uu.id = c.used_by
+     ORDER BY c.used_at IS NOT NULL, c.created_at DESC
+     LIMIT 50`
+  ).all();
+  return results;
+}
+
+async function revokeInviteCode(env, id) {
+  const res = await env.DB.prepare("DELETE FROM invite_codes WHERE id = ? AND used_at IS NULL").bind(id).run();
+  return res.meta.changes === 1;
+}
+
+async function countOpenInviteCodes(env) {
+  const row = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM invite_codes WHERE used_at IS NULL AND expires_at > datetime('now')"
+  ).first();
+  return row.n;
+}
+
 // ---- Google account binding ----
 async function getUserByEmail(env, email) {
   return env.DB.prepare("SELECT * FROM users WHERE email = ?").bind(email).first();
@@ -877,7 +962,7 @@ async function runRetentionScan(env) {
   return { leadsFlagged: staleLeads.length, freelancersFlagged: staleFreelancers.length };
 }
 
-return { getFreelancers, getFreelancerById, createFreelancer, setFreelancerActive, getClients, createClient, setClientStatus, getLeads, createLead, updateLeadStage, getRevenueEntries, createRevenueEntry, getWeeklyEntry, upsertWeeklyEntry, getFreelancerHistory, getDashboard, replaceBackupCodes, countUnusedBackupCodes, redeemBackupCode, clearBackupCodes, listUsers, getUserById, getFreelancersWithoutUser, createUser, reissueSetupToken, revokeUserAccess, countActiveFounders, getUserByEmail, bindGoogleSub, logAudit, getAuditLog, logError, getErrorLog, flagForRetentionReview, getOpenRetentionFlags, resolveRetentionFlag, eraseLeadPII, eraseFreelancerPII, runRetentionScan };
+return { getFreelancers, getFreelancerById, createFreelancer, setFreelancerActive, getClients, createClient, setClientStatus, getLeads, createLead, updateLeadStage, getRevenueEntries, createRevenueEntry, getWeeklyEntry, upsertWeeklyEntry, getFreelancerHistory, getDashboard, replaceBackupCodes, countUnusedBackupCodes, redeemBackupCode, clearBackupCodes, listUsers, getUserById, getFreelancersWithoutUser, createUser, reissueSetupToken, revokeUserAccess, countActiveFounders, createInviteCode, findOpenInviteCode, consumeInviteCode, listInviteCodes, revokeInviteCode, countOpenInviteCodes, getUserByEmail, bindGoogleSub, logAudit, getAuditLog, logError, getErrorLog, flagForRetentionReview, getOpenRetentionFlags, resolveRetentionFlag, eraseLeadPII, eraseFreelancerPII, runRetentionScan };
 })();
 
 // ===================== src/views.js ====================
@@ -1157,6 +1242,8 @@ h3.sub-label{font-size:13px;font-weight:600;margin:0 0 8px}
 .code-chip{font-family:var(--font-mono);font-size:13.5px;letter-spacing:.04em;background:var(--input-bg);border:1px solid var(--border);border-radius:var(--radius);padding:9px 12px;text-align:center}
 .code-chip.spent{opacity:.45;text-decoration:line-through}
 .codes-warn{font-size:13px;line-height:1.6;max-width:520px}
+.link-inline{color:var(--red-text);text-decoration:underline;font-weight:600}
+.code-big{font-family:var(--font-mono);font-size:19px;letter-spacing:.08em;font-weight:700;display:block;margin:10px 0;padding:14px;background:var(--input-bg);border:1px solid var(--red-text);border-radius:var(--radius);text-align:center;word-break:break-all}
 </style>
 </head>
 <body>
@@ -1194,7 +1281,30 @@ function loginPage({ error, theme, googleEnabled = false } = {}) {
         <div class="field"><label>Password</label><input type="password" name="password" required placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;" /></div>
         <button type="submit" class="btn btn-primary">Continue</button>
       </form>
-      <div class="helper">Forgot password? Ask a founder to reset it from Freelancers or Clients.</div>
+      <div class="helper">Have an invite code? <a href="/register" class="link-inline">Create your account</a>.<br />Forgot your password? Ask a founder to send you a new invite link.</div>
+    </div>`,
+  });
+}
+
+// ---------- Public: self-service registration (invite code required) ----------
+function registerPage({ error, theme, name = "", email = "" } = {}) {
+  return layout({
+    title: "Create your account",
+    theme,
+    body: `
+    <div class="authcard">
+      <h1>Create your account</h1>
+      <p class="lead">You'll need an invite code from one of the founders. The code decides what you can see once you're in.</p>
+      ${error ? `<div class="msg msg-error">${esc(error)}</div>` : ""}
+      <form class="plain" method="post" action="/register">
+        <div class="field"><label>Invite code</label><input name="code" required autofocus placeholder="XXXXX-XXXXX-XXXXX" autocapitalize="characters" spellcheck="false" /></div>
+        <div class="field"><label>Full name</label><input name="name" required value="${esc(name)}" placeholder="Somila Tenza Sogaxa" /></div>
+        <div class="field"><label>Email</label><input type="email" name="email" required value="${esc(email)}" placeholder="you@catalyst7.co.za" /></div>
+        <div class="field"><label>Password (min 8 characters)</label><input type="password" name="password" minlength="8" required placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;" /></div>
+        <div class="field"><label>Confirm password</label><input type="password" name="confirm" minlength="8" required placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;" /></div>
+        <button type="submit" class="btn btn-primary">Create account</button>
+      </form>
+      <div class="helper">Already have an account? <a href="/login" class="link-inline">Sign in</a>.</div>
     </div>`,
   });
 }
@@ -1767,12 +1877,15 @@ function teamPage({
   user,
   users,
   unlinkedFreelancers = [],
+  inviteCodes = [],
+  registerUrl = "/register",
   csrf,
   theme,
   error,
   message,
   inviteLink,
   inviteFor,
+  newCode,
 }) {
   const statusPill = (u) => {
     if (u.has_password) return pill("active", "green");
@@ -1874,6 +1987,79 @@ function teamPage({
           rows
             ? `<table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th>Sign-in</th><th class="right">Actions</th></tr></thead><tbody>${rows}</tbody></table>`
             : `<div class="empty">No accounts yet.</div>`
+        }
+      </div>
+    </div>
+
+    <h2 class="section-label" style="margin-top:32px">Invite codes</h2>
+    <div class="panel">
+      <div class="security-body">
+        <div class="security-copy" style="margin-bottom:16px">
+          An invite code lets someone create their own account at <span class="mono-box" style="display:inline-block;margin:0">${esc(
+            registerUrl
+          )}</span> — they choose their own name, email and password. <strong>The code decides their role, not them.</strong> Each code works once and expires.
+        </div>
+        ${
+          newCode
+            ? `<div class="msg msg-ok codes-warn"><strong>Send this to them now — it isn't shown again.</strong><span class="code-big">${esc(
+                newCode
+              )}</span>Along with the link: ${esc(registerUrl)}</div>`
+            : ""
+        }
+        <form method="post" action="/team/codes">
+          ${csrfField(csrf)}
+          <div class="form-grid" style="padding:0 0 14px">
+            <div class="field"><label>Role this code creates</label>
+              <select name="role">
+                <option value="founder">Founder &mdash; full access</option>
+                <option value="freelancer">Freelancer &mdash; own weekly log only</option>
+              </select>
+            </div>
+            <div class="field"><label>Freelancer profile (freelancer codes only)</label>
+              <select name="freelancer_id">
+                <option value="">&mdash;</option>
+                ${unlinkedFreelancers.map((f) => `<option value="${f.id}">${esc(f.name)}</option>`).join("")}
+              </select>
+            </div>
+            <div class="field"><label>Expires after</label>
+              <select name="expires_days">
+                <option value="1">1 day</option>
+                <option value="7" selected>7 days</option>
+                <option value="14">14 days</option>
+                <option value="30">30 days</option>
+              </select>
+            </div>
+            <div class="field"><label>Note (who it's for)</label><input name="note" placeholder="Somila" /></div>
+          </div>
+          <button type="submit" class="btn btn-primary">Generate invite code</button>
+        </form>
+      </div>
+      <div class="table-wrap">
+        ${
+          inviteCodes.length
+            ? `<table><thead><tr><th>For</th><th>Role</th><th>Status</th><th>Expires</th><th class="right">Action</th></tr></thead><tbody>${inviteCodes
+                .map((c) => {
+                  const status = c.used_at
+                    ? pill(`used by ${c.used_by_name || "someone"}`, "green")
+                    : c.expired
+                      ? pill("expired", "red")
+                      : pill("open");
+                  return `<tr>
+                    <td class="strong">${esc(c.note || "—")}${c.freelancer_name ? `<br/><span class="hint">${esc(c.freelancer_name)}</span>` : ""}</td>
+                    <td class="muted" style="text-transform:capitalize">${esc(c.role)}</td>
+                    <td>${status}</td>
+                    <td class="mono muted nowrap">${esc(String(c.expires_at).slice(0, 10))}</td>
+                    <td class="right">${
+                      c.used_at || c.expired
+                        ? ""
+                        : `<form method="post" action="/team/codes/${c.id}/revoke" class="row-actions">${csrfField(
+                            csrf
+                          )}<button type="submit" class="btn btn-sm btn-danger">Cancel</button></form>`
+                    }</td>
+                  </tr>`;
+                })
+                .join("")}</tbody></table>`
+            : `<div class="empty">No invite codes yet.</div>`
         }
       </div>
     </div>
@@ -2018,7 +2204,7 @@ function errorPage(message, status = 400, theme = "dark") {
   });
 }
 
-return { loginPage, totpVerifyPage, setupPage, securityPage, dashboardPage, freelancersPage, clientsPage, leadsPage, revenuePage, logPage, historyPage, teamPage, auditPage, errorsPage, retentionPage, errorPage };
+return { loginPage, registerPage, totpVerifyPage, setupPage, securityPage, dashboardPage, freelancersPage, clientsPage, leadsPage, revenuePage, logPage, historyPage, teamPage, auditPage, errorsPage, retentionPage, errorPage };
 })();
 
 // ===================== src/index.js ====================
@@ -2368,6 +2554,92 @@ export default {
         return redirect("/", {
           "Set-Cookie": [sessionCookie(token), clearPendingCookie()],
         });
+      }
+
+      // ---------- Public: self-service registration ----------
+      // Public, but not open: an invite code is required, and the code -- not
+      // the form -- decides the role. Someone posting role=founder here gets
+      // whatever their code says, which is the whole point.
+      if (path === "/register" && method === "GET") {
+        const existing = await getSessionUser(request, env);
+        if (existing) return redirect("/");
+        return html(views.registerPage({ theme }));
+      }
+
+      if (path === "/register" && method === "POST") {
+        const ip = clientIp(request);
+        // Codes are 75 bits, but rate limiting the endpoint stops anyone
+        // grinding at it and keeps the attempt in the same audit trail as
+        // failed logins.
+        const rlKey = "register";
+        const limit = await checkRateLimit(env, rlKey, ip);
+        if (limit.blocked) {
+          return html(views.registerPage({ theme, error: limit.reason }), 429);
+        }
+
+        const f = await readForm(request);
+        const name = (f.name || "").trim();
+        const email = (f.email || "").trim().toLowerCase();
+        const password = f.password || "";
+        const submitted = f.code || "";
+
+        const reject = async (msg, status = 400, countsAsAttempt = true) => {
+          if (countsAsAttempt) await recordLoginAttempt(env, rlKey, ip, false);
+          return html(views.registerPage({ theme, error: msg, name, email }), status);
+        };
+
+        if (!name || !email || !password || !submitted) {
+          return reject("Every field is required.", 400, false);
+        }
+        if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+          return reject("That doesn't look like a valid email address.", 400, false);
+        }
+        if (password.length < 8) {
+          return reject("Password must be at least 8 characters.", 400, false);
+        }
+        if (password !== f.confirm) {
+          return reject("Passwords don't match.", 400, false);
+        }
+
+        const invite = await db.findOpenInviteCode(env, await hashInviteCode(submitted));
+        if (!invite) {
+          // Deliberately vague: don't distinguish wrong / used / expired, or
+          // this becomes an oracle for probing codes.
+          return reject("That invite code isn't valid. Ask a founder for a new one.", 403);
+        }
+
+        if (await db.getUserByEmail(env, email)) {
+          return reject(`${email} already has an account. Try signing in instead.`, 409, false);
+        }
+
+        // Freelancer codes carry the profile they belong to, so the account is
+        // never created in the broken unlinked state.
+        if (invite.role === "freelancer" && !invite.freelancer_id) {
+          return reject("That code is misconfigured — ask a founder to issue a new one.", 400, false);
+        }
+
+        await db.createUser(env, {
+          email,
+          name,
+          role: invite.role,
+          freelancer_id: invite.freelancer_id,
+          setup_token: null,
+        });
+        const created = await db.getUserByEmail(env, email);
+
+        // Consume before issuing a session. If two requests race, the loser
+        // gets nothing usable.
+        if (!(await db.consumeInviteCode(env, invite.id, created.id))) {
+          await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(created.id).run();
+          return reject("That invite code was just used by someone else.", 409, false);
+        }
+
+        await setPassword(env, created.id, password);
+        await recordLoginAttempt(env, rlKey, ip, true);
+        await db.logAudit(env, created, "account_registered", "user", created.id, `${invite.role} via invite code`);
+
+        const token = await createSession(env, created.id);
+        return redirect("/", { "Set-Cookie": sessionCookie(token) });
       }
 
       // ---------- Public: first-time setup / invite ----------
@@ -2724,6 +2996,8 @@ export default {
             theme,
             users: await db.listUsers(env),
             unlinkedFreelancers: await db.getFreelancersWithoutUser(env),
+            inviteCodes: await db.listInviteCodes(env),
+            registerUrl: `${url.origin}/register`,
             ...extra,
           });
 
@@ -2798,6 +3072,62 @@ export default {
               message: `New link for ${target.name}. Any previous link or password for this account has stopped working.`,
               inviteLink: `${url.origin}/setup/${token}`,
               inviteFor: target.name,
+            })
+          );
+        }
+
+        // ---- Invite codes for self-service registration ----
+        if (path === "/team/codes" && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+
+          const role = f.role === "founder" ? "founder" : f.role === "freelancer" ? "freelancer" : null;
+          if (!role) return html(await teamPage({ error: "Pick a role for the code." }), 400);
+
+          let freelancerId = null;
+          if (role === "freelancer") {
+            const available = await db.getFreelancersWithoutUser(env);
+            const chosen = available.find((x) => String(x.id) === String(f.freelancer_id));
+            if (!chosen) {
+              return html(
+                await teamPage({ error: "A freelancer code has to name which freelancer profile it's for." }),
+                400
+              );
+            }
+            freelancerId = chosen.id;
+          }
+
+          const days = Math.min(Math.max(parseInt(f.expires_days || "7", 10) || 7, 1), 30);
+          const code = generateInviteCode();
+          await db.createInviteCode(env, {
+            code_hash: await hashInviteCode(code),
+            role,
+            freelancer_id: freelancerId,
+            note: (f.note || "").trim() || null,
+            created_by: user.id,
+            expires_at: new Date(Date.now() + days * 86400000).toISOString(),
+          });
+          await db.logAudit(env, user, "invite_code_created", "user", null, `${role}, expires in ${days}d${f.note ? " — " + f.note : ""}`);
+
+          return html(
+            await teamPage({
+              message: `Invite code created. It works once, expires in ${days} day${days === 1 ? "" : "s"}, and creates a ${role} account.`,
+              newCode: code,
+            })
+          );
+        }
+
+        const codeRevoke = path.match(/^\/team\/codes\/(\d+)\/revoke$/);
+        if (codeRevoke && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          const gone = await db.revokeInviteCode(env, codeRevoke[1]);
+          await db.logAudit(env, user, "invite_code_revoked", "user", null, gone ? "revoked" : "already used or gone");
+          return html(
+            await teamPage({
+              message: gone ? "That invite code has been cancelled." : "That code was already used or no longer exists.",
             })
           );
         }

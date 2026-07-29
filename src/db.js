@@ -317,6 +317,67 @@ export async function countActiveFounders(env) {
   return row.n;
 }
 
+// ---- Registration invite codes ----
+export async function createInviteCode(env, c) {
+  await env.DB.prepare(
+    `INSERT INTO invite_codes (code_hash, role, freelancer_id, note, created_by, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  )
+    .bind(c.code_hash, c.role, c.freelancer_id || null, c.note || null, c.created_by || null, c.expires_at)
+    .run();
+}
+
+// Only ever returns a code that is unused AND unexpired -- the two conditions
+// live here rather than at the call site so no route can forget one.
+export async function findOpenInviteCode(env, codeHash) {
+  return env.DB.prepare(
+    `SELECT * FROM invite_codes
+     WHERE code_hash = ? AND used_at IS NULL AND expires_at > datetime('now')`
+  )
+    .bind(codeHash)
+    .first();
+}
+
+// The `used_at IS NULL` guard makes redemption single-use even if two
+// registrations race for the same code.
+export async function consumeInviteCode(env, id, userId) {
+  const res = await env.DB.prepare(
+    "UPDATE invite_codes SET used_at = datetime('now'), used_by = ? WHERE id = ? AND used_at IS NULL"
+  )
+    .bind(userId, id)
+    .run();
+  return res.meta.changes === 1;
+}
+
+export async function listInviteCodes(env) {
+  const { results } = await env.DB.prepare(
+    `SELECT c.id, c.role, c.note, c.created_at, c.expires_at, c.used_at,
+            c.expires_at <= datetime('now') AS expired,
+            f.name AS freelancer_name,
+            cu.name AS created_by_name,
+            uu.name AS used_by_name
+     FROM invite_codes c
+     LEFT JOIN freelancers f ON f.id = c.freelancer_id
+     LEFT JOIN users cu ON cu.id = c.created_by
+     LEFT JOIN users uu ON uu.id = c.used_by
+     ORDER BY c.used_at IS NOT NULL, c.created_at DESC
+     LIMIT 50`
+  ).all();
+  return results;
+}
+
+export async function revokeInviteCode(env, id) {
+  const res = await env.DB.prepare("DELETE FROM invite_codes WHERE id = ? AND used_at IS NULL").bind(id).run();
+  return res.meta.changes === 1;
+}
+
+export async function countOpenInviteCodes(env) {
+  const row = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM invite_codes WHERE used_at IS NULL AND expires_at > datetime('now')"
+  ).first();
+  return row.n;
+}
+
 // ---- Google account binding ----
 export async function getUserByEmail(env, email) {
   return env.DB.prepare("SELECT * FROM users WHERE email = ?").bind(email).first();

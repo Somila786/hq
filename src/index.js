@@ -25,6 +25,8 @@ import {
   generateBackupCodes,
   hashBackupCode,
   looksLikeBackupCode,
+  generateInviteCode,
+  hashInviteCode,
   googleConfigured,
   googleAuthUrl,
   exchangeGoogleCode,
@@ -386,6 +388,92 @@ export default {
         });
       }
 
+      // ---------- Public: self-service registration ----------
+      // Public, but not open: an invite code is required, and the code -- not
+      // the form -- decides the role. Someone posting role=founder here gets
+      // whatever their code says, which is the whole point.
+      if (path === "/register" && method === "GET") {
+        const existing = await getSessionUser(request, env);
+        if (existing) return redirect("/");
+        return html(views.registerPage({ theme }));
+      }
+
+      if (path === "/register" && method === "POST") {
+        const ip = clientIp(request);
+        // Codes are 75 bits, but rate limiting the endpoint stops anyone
+        // grinding at it and keeps the attempt in the same audit trail as
+        // failed logins.
+        const rlKey = "register";
+        const limit = await checkRateLimit(env, rlKey, ip);
+        if (limit.blocked) {
+          return html(views.registerPage({ theme, error: limit.reason }), 429);
+        }
+
+        const f = await readForm(request);
+        const name = (f.name || "").trim();
+        const email = (f.email || "").trim().toLowerCase();
+        const password = f.password || "";
+        const submitted = f.code || "";
+
+        const reject = async (msg, status = 400, countsAsAttempt = true) => {
+          if (countsAsAttempt) await recordLoginAttempt(env, rlKey, ip, false);
+          return html(views.registerPage({ theme, error: msg, name, email }), status);
+        };
+
+        if (!name || !email || !password || !submitted) {
+          return reject("Every field is required.", 400, false);
+        }
+        if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+          return reject("That doesn't look like a valid email address.", 400, false);
+        }
+        if (password.length < 8) {
+          return reject("Password must be at least 8 characters.", 400, false);
+        }
+        if (password !== f.confirm) {
+          return reject("Passwords don't match.", 400, false);
+        }
+
+        const invite = await db.findOpenInviteCode(env, await hashInviteCode(submitted));
+        if (!invite) {
+          // Deliberately vague: don't distinguish wrong / used / expired, or
+          // this becomes an oracle for probing codes.
+          return reject("That invite code isn't valid. Ask a founder for a new one.", 403);
+        }
+
+        if (await db.getUserByEmail(env, email)) {
+          return reject(`${email} already has an account. Try signing in instead.`, 409, false);
+        }
+
+        // Freelancer codes carry the profile they belong to, so the account is
+        // never created in the broken unlinked state.
+        if (invite.role === "freelancer" && !invite.freelancer_id) {
+          return reject("That code is misconfigured — ask a founder to issue a new one.", 400, false);
+        }
+
+        await db.createUser(env, {
+          email,
+          name,
+          role: invite.role,
+          freelancer_id: invite.freelancer_id,
+          setup_token: null,
+        });
+        const created = await db.getUserByEmail(env, email);
+
+        // Consume before issuing a session. If two requests race, the loser
+        // gets nothing usable.
+        if (!(await db.consumeInviteCode(env, invite.id, created.id))) {
+          await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(created.id).run();
+          return reject("That invite code was just used by someone else.", 409, false);
+        }
+
+        await setPassword(env, created.id, password);
+        await recordLoginAttempt(env, rlKey, ip, true);
+        await db.logAudit(env, created, "account_registered", "user", created.id, `${invite.role} via invite code`);
+
+        const token = await createSession(env, created.id);
+        return redirect("/", { "Set-Cookie": sessionCookie(token) });
+      }
+
       // ---------- Public: first-time setup / invite ----------
       if (path.startsWith("/setup/") && method === "GET") {
         const token = path.split("/setup/")[1];
@@ -740,6 +828,8 @@ export default {
             theme,
             users: await db.listUsers(env),
             unlinkedFreelancers: await db.getFreelancersWithoutUser(env),
+            inviteCodes: await db.listInviteCodes(env),
+            registerUrl: `${url.origin}/register`,
             ...extra,
           });
 
@@ -814,6 +904,62 @@ export default {
               message: `New link for ${target.name}. Any previous link or password for this account has stopped working.`,
               inviteLink: `${url.origin}/setup/${token}`,
               inviteFor: target.name,
+            })
+          );
+        }
+
+        // ---- Invite codes for self-service registration ----
+        if (path === "/team/codes" && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+
+          const role = f.role === "founder" ? "founder" : f.role === "freelancer" ? "freelancer" : null;
+          if (!role) return html(await teamPage({ error: "Pick a role for the code." }), 400);
+
+          let freelancerId = null;
+          if (role === "freelancer") {
+            const available = await db.getFreelancersWithoutUser(env);
+            const chosen = available.find((x) => String(x.id) === String(f.freelancer_id));
+            if (!chosen) {
+              return html(
+                await teamPage({ error: "A freelancer code has to name which freelancer profile it's for." }),
+                400
+              );
+            }
+            freelancerId = chosen.id;
+          }
+
+          const days = Math.min(Math.max(parseInt(f.expires_days || "7", 10) || 7, 1), 30);
+          const code = generateInviteCode();
+          await db.createInviteCode(env, {
+            code_hash: await hashInviteCode(code),
+            role,
+            freelancer_id: freelancerId,
+            note: (f.note || "").trim() || null,
+            created_by: user.id,
+            expires_at: new Date(Date.now() + days * 86400000).toISOString(),
+          });
+          await db.logAudit(env, user, "invite_code_created", "user", null, `${role}, expires in ${days}d${f.note ? " — " + f.note : ""}`);
+
+          return html(
+            await teamPage({
+              message: `Invite code created. It works once, expires in ${days} day${days === 1 ? "" : "s"}, and creates a ${role} account.`,
+              newCode: code,
+            })
+          );
+        }
+
+        const codeRevoke = path.match(/^\/team\/codes\/(\d+)\/revoke$/);
+        if (codeRevoke && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          const gone = await db.revokeInviteCode(env, codeRevoke[1]);
+          await db.logAudit(env, user, "invite_code_revoked", "user", null, gone ? "revoked" : "already used or gone");
+          return html(
+            await teamPage({
+              message: gone ? "That invite code has been cancelled." : "That code was already used or no longer exists.",
             })
           );
         }

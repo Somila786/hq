@@ -150,3 +150,20 @@ CREATE TABLE IF NOT EXISTS totp_backup_codes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_backup_codes_user ON totp_backup_codes (user_id, used_at);
+
+-- Self-service registration codes (see migrations/002_invite_codes.sql).
+-- The role lives on the code, never on the signup form.
+CREATE TABLE IF NOT EXISTS invite_codes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code_hash TEXT NOT NULL,
+  role TEXT NOT NULL CHECK(role IN ('founder','freelancer')),
+  freelancer_id INTEGER REFERENCES freelancers(id),
+  note TEXT,
+  created_by INTEGER REFERENCES users(id),
+  created_at TEXT DEFAULT (datetime('now')),
+  expires_at TEXT NOT NULL,
+  used_by INTEGER REFERENCES users(id),
+  used_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_invite_codes_open ON invite_codes (used_at, expires_at);

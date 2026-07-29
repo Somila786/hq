@@ -1341,6 +1341,233 @@ await test("team mutations are behind CSRF", async () => {
   assert(stillThere.password_hash, "freelancer's access untouched");
 });
 
+console.log("\nSelf-service registration (invite codes)");
+
+// Mints a code the way a founder does, and returns the plaintext.
+async function mintCode(env, session, csrf, form = {}) {
+  const res = await worker.fetch(
+    req("/team/codes", { method: "POST", cookies: { c7_session: session }, form: { role: "founder", expires_days: "7", ...form, _csrf: csrf } }),
+    env
+  );
+  const body = await res.text();
+  const m = body.match(/<span class="code-big">([A-Z0-9-]+)<\/span>/);
+  return { status: res.status, code: m ? m[1] : null, body };
+}
+
+await test("the login page offers registration and /register renders", async () => {
+  const env = makeEnv();
+  has(await (await worker.fetch(req("/login"), env)).text(), 'href="/register"', "link on the login page");
+  const reg = await worker.fetch(req("/register"), env);
+  eq(reg.status, 200, "register page loads");
+  const body = await reg.text();
+  has(body, 'name="code"', "asks for an invite code");
+  has(body, 'action="/register"', "posts to itself");
+});
+
+await test("registration is refused without a valid code", async () => {
+  const env = makeEnv();
+  const attempt = (code) =>
+    worker.fetch(
+      req("/register", {
+        method: "POST",
+        form: { code, name: "Intruder", email: "intruder@example.com", password: "longenough1", confirm: "longenough1" },
+      }),
+      env
+    );
+
+  eq((await attempt("")).status, 400, "empty code refused");
+  eq((await attempt("AAAAA-BBBBB-CCCCC")).status, 403, "made-up code refused");
+  eq(await db.getUserByEmail(env, "intruder@example.com"), null, "no account created");
+});
+
+await test("a founder code creates a founder, once", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const { status, code } = await mintCode(env, session, csrf, { note: "Somila" });
+  eq(status, 200, "code generated");
+  assert(code && /^[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}$/.test(code), `well-formed code: ${code}`);
+
+  const res = await worker.fetch(
+    req("/register", {
+      method: "POST",
+      form: { code, name: "Somila Tenza Sogaxa", email: "Somila@Catalyst7.co.za", password: "her-own-password", confirm: "her-own-password" },
+    }),
+    env
+  );
+  eq(res.status, 302, "registered and signed in");
+  const theirSession = setCookie(res, "c7_session");
+  assert(theirSession, "session issued");
+
+  const created = await db.getUserByEmail(env, "somila@catalyst7.co.za");
+  assert(created, "email normalised to lowercase");
+  eq(created.name, "Somila Tenza Sogaxa", "name stored");
+  eq(created.role, "founder", "role came from the code");
+  assert(created.password_hash, "password set");
+  lacks(created.password_hash, "her-own-password", "plaintext never stored");
+
+  eq((await worker.fetch(req("/dashboard", { cookies: { c7_session: theirSession } }), env)).status, 200, "founder access works");
+  assert((await auditActions(env)).includes("account_registered"), "audited");
+
+  // Second use of the same code fails.
+  const reuse = await worker.fetch(
+    req("/register", {
+      method: "POST",
+      form: { code, name: "Someone Else", email: "else@example.com", password: "longenough1", confirm: "longenough1" },
+    }),
+    env
+  );
+  eq(reuse.status, 403, "code is single-use");
+  eq(await db.getUserByEmail(env, "else@example.com"), null, "no second account");
+});
+
+await test("the code decides the role — the form cannot override it", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  await db.createFreelancer(env, { name: "Naledi Khumalo" });
+  const fl = (await db.getFreelancers(env))[0];
+  const { code } = await mintCode(env, session, csrf, { role: "freelancer", freelancer_id: String(fl.id), note: "Naledi" });
+  assert(code, "freelancer code minted");
+
+  // Submit role=founder in the form and see what actually gets created.
+  const res = await worker.fetch(
+    req("/register", {
+      method: "POST",
+      form: {
+        code,
+        name: "Naledi",
+        email: "naledi@example.com",
+        password: "longenough1",
+        confirm: "longenough1",
+        role: "founder",
+        freelancer_id: "",
+      },
+    }),
+    env
+  );
+  eq(res.status, 302, "registered");
+  const created = await db.getUserByEmail(env, "naledi@example.com");
+  eq(created.role, "freelancer", "privilege escalation attempt ignored");
+  eq(created.freelancer_id, fl.id, "profile came from the code, not the form");
+
+  const theirSession = setCookie(res, "c7_session");
+  eq((await worker.fetch(req("/dashboard", { cookies: { c7_session: theirSession } }), env)).status, 404, "founder pages stay closed to them");
+  eq((await worker.fetch(req("/log", { cookies: { c7_session: theirSession } }), env)).status, 200, "their own log works");
+});
+
+await test("registration validates its inputs and refuses duplicate emails", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const f = await env.DB.prepare("SELECT email FROM users WHERE role='founder'").first();
+
+  const post = async (over) => {
+    const { code } = await mintCode(env, session, csrf);
+    return worker.fetch(
+      req("/register", {
+        method: "POST",
+        form: { code, name: "X", email: "x@example.com", password: "longenough1", confirm: "longenough1", ...over },
+      }),
+      env
+    );
+  };
+
+  eq((await post({ name: "" })).status, 400, "name required");
+  eq((await post({ email: "nope" })).status, 400, "email must look valid");
+  eq((await post({ password: "short", confirm: "short" })).status, 400, "password length enforced");
+  eq((await post({ confirm: "different1" })).status, 400, "passwords must match");
+  eq((await post({ email: f.email })).status, 409, "duplicate email refused");
+  eq(await db.getUserByEmail(env, "x@example.com"), null, "nothing created by any of that");
+});
+
+await test("an expired or cancelled code stops working", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+
+  // Expired.
+  const { code: expiring } = await mintCode(env, session, csrf, { note: "old" });
+  await env.DB.prepare("UPDATE invite_codes SET expires_at = datetime('now','-1 day') WHERE used_at IS NULL").run();
+  const late = await worker.fetch(
+    req("/register", { method: "POST", form: { code: expiring, name: "A", email: "a@example.com", password: "longenough1", confirm: "longenough1" } }),
+    env
+  );
+  eq(late.status, 403, "expired code refused");
+
+  // Cancelled.
+  const { code: doomed } = await mintCode(env, session, csrf, { note: "cancel me" });
+  const open = (await db.listInviteCodes(env)).find((c) => c.note === "cancel me");
+  const cancel = await worker.fetch(
+    req(`/team/codes/${open.id}/revoke`, { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf } }),
+    env
+  );
+  eq(cancel.status, 200, "cancelled");
+  const after = await worker.fetch(
+    req("/register", { method: "POST", form: { code: doomed, name: "B", email: "b@example.com", password: "longenough1", confirm: "longenough1" } }),
+    env
+  );
+  eq(after.status, 403, "cancelled code refused");
+  eq(await db.getUserByEmail(env, "b@example.com"), null, "no account");
+});
+
+await test("codes are stored hashed and shown only once", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const { code } = await mintCode(env, session, csrf, { note: "Somila" });
+
+  const { results } = await env.DB.prepare("SELECT * FROM invite_codes").all();
+  eq(results.length, 1, "one code stored");
+  lacks(results[0].code_hash, normalizeBackupCode(code), "plaintext code is not in the database");
+  eq(results[0].created_by, (await env.DB.prepare("SELECT id FROM users").first()).id, "attributed to its creator");
+
+  const revisit = await (await worker.fetch(req("/team", { cookies: { c7_session: session } }), env)).text();
+  lacks(revisit, code, "code is not shown again on reload");
+  has(revisit, "Somila", "but the note is, so you know which is which");
+});
+
+await test("only founders can mint or cancel invite codes", async () => {
+  const env = makeEnv();
+  const fl = await seedFreelancer(env);
+  const { session } = await login(env, fl.email, FREELANCER_PW);
+  eq(
+    (await worker.fetch(req("/team/codes", { method: "POST", cookies: { c7_session: session }, form: { role: "founder" } }), env)).status,
+    404,
+    "a freelancer cannot mint a founder code"
+  );
+  const { results } = await env.DB.prepare("SELECT * FROM invite_codes").all();
+  eq(results.length, 0, "nothing minted");
+});
+
+await test("code minting is behind CSRF", async () => {
+  const env = makeEnv();
+  const { session } = await founderSession(env);
+  const r = await worker.fetch(req("/team/codes", { method: "POST", cookies: { c7_session: session }, form: { role: "founder" } }), env);
+  eq(r.status, 403, "rejected without a token");
+  const { results } = await env.DB.prepare("SELECT * FROM invite_codes").all();
+  eq(results.length, 0, "nothing minted");
+});
+
+await test("registration attempts are rate limited", async () => {
+  const env = makeEnv();
+  for (let i = 0; i < 5; i++) {
+    const r = await worker.fetch(
+      req("/register", {
+        method: "POST",
+        headers: { "CF-Connecting-IP": "41.13.7.9" },
+        form: { code: `WRONG-CODE${i}-XXXXX`, name: "X", email: `x${i}@example.com`, password: "longenough1", confirm: "longenough1" },
+      }),
+      env
+    );
+    eq(r.status, 403, `attempt ${i + 1} refused`);
+  }
+  const blocked = await worker.fetch(
+    req("/register", {
+      method: "POST",
+      headers: { "CF-Connecting-IP": "41.13.7.9" },
+      form: { code: "WRONG-AGAIN-XXXXX", name: "X", email: "x9@example.com", password: "longenough1", confirm: "longenough1" },
+    }),
+    env
+  );
+  eq(blocked.status, 429, "6th attempt is rate limited, so codes can't be ground down");
+});
+
 console.log("\nSecurity headers");
 
 await test("every response carries the security header set", async () => {

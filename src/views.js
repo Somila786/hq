@@ -272,6 +272,8 @@ h3.sub-label{font-size:13px;font-weight:600;margin:0 0 8px}
 .code-chip{font-family:var(--font-mono);font-size:13.5px;letter-spacing:.04em;background:var(--input-bg);border:1px solid var(--border);border-radius:var(--radius);padding:9px 12px;text-align:center}
 .code-chip.spent{opacity:.45;text-decoration:line-through}
 .codes-warn{font-size:13px;line-height:1.6;max-width:520px}
+.link-inline{color:var(--red-text);text-decoration:underline;font-weight:600}
+.code-big{font-family:var(--font-mono);font-size:19px;letter-spacing:.08em;font-weight:700;display:block;margin:10px 0;padding:14px;background:var(--input-bg);border:1px solid var(--red-text);border-radius:var(--radius);text-align:center;word-break:break-all}
 </style>
 </head>
 <body>
@@ -309,7 +311,30 @@ export function loginPage({ error, theme, googleEnabled = false } = {}) {
         <div class="field"><label>Password</label><input type="password" name="password" required placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;" /></div>
         <button type="submit" class="btn btn-primary">Continue</button>
       </form>
-      <div class="helper">Forgot password? Ask a founder to reset it from Freelancers or Clients.</div>
+      <div class="helper">Have an invite code? <a href="/register" class="link-inline">Create your account</a>.<br />Forgot your password? Ask a founder to send you a new invite link.</div>
+    </div>`,
+  });
+}
+
+// ---------- Public: self-service registration (invite code required) ----------
+export function registerPage({ error, theme, name = "", email = "" } = {}) {
+  return layout({
+    title: "Create your account",
+    theme,
+    body: `
+    <div class="authcard">
+      <h1>Create your account</h1>
+      <p class="lead">You'll need an invite code from one of the founders. The code decides what you can see once you're in.</p>
+      ${error ? `<div class="msg msg-error">${esc(error)}</div>` : ""}
+      <form class="plain" method="post" action="/register">
+        <div class="field"><label>Invite code</label><input name="code" required autofocus placeholder="XXXXX-XXXXX-XXXXX" autocapitalize="characters" spellcheck="false" /></div>
+        <div class="field"><label>Full name</label><input name="name" required value="${esc(name)}" placeholder="Somila Tenza Sogaxa" /></div>
+        <div class="field"><label>Email</label><input type="email" name="email" required value="${esc(email)}" placeholder="you@catalyst7.co.za" /></div>
+        <div class="field"><label>Password (min 8 characters)</label><input type="password" name="password" minlength="8" required placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;" /></div>
+        <div class="field"><label>Confirm password</label><input type="password" name="confirm" minlength="8" required placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;" /></div>
+        <button type="submit" class="btn btn-primary">Create account</button>
+      </form>
+      <div class="helper">Already have an account? <a href="/login" class="link-inline">Sign in</a>.</div>
     </div>`,
   });
 }
@@ -882,12 +907,15 @@ export function teamPage({
   user,
   users,
   unlinkedFreelancers = [],
+  inviteCodes = [],
+  registerUrl = "/register",
   csrf,
   theme,
   error,
   message,
   inviteLink,
   inviteFor,
+  newCode,
 }) {
   const statusPill = (u) => {
     if (u.has_password) return pill("active", "green");
@@ -989,6 +1017,79 @@ export function teamPage({
           rows
             ? `<table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th>Sign-in</th><th class="right">Actions</th></tr></thead><tbody>${rows}</tbody></table>`
             : `<div class="empty">No accounts yet.</div>`
+        }
+      </div>
+    </div>
+
+    <h2 class="section-label" style="margin-top:32px">Invite codes</h2>
+    <div class="panel">
+      <div class="security-body">
+        <div class="security-copy" style="margin-bottom:16px">
+          An invite code lets someone create their own account at <span class="mono-box" style="display:inline-block;margin:0">${esc(
+            registerUrl
+          )}</span> — they choose their own name, email and password. <strong>The code decides their role, not them.</strong> Each code works once and expires.
+        </div>
+        ${
+          newCode
+            ? `<div class="msg msg-ok codes-warn"><strong>Send this to them now — it isn't shown again.</strong><span class="code-big">${esc(
+                newCode
+              )}</span>Along with the link: ${esc(registerUrl)}</div>`
+            : ""
+        }
+        <form method="post" action="/team/codes">
+          ${csrfField(csrf)}
+          <div class="form-grid" style="padding:0 0 14px">
+            <div class="field"><label>Role this code creates</label>
+              <select name="role">
+                <option value="founder">Founder &mdash; full access</option>
+                <option value="freelancer">Freelancer &mdash; own weekly log only</option>
+              </select>
+            </div>
+            <div class="field"><label>Freelancer profile (freelancer codes only)</label>
+              <select name="freelancer_id">
+                <option value="">&mdash;</option>
+                ${unlinkedFreelancers.map((f) => `<option value="${f.id}">${esc(f.name)}</option>`).join("")}
+              </select>
+            </div>
+            <div class="field"><label>Expires after</label>
+              <select name="expires_days">
+                <option value="1">1 day</option>
+                <option value="7" selected>7 days</option>
+                <option value="14">14 days</option>
+                <option value="30">30 days</option>
+              </select>
+            </div>
+            <div class="field"><label>Note (who it's for)</label><input name="note" placeholder="Somila" /></div>
+          </div>
+          <button type="submit" class="btn btn-primary">Generate invite code</button>
+        </form>
+      </div>
+      <div class="table-wrap">
+        ${
+          inviteCodes.length
+            ? `<table><thead><tr><th>For</th><th>Role</th><th>Status</th><th>Expires</th><th class="right">Action</th></tr></thead><tbody>${inviteCodes
+                .map((c) => {
+                  const status = c.used_at
+                    ? pill(`used by ${c.used_by_name || "someone"}`, "green")
+                    : c.expired
+                      ? pill("expired", "red")
+                      : pill("open");
+                  return `<tr>
+                    <td class="strong">${esc(c.note || "—")}${c.freelancer_name ? `<br/><span class="hint">${esc(c.freelancer_name)}</span>` : ""}</td>
+                    <td class="muted" style="text-transform:capitalize">${esc(c.role)}</td>
+                    <td>${status}</td>
+                    <td class="mono muted nowrap">${esc(String(c.expires_at).slice(0, 10))}</td>
+                    <td class="right">${
+                      c.used_at || c.expired
+                        ? ""
+                        : `<form method="post" action="/team/codes/${c.id}/revoke" class="row-actions">${csrfField(
+                            csrf
+                          )}<button type="submit" class="btn btn-sm btn-danger">Cancel</button></form>`
+                    }</td>
+                  </tr>`;
+                })
+                .join("")}</tbody></table>`
+            : `<div class="empty">No invite codes yet.</div>`
         }
       </div>
     </div>

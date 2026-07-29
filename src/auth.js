@@ -309,6 +309,30 @@ export function looksLikeBackupCode(input) {
   return normalizeBackupCode(input).length === BACKUP_CODE_LEN;
 }
 
+// ---- Registration invite codes ----
+// The code IS the authorisation to create an account, so it's treated like a
+// credential: high entropy, stored hashed, shown to the founder once.
+// Same SHA-256 reasoning as backup codes -- 75 bits of CSPRNG output has no
+// dictionary to stretch against.
+export function generateInviteCode() {
+  const bytes = new Uint8Array(15);
+  crypto.getRandomValues(bytes);
+  let out = "";
+  for (const b of bytes) out += BACKUP_ALPHABET[b % BACKUP_ALPHABET.length];
+  return `${out.slice(0, 5)}-${out.slice(5, 10)}-${out.slice(10)}`;
+}
+
+export function normalizeInviteCode(code) {
+  return String(code || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+}
+
+export async function hashInviteCode(code) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(normalizeInviteCode(code)));
+  return bytesToHex(new Uint8Array(digest));
+}
+
 // ---- Google sign-in (OAuth 2.0 authorization code + PKCE) ----
 // No library: the whole flow is two fetches and some claim checking.
 
