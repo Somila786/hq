@@ -8,7 +8,12 @@
 // On Node 20/22 add --experimental-sqlite; on Node 23+ node:sqlite is on by
 // default and the flag is unnecessary.
 
-import worker from "../src/index.js";
+// Defaults to the real source tree. Set TEST_TARGET=../dist/worker.js to run
+// this same suite against the single-file dashboard build, which is how that
+// build is verified to be equivalent (see tests/bundle.mjs).
+const TARGET = process.env.TEST_TARGET || "../src/index.js";
+const worker = (await import(TARGET)).default;
+
 import { setPassword, totpCodeNow, generateTotpSecret, hashBackupCode, normalizeBackupCode } from "../src/auth.js";
 import * as db from "../src/db.js";
 import { makeEnv } from "./d1.mjs";
