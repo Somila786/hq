@@ -27,15 +27,27 @@ My tools can create and query D1 databases, but there is no tool available to me
 
 ## Activate your founder account
 
-Visit this one-time link (works on either the workers.dev URL or your custom domain once bound):
+Your account (`catalyst948@gmail.com`) is seeded and waiting on a password. Activation is a one-time `/setup/<token>` link.
 
+**The token is deliberately not written down here.** It's a working credential — anyone holding it can set the founder password and take the account — so it doesn't belong in a file that gets committed, zipped, or shared. Read it out of the database when you need it:
+
+```bash
+npx wrangler d1 execute catalyst7-kpi --remote --command \
+  "SELECT setup_token FROM users WHERE email = 'catalyst948@gmail.com';"
 ```
-/setup/<setup-token-redacted-see-README>
+
+Then open `/setup/<that token>` on your workers.dev URL or custom domain, and set your password. The token is consumed on use.
+
+If it ever leaks — pasted into a chat, committed, forwarded — rotate it and use the new one:
+
+```bash
+npx wrangler d1 execute catalyst7-kpi --remote --command \
+  "UPDATE users SET setup_token = lower(hex(randomblob(24))) WHERE email = 'catalyst948@gmail.com' AND password_hash IS NULL;"
 ```
 
-e.g. `https://catalyst7-kpi.<your-subdomain>.workers.dev/setup/<setup-token-redacted-see-README>`
+(The `password_hash IS NULL` guard means this is a no-op once you've activated — it can't lock you out of a live account.)
 
-Set your password there. You're in. From the Dashboard nav you can then add the other two founders' logins yourself by inserting a row directly via `wrangler d1 execute` (see "Adding more founders" below) — there's no self-serve founder invite UI in v1, only freelancer invites.
+From the Dashboard nav you can then add the other two founders' logins yourself by inserting a row directly via `wrangler d1 execute` (see "Adding more founders" below) — there's no self-serve founder invite UI in v1, only freelancer invites.
 
 ## Point it at kpi.catalyst7.[yourdomain]
 
