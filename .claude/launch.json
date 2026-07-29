@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "kpi-preview",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["tests/devserver.mjs"],
+      "port": 8788
+    }
+  ]
+}

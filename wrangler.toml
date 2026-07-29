@@ -1,0 +1,14 @@
+name = "catalyst7-kpi"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "catalyst7-kpi"
+database_id = "ba622992-c6dc-4a9b-a099-3b8a5fbe3a83"
+
+# Monthly retention review scan (03:00 UTC on the 1st). Flags stale lost-leads
+# and inactive freelancers for a founder to keep or erase at /retention.
+# Never deletes anything on its own.
+[triggers]
+crons = ["0 3 1 * *"]
