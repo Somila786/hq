@@ -273,7 +273,7 @@ async function verifyTotp(secretBase32, userCode, timeStepSeconds = 30) {
   return false;
 }
 
-function totpUri(secretBase32, email, issuer = "Catalyst7 KPI") {
+function totpUri(secretBase32, email, issuer = "Catalyst7 HQ") {
   return `otpauth://totp/${encodeURIComponent(issuer)}:${encodeURIComponent(email)}?secret=${secretBase32}&issuer=${encodeURIComponent(
     issuer
   )}&algorithm=SHA1&digits=6&period=30`;
@@ -689,6 +689,82 @@ async function clearBackupCodes(env, userId) {
   await env.DB.prepare("DELETE FROM totp_backup_codes WHERE user_id = ?").bind(userId).run();
 }
 
+// ---- Team / user accounts ----
+// Never selects password_hash or password_salt -- nothing that renders a user
+// list has any business holding those in memory.
+async function listUsers(env) {
+  const { results } = await env.DB.prepare(
+    `SELECT u.id, u.email, u.name, u.role, u.freelancer_id, u.created_at, u.totp_enabled,
+            u.setup_token IS NOT NULL AS invite_pending,
+            u.password_hash IS NOT NULL AS has_password,
+            u.google_sub IS NOT NULL AS google_linked,
+            f.name AS freelancer_name
+     FROM users u
+     LEFT JOIN freelancers f ON f.id = u.freelancer_id
+     ORDER BY CASE u.role WHEN 'founder' THEN 0 ELSE 1 END, u.name`
+  ).all();
+  return results;
+}
+
+async function getUserById(env, id) {
+  return env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(id).first();
+}
+
+// Freelancer profiles that don't yet have a login attached -- the only valid
+// targets when creating a freelancer account, since /log resolves a user's
+// rows through freelancer_id and breaks without one.
+async function getFreelancersWithoutUser(env) {
+  const { results } = await env.DB.prepare(
+    `SELECT f.id, f.name FROM freelancers f
+     WHERE f.active = 1
+       AND NOT EXISTS (SELECT 1 FROM users u WHERE u.freelancer_id = f.id)
+     ORDER BY f.name`
+  ).all();
+  return results;
+}
+
+async function createUser(env, u) {
+  return env.DB.prepare(
+    "INSERT INTO users (email, name, role, freelancer_id, setup_token) VALUES (?, ?, ?, ?, ?)"
+  )
+    .bind(u.email, u.name, u.role, u.freelancer_id || null, u.setup_token)
+    .run();
+}
+
+// Issuing a fresh invite clears any existing password: the link is a way back
+// in for someone locked out, so the old credential must stop working.
+async function reissueSetupToken(env, id, token) {
+  return env.DB.prepare(
+    "UPDATE users SET setup_token = ?, password_hash = NULL, password_salt = NULL WHERE id = ?"
+  )
+    .bind(token, id)
+    .run();
+}
+
+// Locks an account without deleting it, so audit history and any linked
+// records stay intact -- same principle as the retention flow.
+async function revokeUserAccess(env, id) {
+  await env.DB.prepare(
+    `UPDATE users SET password_hash = NULL, password_salt = NULL, setup_token = NULL,
+                      totp_secret = NULL, totp_enabled = 0, google_sub = NULL
+     WHERE id = ?`
+  )
+    .bind(id)
+    .run();
+  // Kill any live session immediately -- revoking is pointless if the person
+  // stays signed in on a device they already have open.
+  await env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM pending_logins WHERE user_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM totp_backup_codes WHERE user_id = ?").bind(id).run();
+}
+
+async function countActiveFounders(env) {
+  const row = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM users WHERE role = 'founder' AND password_hash IS NOT NULL"
+  ).first();
+  return row.n;
+}
+
 // ---- Google account binding ----
 async function getUserByEmail(env, email) {
   return env.DB.prepare("SELECT * FROM users WHERE email = ?").bind(email).first();
@@ -801,7 +877,7 @@ async function runRetentionScan(env) {
   return { leadsFlagged: staleLeads.length, freelancersFlagged: staleFreelancers.length };
 }
 
-return { getFreelancers, getFreelancerById, createFreelancer, setFreelancerActive, getClients, createClient, setClientStatus, getLeads, createLead, updateLeadStage, getRevenueEntries, createRevenueEntry, getWeeklyEntry, upsertWeeklyEntry, getFreelancerHistory, getDashboard, replaceBackupCodes, countUnusedBackupCodes, redeemBackupCode, clearBackupCodes, getUserByEmail, bindGoogleSub, logAudit, getAuditLog, logError, getErrorLog, flagForRetentionReview, getOpenRetentionFlags, resolveRetentionFlag, eraseLeadPII, eraseFreelancerPII, runRetentionScan };
+return { getFreelancers, getFreelancerById, createFreelancer, setFreelancerActive, getClients, createClient, setClientStatus, getLeads, createLead, updateLeadStage, getRevenueEntries, createRevenueEntry, getWeeklyEntry, upsertWeeklyEntry, getFreelancerHistory, getDashboard, replaceBackupCodes, countUnusedBackupCodes, redeemBackupCode, clearBackupCodes, listUsers, getUserById, getFreelancersWithoutUser, createUser, reissueSetupToken, revokeUserAccess, countActiveFounders, getUserByEmail, bindGoogleSub, logAudit, getAuditLog, logError, getErrorLog, flagForRetentionReview, getOpenRetentionFlags, resolveRetentionFlag, eraseLeadPII, eraseFreelancerPII, runRetentionScan };
 })();
 
 // ===================== src/views.js ====================
@@ -851,6 +927,7 @@ const FOUNDER_NAV = [
   ["clients", "/clients", "Clients"],
   ["leads", "/leads", "Leads"],
   ["revenue", "/revenue", "Revenue"],
+  ["team", "/team", "Team"],
   ["audit", "/audit", "Audit"],
   ["retention", "/retention", "Retention"],
   ["errors", "/errors", "Errors"],
@@ -874,7 +951,7 @@ function layout({ title, user, active, body, theme = "dark" }) {
     .map(([key, href, label]) => `<a href="${href}" class="mobilelink${active === key ? " on" : ""}">${esc(label)}</a>`)
     .join("");
 
-  const brand = `<div class="brandwrap"><span class="brand">Catalyst 7</span><span class="brand-sub">KPI</span></div>`;
+  const brand = `<div class="brandwrap"><span class="brand">Catalyst 7</span><span class="brand-sub">HQ</span></div>`;
   const modeToggle = `<a href="/theme/toggle" class="mode-toggle">${themeLabel}</a>`;
 
   const header = user
@@ -904,7 +981,7 @@ function layout({ title, user, active, body, theme = "dark" }) {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>${esc(title)} &middot; Catalyst 7 KPI</title>
+<title>${esc(title)} &middot; Catalyst 7 HQ</title>
 <style>
 :root {
   --bg: #0D0D0D; --text: #F5EDD8; --text-muted: #9c9686;
@@ -1685,6 +1762,134 @@ function historyPage({ user, rows, theme }) {
   });
 }
 
+// ---------- Founder: Team / user accounts ----------
+function teamPage({
+  user,
+  users,
+  unlinkedFreelancers = [],
+  csrf,
+  theme,
+  error,
+  message,
+  inviteLink,
+  inviteFor,
+}) {
+  const statusPill = (u) => {
+    if (u.has_password) return pill("active", "green");
+    if (u.invite_pending) return pill("invite sent");
+    return pill("no access", "red");
+  };
+
+  const rows = users
+    .map((u) => {
+      const isSelf = u.id === user.id;
+      return `<tr>
+      <td class="strong">${esc(u.name)}${isSelf ? ' <span class="hint">(you)</span>' : ""}${
+        u.freelancer_name ? `<br/><span class="hint">profile: ${esc(u.freelancer_name)}</span>` : ""
+      }</td>
+      <td class="muted">${esc(u.email)}</td>
+      <td>${u.role === "founder" ? pill("founder", "green") : pill("freelancer")}</td>
+      <td>${statusPill(u)}</td>
+      <td class="muted nowrap">${u.totp_enabled ? "2FA on" : "&mdash;"}${u.google_linked ? " &middot; Google" : ""}</td>
+      <td class="right">
+        <div class="row-actions">
+          <form method="post" action="/team/${u.id}/invite">${csrfField(csrf)}<button type="submit" class="btn btn-sm">${
+            u.has_password ? "Reset access" : "New link"
+          }</button></form>
+          ${
+            isSelf
+              ? ""
+              : `<form method="post" action="/team/${u.id}/revoke" onsubmit="return confirm('Revoke access for this person? They will be signed out everywhere and will need a new invite link to get back in.');">${csrfField(
+                  csrf
+                )}<button type="submit" class="btn btn-sm btn-danger">Revoke</button></form>`
+          }
+        </div>
+      </td>
+    </tr>`;
+    })
+    .join("");
+
+  const freelancerOptions = unlinkedFreelancers.map((f) => `<option value="${f.id}">${esc(f.name)}</option>`).join("");
+
+  return layout({
+    user,
+    active: "team",
+    title: "Team",
+    theme,
+    body: `
+    <input type="checkbox" id="add-toggle" class="form-toggle" />
+    <div class="page-head-row">
+      <div>
+        <div class="page-title">Team</div>
+        <div class="page-sub">${users.length} ${users.length === 1 ? "account" : "accounts"} &middot; who can sign in, and what they can see</div>
+      </div>
+      <label for="add-toggle" class="btn btn-primary"><span class="toggle-open">Add person</span><span class="toggle-close">Close</span></label>
+    </div>
+
+    ${error ? `<div class="msg msg-error">${esc(error)}</div>` : ""}
+    ${message ? `<div class="msg msg-ok">${esc(message)}</div>` : ""}
+    ${
+      inviteLink
+        ? `<div class="msg msg-ok">Invite link${inviteFor ? ` for ${esc(inviteFor)}` : ""} &mdash; send it via WhatsApp or email, it works once and then expires:<span class="mono-box">${esc(
+            inviteLink
+          )}</span><span class="hint">This is the only time it's shown. If it gets lost, use "New link" to issue another.</span></div>`
+        : ""
+    }
+
+    <div class="panel add-panel">
+      <div class="panel-head">Add someone to the team</div>
+      <form class="plain" method="post" action="/team">
+        ${csrfField(csrf)}
+        <div class="form-grid">
+          <div class="field"><label>Full name</label><input name="name" required placeholder="Somila" /></div>
+          <div class="field"><label>Email</label><input name="email" type="email" required placeholder="somila@catalyst7.co.za" /></div>
+          <div class="field"><label>Role</label>
+            <select name="role">
+              <option value="founder">Founder &mdash; full access</option>
+              <option value="freelancer">Freelancer &mdash; own weekly log only</option>
+            </select>
+          </div>
+          <div class="field"><label>Freelancer profile (freelancers only)</label>
+            <select name="freelancer_id">
+              <option value="">&mdash;</option>
+              ${freelancerOptions}
+            </select>
+            <span class="hint">${
+              unlinkedFreelancers.length
+                ? "Required if the role is Freelancer, so their weekly log points at the right person."
+                : "No unlinked freelancer profiles. Add one on the Freelancers page first."
+            }</span>
+          </div>
+        </div>
+        <div class="form-foot">
+          <label for="add-toggle" class="btn">Cancel</label>
+          <button type="submit" class="btn btn-primary">Add person</button>
+        </div>
+      </form>
+    </div>
+
+    <div class="panel">
+      <div class="table-wrap">
+        ${
+          rows
+            ? `<table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th>Sign-in</th><th class="right">Actions</th></tr></thead><tbody>${rows}</tbody></table>`
+            : `<div class="empty">No accounts yet.</div>`
+        }
+      </div>
+    </div>
+
+    <h2 class="section-label" style="margin-top:32px">What the roles mean</h2>
+    <div class="panel"><div class="security-body">
+      <div class="security-copy" style="max-width:640px">
+        <strong>Founder</strong> sees everything &mdash; dashboard, revenue, clients, leads, the audit log, and this page.<br/><br/>
+        <strong>Freelancer</strong> only ever sees their own weekly log and history. They cannot reach any founder page, and cannot see another freelancer's hours.<br/><br/>
+        Nobody can change their own role, and roles are checked on the server for every request &mdash; not just hidden in the menu.
+      </div>
+    </div></div>
+  `,
+  });
+}
+
 // ---------- Founder: Audit log ----------
 function auditPage({ user, rows, theme }) {
   const trs = rows
@@ -1813,7 +2018,7 @@ function errorPage(message, status = 400, theme = "dark") {
   });
 }
 
-return { loginPage, totpVerifyPage, setupPage, securityPage, dashboardPage, freelancersPage, clientsPage, leadsPage, revenuePage, logPage, historyPage, auditPage, errorsPage, retentionPage, errorPage };
+return { loginPage, totpVerifyPage, setupPage, securityPage, dashboardPage, freelancersPage, clientsPage, leadsPage, revenuePage, logPage, historyPage, teamPage, auditPage, errorsPage, retentionPage, errorPage };
 })();
 
 // ===================== src/index.js ====================
@@ -1836,6 +2041,7 @@ return { loginPage, totpVerifyPage, setupPage, securityPage, dashboardPage, free
 const INLINE_SCRIPT_HASHES = [
   "'sha256-osjxnKEPL/pQJbFk1dKsF7PYFmTyMWGmVSiL9inhxJY='", // this.form.submit()
   "'sha256-h8g6LCqXGbG2tO/pvAHBjSIDgOVHHT7/zXTJSzndxl0='", // retention erase confirm()
+  "'sha256-sBUkWCcHNuXUK0ODUDXA2EfK7BwSPxu7JXNkACjavvM='", // team revoke-access confirm()
 ];
 
 // style-src keeps 'unsafe-inline': the layout ships one big inline <style>
@@ -2505,6 +2711,123 @@ export default {
           });
           await db.logAudit(env, user, "revenue_logged", "revenue", null, `${r.amount} (${r.type})`);
           return redirect("/revenue");
+        }
+
+        // ---- Team / user accounts (founders only) ----
+        // Creating a login is the highest-privilege action in the app, so every
+        // path through here is audited and the role is validated server-side
+        // against a fixed list -- never taken from the form as-is.
+        const teamPage = async (extra = {}) =>
+          views.teamPage({
+            user,
+            csrf,
+            theme,
+            users: await db.listUsers(env),
+            unlinkedFreelancers: await db.getFreelancersWithoutUser(env),
+            ...extra,
+          });
+
+        if (path === "/team" && method === "GET") {
+          return html(await teamPage());
+        }
+
+        if (path === "/team" && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+
+          const name = (f.name || "").trim();
+          const email = (f.email || "").trim().toLowerCase();
+          const role = f.role === "founder" ? "founder" : f.role === "freelancer" ? "freelancer" : null;
+
+          if (!name || !email || !role) {
+            return html(await teamPage({ error: "Name, email and role are all required." }), 400);
+          }
+          if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+            return html(await teamPage({ error: "That doesn't look like a valid email address." }), 400);
+          }
+
+          // A freelancer login without a freelancer profile can sign in but
+          // lands on an error page, so require the link up front.
+          let freelancerId = null;
+          if (role === "freelancer") {
+            const available = await db.getFreelancersWithoutUser(env);
+            const chosen = available.find((x) => String(x.id) === String(f.freelancer_id));
+            if (!chosen) {
+              return html(
+                await teamPage({
+                  error: "Pick which freelancer profile this login belongs to. Add the profile on the Freelancers page first if it isn't listed.",
+                }),
+                400
+              );
+            }
+            freelancerId = chosen.id;
+          }
+
+          const existing = await db.getUserByEmail(env, email);
+          if (existing) {
+            return html(await teamPage({ error: `${email} already has an account.` }), 409);
+          }
+
+          const token = randomToken();
+          await db.createUser(env, { email, name, role, freelancer_id: freelancerId, setup_token: token });
+          await db.logAudit(env, user, role === "founder" ? "founder_created" : "user_created", "user", null, `${name} <${email}>`);
+
+          return html(
+            await teamPage({
+              message: `${name} added as ${role}. Send them the link below — it works once.`,
+              inviteLink: `${url.origin}/setup/${token}`,
+              inviteFor: name,
+            })
+          );
+        }
+
+        const teamInvite = path.match(/^\/team\/(\d+)\/invite$/);
+        if (teamInvite && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          const target = await db.getUserById(env, teamInvite[1]);
+          if (!target) return html(views.errorPage("That account no longer exists.", 404, theme), 404);
+
+          const token = randomToken();
+          await db.reissueSetupToken(env, target.id, token);
+          await db.logAudit(env, user, "invite_reissued", "user", target.id, `${target.name} <${target.email}>`);
+          return html(
+            await teamPage({
+              message: `New link for ${target.name}. Any previous link or password for this account has stopped working.`,
+              inviteLink: `${url.origin}/setup/${token}`,
+              inviteFor: target.name,
+            })
+          );
+        }
+
+        const teamRevoke = path.match(/^\/team\/(\d+)\/revoke$/);
+        if (teamRevoke && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          const target = await db.getUserById(env, teamRevoke[1]);
+          if (!target) return html(views.errorPage("That account no longer exists.", 404, theme), 404);
+
+          // Two lockout guards. Neither is theoretical: without them one
+          // mis-click leaves nobody able to administer the system.
+          if (target.id === user.id) {
+            return html(await teamPage({ error: "You can't revoke your own access." }), 400);
+          }
+          // Only blocks when the target is itself a *working* founder login.
+          // Revoking a founder who never activated removes nothing, and
+          // blocking that would strand a sole founder who mistyped an invite.
+          if (target.role === "founder" && target.password_hash && (await db.countActiveFounders(env)) <= 1) {
+            return html(
+              await teamPage({ error: "That's the last founder with a working login — revoking it would lock everyone out." }),
+              400
+            );
+          }
+
+          await db.revokeUserAccess(env, target.id);
+          await db.logAudit(env, user, "access_revoked", "user", target.id, `${target.name} <${target.email}>`);
+          return html(await teamPage({ message: `${target.name}'s access has been revoked and their sessions ended.` }));
         }
 
         // ---- Audit log ----

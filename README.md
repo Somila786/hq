@@ -1,4 +1,4 @@
-# Catalyst 7 KPI — Weekly Freelancer, Revenue, Client & Lead Tracker
+# Catalyst 7 HQ — Weekly Freelancer, Revenue, Client & Lead Tracker
 
 Self-hosted on your own Cloudflare account. Cloudflare Worker (app + API) + D1 (SQLite-compatible database, already live).
 
@@ -7,7 +7,7 @@ Self-hosted on your own Cloudflare account. Cloudflare Worker (app + API) + D1 (
 - **Database created and live**: `catalyst7-kpi` (id `ba622992-c6dc-4a9b-a099-3b8a5fbe3a83`) in your Cloudflare account, schema applied (12 tables; a migration adds 2 more — see below).
 - **Your founder account is seeded**: `catalyst948@gmail.com`, role `founder`, waiting on a password.
 - **All application code is written and integration-tested** — auth, dashboard, freelancer/client/lead/revenue management, freelancer weekly log-in flow, plus the full security layer below.
-- **Security hardening pass complete**: login rate limiting, CSRF protection, an audit log, optional TOTP 2FA, an in-app error log, and a monthly data-retention review — see "Security & compliance features" below. 54 end-to-end tests cover all of it against a real SQLite engine standing in for D1; all 54 pass.
+- **Security hardening pass complete**: login rate limiting, CSRF protection, an audit log, optional TOTP 2FA, an in-app error log, and a monthly data-retention review — see "Security & compliance features" below. 63 end-to-end tests cover all of it against a real SQLite engine standing in for D1; all 63 pass.
 - **Brand design system applied**: the real Catalyst 7 palette (black / cream / red) with a working dark ↔ light toggle, a mobile nav, and collapsible add-forms — all server-rendered, still no client JS bundle. See "Look & feel" below.
 
 ## What I could NOT do for you
@@ -47,7 +47,7 @@ npx wrangler d1 execute catalyst7-kpi --remote --command \
 
 (The `password_hash IS NULL` guard means this is a no-op once you've activated — it can't lock you out of a live account.)
 
-From the Dashboard nav you can then add the other two founders' logins yourself by inserting a row directly via `wrangler d1 execute` (see "Adding more founders" below) — there's no self-serve founder invite UI in v1, only freelancer invites.
+Once you're in, add Somila and Lethu yourself from the **Team** page in the nav — no database commands needed.
 
 ## Point it at kpi.catalyst7.[yourdomain]
 
@@ -61,6 +61,7 @@ Your domain is already on Cloudflare (same account as this Worker), so:
 
 - **Founders** (`/dashboard`, `/freelancers`, `/clients`, `/leads`, `/revenue`): log revenue and lead/client changes as they happen; check the dashboard weekly for the freelancer-hours vs last week, revenue vs last week, pipeline value, and who hasn't logged their week yet.
 - **Freelancers** (`/log`): after you generate their invite link from the Freelancers page and send it to them, they set their own password and log hours/deliverables/status each week from `/log`. They only ever see and edit their own row.
+- **Team** (`/team`, founders only): add founders and freelancers, hand out one-time invite links, and revoke access when someone leaves. Revoking signs them out everywhere immediately and keeps their history intact — nothing is deleted.
 - **Weeks** run Monday–Sunday (UTC). Revenue entries are tagged to a "week starting" date you pick when logging them, so you can backfill if needed.
 
 ## Look & feel
@@ -73,7 +74,7 @@ Your domain is already on Cloudflare (same account as this Worker), so:
 ## Testing & local preview
 
 ```bash
-npm test        # 54 end-to-end tests against a real SQLite engine, no framework needed
+npm test        # 63 end-to-end tests against a real SQLite engine, no framework needed
 npm run preview # real app + seeded demo data at http://localhost:8788, no Cloudflare login
 ```
 
@@ -120,7 +121,6 @@ If a user has 2FA switched on, Google sign-in **still** asks for their second fa
 ## Known v1 limitations (easy to extend later, intentionally left out to ship fast)
 
 - No edit/delete UI for clients/leads/freelancers/revenue rows yet — only add + status toggle. Corrections go via `wrangler d1 execute catalyst7-kpi --remote --command "..."`.
-- No self-serve founder invite UI — adding Somila and Lethu's logins is a manual D1 insert (see "Adding more founders" below).
 - No email sending — invite links are generated in-app for you to paste into WhatsApp/email yourself, so no email connector dependency.
 - No CI/CD — there's no `.github/workflows/` in this repo despite earlier notes saying otherwise. Once this is a GitHub repo, a deploy workflow using `cloudflare/wrangler-action` plus a `CLOUDFLARE_API_TOKEN` secret is a short file to add. Until then, deploy manually with `wrangler deploy` and run `npm test` first.
 - 2FA has no backup/recovery codes — if a founder loses their authenticator, another founder needs to disable it for them via a direct D1 update (`UPDATE users SET totp_enabled = 0, totp_secret = NULL WHERE email = '...'`).

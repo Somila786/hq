@@ -57,6 +57,7 @@ import * as views from "./views.js";
 const INLINE_SCRIPT_HASHES = [
   "'sha256-osjxnKEPL/pQJbFk1dKsF7PYFmTyMWGmVSiL9inhxJY='", // this.form.submit()
   "'sha256-h8g6LCqXGbG2tO/pvAHBjSIDgOVHHT7/zXTJSzndxl0='", // retention erase confirm()
+  "'sha256-sBUkWCcHNuXUK0ODUDXA2EfK7BwSPxu7JXNkACjavvM='", // team revoke-access confirm()
 ];
 
 // style-src keeps 'unsafe-inline': the layout ships one big inline <style>
@@ -726,6 +727,123 @@ export default {
           });
           await db.logAudit(env, user, "revenue_logged", "revenue", null, `${r.amount} (${r.type})`);
           return redirect("/revenue");
+        }
+
+        // ---- Team / user accounts (founders only) ----
+        // Creating a login is the highest-privilege action in the app, so every
+        // path through here is audited and the role is validated server-side
+        // against a fixed list -- never taken from the form as-is.
+        const teamPage = async (extra = {}) =>
+          views.teamPage({
+            user,
+            csrf,
+            theme,
+            users: await db.listUsers(env),
+            unlinkedFreelancers: await db.getFreelancersWithoutUser(env),
+            ...extra,
+          });
+
+        if (path === "/team" && method === "GET") {
+          return html(await teamPage());
+        }
+
+        if (path === "/team" && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+
+          const name = (f.name || "").trim();
+          const email = (f.email || "").trim().toLowerCase();
+          const role = f.role === "founder" ? "founder" : f.role === "freelancer" ? "freelancer" : null;
+
+          if (!name || !email || !role) {
+            return html(await teamPage({ error: "Name, email and role are all required." }), 400);
+          }
+          if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+            return html(await teamPage({ error: "That doesn't look like a valid email address." }), 400);
+          }
+
+          // A freelancer login without a freelancer profile can sign in but
+          // lands on an error page, so require the link up front.
+          let freelancerId = null;
+          if (role === "freelancer") {
+            const available = await db.getFreelancersWithoutUser(env);
+            const chosen = available.find((x) => String(x.id) === String(f.freelancer_id));
+            if (!chosen) {
+              return html(
+                await teamPage({
+                  error: "Pick which freelancer profile this login belongs to. Add the profile on the Freelancers page first if it isn't listed.",
+                }),
+                400
+              );
+            }
+            freelancerId = chosen.id;
+          }
+
+          const existing = await db.getUserByEmail(env, email);
+          if (existing) {
+            return html(await teamPage({ error: `${email} already has an account.` }), 409);
+          }
+
+          const token = randomToken();
+          await db.createUser(env, { email, name, role, freelancer_id: freelancerId, setup_token: token });
+          await db.logAudit(env, user, role === "founder" ? "founder_created" : "user_created", "user", null, `${name} <${email}>`);
+
+          return html(
+            await teamPage({
+              message: `${name} added as ${role}. Send them the link below — it works once.`,
+              inviteLink: `${url.origin}/setup/${token}`,
+              inviteFor: name,
+            })
+          );
+        }
+
+        const teamInvite = path.match(/^\/team\/(\d+)\/invite$/);
+        if (teamInvite && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          const target = await db.getUserById(env, teamInvite[1]);
+          if (!target) return html(views.errorPage("That account no longer exists.", 404, theme), 404);
+
+          const token = randomToken();
+          await db.reissueSetupToken(env, target.id, token);
+          await db.logAudit(env, user, "invite_reissued", "user", target.id, `${target.name} <${target.email}>`);
+          return html(
+            await teamPage({
+              message: `New link for ${target.name}. Any previous link or password for this account has stopped working.`,
+              inviteLink: `${url.origin}/setup/${token}`,
+              inviteFor: target.name,
+            })
+          );
+        }
+
+        const teamRevoke = path.match(/^\/team\/(\d+)\/revoke$/);
+        if (teamRevoke && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          const target = await db.getUserById(env, teamRevoke[1]);
+          if (!target) return html(views.errorPage("That account no longer exists.", 404, theme), 404);
+
+          // Two lockout guards. Neither is theoretical: without them one
+          // mis-click leaves nobody able to administer the system.
+          if (target.id === user.id) {
+            return html(await teamPage({ error: "You can't revoke your own access." }), 400);
+          }
+          // Only blocks when the target is itself a *working* founder login.
+          // Revoking a founder who never activated removes nothing, and
+          // blocking that would strand a sole founder who mistyped an invite.
+          if (target.role === "founder" && target.password_hash && (await db.countActiveFounders(env)) <= 1) {
+            return html(
+              await teamPage({ error: "That's the last founder with a working login — revoking it would lock everyone out." }),
+              400
+            );
+          }
+
+          await db.revokeUserAccess(env, target.id);
+          await db.logAudit(env, user, "access_revoked", "user", target.id, `${target.name} <${target.email}>`);
+          return html(await teamPage({ message: `${target.name}'s access has been revoked and their sessions ended.` }));
         }
 
         // ---- Audit log ----

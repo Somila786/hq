@@ -42,6 +42,7 @@ const FOUNDER_NAV = [
   ["clients", "/clients", "Clients"],
   ["leads", "/leads", "Leads"],
   ["revenue", "/revenue", "Revenue"],
+  ["team", "/team", "Team"],
   ["audit", "/audit", "Audit"],
   ["retention", "/retention", "Retention"],
   ["errors", "/errors", "Errors"],
@@ -65,7 +66,7 @@ function layout({ title, user, active, body, theme = "dark" }) {
     .map(([key, href, label]) => `<a href="${href}" class="mobilelink${active === key ? " on" : ""}">${esc(label)}</a>`)
     .join("");
 
-  const brand = `<div class="brandwrap"><span class="brand">Catalyst 7</span><span class="brand-sub">KPI</span></div>`;
+  const brand = `<div class="brandwrap"><span class="brand">Catalyst 7</span><span class="brand-sub">HQ</span></div>`;
   const modeToggle = `<a href="/theme/toggle" class="mode-toggle">${themeLabel}</a>`;
 
   const header = user
@@ -95,7 +96,7 @@ function layout({ title, user, active, body, theme = "dark" }) {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>${esc(title)} &middot; Catalyst 7 KPI</title>
+<title>${esc(title)} &middot; Catalyst 7 HQ</title>
 <style>
 :root {
   --bg: #0D0D0D; --text: #F5EDD8; --text-muted: #9c9686;
@@ -872,6 +873,134 @@ export function historyPage({ user, rows, theme }) {
         }
       </div>
     </div>
+  `,
+  });
+}
+
+// ---------- Founder: Team / user accounts ----------
+export function teamPage({
+  user,
+  users,
+  unlinkedFreelancers = [],
+  csrf,
+  theme,
+  error,
+  message,
+  inviteLink,
+  inviteFor,
+}) {
+  const statusPill = (u) => {
+    if (u.has_password) return pill("active", "green");
+    if (u.invite_pending) return pill("invite sent");
+    return pill("no access", "red");
+  };
+
+  const rows = users
+    .map((u) => {
+      const isSelf = u.id === user.id;
+      return `<tr>
+      <td class="strong">${esc(u.name)}${isSelf ? ' <span class="hint">(you)</span>' : ""}${
+        u.freelancer_name ? `<br/><span class="hint">profile: ${esc(u.freelancer_name)}</span>` : ""
+      }</td>
+      <td class="muted">${esc(u.email)}</td>
+      <td>${u.role === "founder" ? pill("founder", "green") : pill("freelancer")}</td>
+      <td>${statusPill(u)}</td>
+      <td class="muted nowrap">${u.totp_enabled ? "2FA on" : "&mdash;"}${u.google_linked ? " &middot; Google" : ""}</td>
+      <td class="right">
+        <div class="row-actions">
+          <form method="post" action="/team/${u.id}/invite">${csrfField(csrf)}<button type="submit" class="btn btn-sm">${
+            u.has_password ? "Reset access" : "New link"
+          }</button></form>
+          ${
+            isSelf
+              ? ""
+              : `<form method="post" action="/team/${u.id}/revoke" onsubmit="return confirm('Revoke access for this person? They will be signed out everywhere and will need a new invite link to get back in.');">${csrfField(
+                  csrf
+                )}<button type="submit" class="btn btn-sm btn-danger">Revoke</button></form>`
+          }
+        </div>
+      </td>
+    </tr>`;
+    })
+    .join("");
+
+  const freelancerOptions = unlinkedFreelancers.map((f) => `<option value="${f.id}">${esc(f.name)}</option>`).join("");
+
+  return layout({
+    user,
+    active: "team",
+    title: "Team",
+    theme,
+    body: `
+    <input type="checkbox" id="add-toggle" class="form-toggle" />
+    <div class="page-head-row">
+      <div>
+        <div class="page-title">Team</div>
+        <div class="page-sub">${users.length} ${users.length === 1 ? "account" : "accounts"} &middot; who can sign in, and what they can see</div>
+      </div>
+      <label for="add-toggle" class="btn btn-primary"><span class="toggle-open">Add person</span><span class="toggle-close">Close</span></label>
+    </div>
+
+    ${error ? `<div class="msg msg-error">${esc(error)}</div>` : ""}
+    ${message ? `<div class="msg msg-ok">${esc(message)}</div>` : ""}
+    ${
+      inviteLink
+        ? `<div class="msg msg-ok">Invite link${inviteFor ? ` for ${esc(inviteFor)}` : ""} &mdash; send it via WhatsApp or email, it works once and then expires:<span class="mono-box">${esc(
+            inviteLink
+          )}</span><span class="hint">This is the only time it's shown. If it gets lost, use "New link" to issue another.</span></div>`
+        : ""
+    }
+
+    <div class="panel add-panel">
+      <div class="panel-head">Add someone to the team</div>
+      <form class="plain" method="post" action="/team">
+        ${csrfField(csrf)}
+        <div class="form-grid">
+          <div class="field"><label>Full name</label><input name="name" required placeholder="Somila" /></div>
+          <div class="field"><label>Email</label><input name="email" type="email" required placeholder="somila@catalyst7.co.za" /></div>
+          <div class="field"><label>Role</label>
+            <select name="role">
+              <option value="founder">Founder &mdash; full access</option>
+              <option value="freelancer">Freelancer &mdash; own weekly log only</option>
+            </select>
+          </div>
+          <div class="field"><label>Freelancer profile (freelancers only)</label>
+            <select name="freelancer_id">
+              <option value="">&mdash;</option>
+              ${freelancerOptions}
+            </select>
+            <span class="hint">${
+              unlinkedFreelancers.length
+                ? "Required if the role is Freelancer, so their weekly log points at the right person."
+                : "No unlinked freelancer profiles. Add one on the Freelancers page first."
+            }</span>
+          </div>
+        </div>
+        <div class="form-foot">
+          <label for="add-toggle" class="btn">Cancel</label>
+          <button type="submit" class="btn btn-primary">Add person</button>
+        </div>
+      </form>
+    </div>
+
+    <div class="panel">
+      <div class="table-wrap">
+        ${
+          rows
+            ? `<table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th>Sign-in</th><th class="right">Actions</th></tr></thead><tbody>${rows}</tbody></table>`
+            : `<div class="empty">No accounts yet.</div>`
+        }
+      </div>
+    </div>
+
+    <h2 class="section-label" style="margin-top:32px">What the roles mean</h2>
+    <div class="panel"><div class="security-body">
+      <div class="security-copy" style="max-width:640px">
+        <strong>Founder</strong> sees everything &mdash; dashboard, revenue, clients, leads, the audit log, and this page.<br/><br/>
+        <strong>Freelancer</strong> only ever sees their own weekly log and history. They cannot reach any founder page, and cannot see another freelancer's hours.<br/><br/>
+        Nobody can change their own role, and roles are checked on the server for every request &mdash; not just hidden in the menu.
+      </div>
+    </div></div>
   `,
   });
 }

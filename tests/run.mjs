@@ -1123,6 +1123,224 @@ await test("backup code endpoints are behind CSRF and require 2FA to be on", asy
   eq(await db.countUnusedBackupCodes(env, id), 0, "still nothing generated");
 });
 
+console.log("\nTeam / user accounts");
+
+function inviteLinkFrom(body) {
+  const m = body.match(/\/setup\/([a-f0-9]{48,})/);
+  return m ? m[1] : null;
+}
+
+await test("a founder can create another founder and gets a one-time invite link", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+
+  const res = await worker.fetch(
+    req("/team", {
+      method: "POST",
+      cookies: { c7_session: session },
+      form: { name: "Somila", email: "Somila@Catalyst7.co.za", role: "founder", _csrf: csrf },
+    }),
+    env
+  );
+  eq(res.status, 200, "status");
+  const body = await res.text();
+  const token = inviteLinkFrom(body);
+  assert(token, "invite link rendered");
+
+  const created = await db.getUserByEmail(env, "somila@catalyst7.co.za");
+  assert(created, "email is normalised to lowercase before storing");
+  eq(created.role, "founder", "role applied");
+  eq(created.password_hash, null, "no password until they set one");
+  eq(created.setup_token, token, "token matches the link shown");
+  assert((await auditActions(env)).includes("founder_created"), "creation audited");
+
+  // The link actually works end to end.
+  const setup = await worker.fetch(
+    req(`/setup/${token}`, { method: "POST", form: { password: "somilas-password", confirm: "somilas-password" } }),
+    env
+  );
+  eq(setup.status, 302, "new founder can activate");
+  assert(setCookie(setup, "c7_session"), "and is signed straight in");
+  const after = await db.getUserByEmail(env, "somila@catalyst7.co.za");
+  assert(after.password_hash, "password set");
+  eq(after.setup_token, null, "token consumed");
+});
+
+await test("the new founder really does get founder-level access", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const created = await worker.fetch(
+    req("/team", { method: "POST", cookies: { c7_session: session }, form: { name: "Somila", email: "somila@catalyst7.co.za", role: "founder", _csrf: csrf } }),
+    env
+  );
+  const token = inviteLinkFrom(await created.text());
+  const setup = await worker.fetch(
+    req(`/setup/${token}`, { method: "POST", form: { password: "somilas-password", confirm: "somilas-password" } }),
+    env
+  );
+  const theirSession = setCookie(setup, "c7_session");
+
+  for (const p of ["/dashboard", "/revenue", "/team", "/audit"]) {
+    const r = await worker.fetch(req(p, { cookies: { c7_session: theirSession } }), env);
+    eq(r.status, 200, `${p} reachable by the new founder`);
+  }
+});
+
+await test("creating a freelancer login requires a real freelancer profile", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+
+  const noProfile = await worker.fetch(
+    req("/team", { method: "POST", cookies: { c7_session: session }, form: { name: "Naledi", email: "naledi@example.com", role: "freelancer", _csrf: csrf } }),
+    env
+  );
+  eq(noProfile.status, 400, "refused without a linked profile");
+  eq(await db.getUserByEmail(env, "naledi@example.com"), null, "nothing created");
+
+  await db.createFreelancer(env, { name: "Naledi Khumalo" });
+  const fl = (await db.getFreelancers(env))[0];
+  const ok = await worker.fetch(
+    req("/team", {
+      method: "POST",
+      cookies: { c7_session: session },
+      form: { name: "Naledi", email: "naledi@example.com", role: "freelancer", freelancer_id: String(fl.id), _csrf: csrf },
+    }),
+    env
+  );
+  eq(ok.status, 200, "accepted with a profile");
+  const created = await db.getUserByEmail(env, "naledi@example.com");
+  eq(created.freelancer_id, fl.id, "linked to the profile");
+  eq(created.role, "freelancer", "role applied");
+
+  // That profile is no longer offered for a second login.
+  eq((await db.getFreelancersWithoutUser(env)).length, 0, "already-linked profiles drop out of the picker");
+});
+
+await test("the add-person form validates and refuses duplicates", async () => {
+  const env = makeEnv();
+  const f = await seedFounder(env);
+  const { session } = await login(env, f.email, FOUNDER_PW);
+  const csrf = await csrfFor(env, session);
+  const post = (form) => worker.fetch(req("/team", { method: "POST", cookies: { c7_session: session }, form: { ...form, _csrf: csrf } }), env);
+
+  eq((await post({ name: "", email: "x@y.co", role: "founder" })).status, 400, "name required");
+  eq((await post({ name: "X", email: "", role: "founder" })).status, 400, "email required");
+  eq((await post({ name: "X", email: "not-an-email", role: "founder" })).status, 400, "email must look like one");
+  eq((await post({ name: "X", email: "x@y.co", role: "superuser" })).status, 400, "role must be founder or freelancer");
+  eq((await post({ name: "Dupe", email: f.email, role: "founder" })).status, 409, "duplicate email refused");
+
+  const { results } = await env.DB.prepare("SELECT * FROM users").all();
+  eq(results.length, 1, "no junk accounts created by any of that");
+});
+
+await test("only founders can reach the team page", async () => {
+  const env = makeEnv();
+  const fl = await seedFreelancer(env);
+  const { session } = await login(env, fl.email, FREELANCER_PW);
+  eq((await worker.fetch(req("/team", { cookies: { c7_session: session } }), env)).status, 404, "GET blocked");
+  const post = await worker.fetch(
+    req("/team", { method: "POST", cookies: { c7_session: session }, form: { name: "Sneaky", email: "sneaky@x.co", role: "founder" } }),
+    env
+  );
+  eq(post.status, 404, "POST blocked -- a freelancer cannot mint a founder");
+  eq(await db.getUserByEmail(env, "sneaky@x.co"), null, "nothing created");
+});
+
+await test("reissuing an invite invalidates the old password and link", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const fl = await seedFreelancer(env);
+
+  const res = await worker.fetch(
+    req(`/team/${fl.userId}/invite`, { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf } }),
+    env
+  );
+  eq(res.status, 200, "status");
+  const token = inviteLinkFrom(await res.text());
+  assert(token, "new link issued");
+
+  const u = await db.getUserById(env, fl.userId);
+  eq(u.password_hash, null, "old password cleared");
+  eq(u.setup_token, token, "new token stored");
+
+  // Their old password no longer signs them in.
+  const { res: oldPw } = await login(env, fl.email, FREELANCER_PW);
+  eq(oldPw.status, 401, "old password rejected");
+  assert((await auditActions(env)).includes("invite_reissued"), "audited");
+});
+
+await test("revoking access ends sessions and locks the account", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const fl = await seedFreelancer(env);
+  const { session: theirSession } = await login(env, fl.email, FREELANCER_PW);
+  eq((await worker.fetch(req("/log", { cookies: { c7_session: theirSession } }), env)).status, 200, "they can get in beforehand");
+
+  const res = await worker.fetch(
+    req(`/team/${fl.userId}/revoke`, { method: "POST", cookies: { c7_session: theirSession ? session : session }, form: { _csrf: csrf } }),
+    env
+  );
+  eq(res.status, 200, "status");
+
+  const after = await db.getUserById(env, fl.userId);
+  assert(after, "the row is kept, not deleted");
+  eq(after.password_hash, null, "password cleared");
+  eq(after.setup_token, null, "no dangling invite");
+  eq(after.totp_enabled, 0, "2FA cleared");
+
+  const live = await worker.fetch(req("/log", { cookies: { c7_session: theirSession } }), env);
+  eq(live.headers.get("Location"), "/login", "their existing session is dead immediately");
+  const { res: relogin } = await login(env, fl.email, FREELANCER_PW);
+  eq(relogin.status, 401, "old password no longer works");
+  assert((await auditActions(env)).includes("access_revoked"), "audited");
+});
+
+await test("the lockout guards hold", async () => {
+  const env = makeEnv();
+  const { id, session, csrf } = await founderSession(env);
+
+  const self = await worker.fetch(
+    req(`/team/${id}/revoke`, { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf } }),
+    env
+  );
+  eq(self.status, 400, "cannot revoke yourself");
+  has(await self.text(), "revoke your own access", "explains why");
+
+  // Add a second founder but leave them un-activated, so there is still only
+  // one *working* founder login.
+  await worker.fetch(
+    req("/team", { method: "POST", cookies: { c7_session: session }, form: { name: "Somila", email: "somila@catalyst7.co.za", role: "founder", _csrf: csrf } }),
+    env
+  );
+  const second = await db.getUserByEmail(env, "somila@catalyst7.co.za");
+  const other = await worker.fetch(
+    req(`/team/${second.id}/revoke`, { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf } }),
+    env
+  );
+  // Revoking a not-yet-activated founder is fine -- it isn't the last working login.
+  eq(other.status, 200, "revoking a pending founder is allowed");
+
+  const me = await db.getUserById(env, id);
+  assert(me.password_hash, "my own login is untouched throughout");
+});
+
+await test("team mutations are behind CSRF", async () => {
+  const env = makeEnv();
+  const { session } = await founderSession(env);
+  const fl = await seedFreelancer(env);
+  for (const [p, form] of [
+    ["/team", { name: "X", email: "x@y.co", role: "founder" }],
+    [`/team/${fl.userId}/invite`, {}],
+    [`/team/${fl.userId}/revoke`, {}],
+  ]) {
+    const r = await worker.fetch(req(p, { method: "POST", cookies: { c7_session: session }, form }), env);
+    eq(r.status, 403, `${p} rejected without a CSRF token`);
+  }
+  eq(await db.getUserByEmail(env, "x@y.co"), null, "nothing created");
+  const stillThere = await db.getUserById(env, fl.userId);
+  assert(stillThere.password_hash, "freelancer's access untouched");
+});
+
 console.log("\nSecurity headers");
 
 await test("every response carries the security header set", async () => {
@@ -1168,6 +1386,9 @@ await test("the CSP script hashes match the inline handlers actually emitted", a
   await db.createLead(env, { name: "Zanele", stage: "new" });
   const lead = (await db.getLeads(env))[0];
   await db.flagForRetentionReview(env, "lead", lead.id, "stale");
+  // A second account, so /team renders its revoke button -- that row is hidden
+  // for your own user, and without it the page carries no inline handler.
+  await seedFreelancer(env);
 
   const csp = (await worker.fetch(req("/dashboard", { cookies: { c7_session: session } }), env)).headers.get(
     "Content-Security-Policy"
@@ -1180,8 +1401,10 @@ await test("the CSP script hashes match the inline handlers actually emitted", a
   lacks(scriptSrc, "'unsafe-inline'", "script-src must never fall back to unsafe-inline");
   lacks(csp, "'unsafe-eval'", "no eval anywhere");
 
+  // Must cover every page that carries an inline handler, or the
+  // no-stale-digests check below fires a false positive.
   const pages = await Promise.all(
-    ["/leads", "/retention"].map(async (p) => (await worker.fetch(req(p, { cookies: { c7_session: session } }), env)).text())
+    ["/leads", "/retention", "/team"].map(async (p) => (await worker.fetch(req(p, { cookies: { c7_session: session } }), env)).text())
   );
 
   const handlers = new Set();

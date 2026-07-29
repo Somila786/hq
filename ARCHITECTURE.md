@@ -1,4 +1,8 @@
-# Catalyst 7 KPI — Full System Architecture & Requirements
+# Catalyst 7 HQ — Full System Architecture & Requirements
+
+The product is branded **Catalyst 7 HQ** in the interface. The Cloudflare Worker
+and D1 database are still named `catalyst7-kpi` — infrastructure names are
+awkward to change and nobody sees them, so they were deliberately left alone.
 
 Status: frontend, backend, and database are built and live in your Cloudflare account.
 Deploy (`wrangler deploy`) and domain binding are the only steps still on you.
@@ -9,7 +13,7 @@ Deploy (`wrangler deploy`) and domain binding are the only steps still on you.
 
 - **No framework, no build step.** Server-rendered HTML strings (`src/views.js`), generated per-request by the Worker. Forms POST directly to routes; the page reloads. No React, no bundler, and the only client-side JS on the entire site is one `onchange` auto-submit on the lead-stage dropdown and one `confirm()` on the retention "Erase" button.
 - **Why this choice:** zero dependency surface, zero build pipeline to maintain, loads fast on mobile data (matches C7's mobile-first / performance-as-accessibility standard — no JS bundle to download at all).
-- **Pages:** login, 2FA verification, first-time password setup, security/2FA self-service, founder dashboard, freelancers, clients, leads, revenue, audit log, error log, retention review, freelancer weekly log, freelancer history.
+- **Pages:** login, 2FA verification, first-time password setup, security/2FA self-service, founder dashboard, freelancers, clients, leads, revenue, **team**, audit log, error log, retention review, freelancer weekly log, freelancer history.
 - **Brand design system.** Three colours only — black `#0D0D0D`, cream `#F5EDD8`, red `#C1272D`. Dark mode is black-on-cream-text, light mode is the inverse; red is the single accent in both. Small red text in dark mode uses a lightened tint `#E2726B`, because full red only reaches ~3.3:1 on `#0D0D0D` at small sizes (it's fine at ~5:1 on cream). Everything is driven by CSS custom properties on `:root`, overridden by `html[data-theme="light"]`.
 - **Theming is server-driven, not client-side.** The theme lives in a `c7_theme` cookie. `src/index.js` reads it on every request and passes `theme` into each `views.*Page()` call; `layout()` stamps it onto `<html data-theme="...">`. `GET /theme/toggle` flips the cookie and redirects back to the page you came from (same-origin Referer only — a cross-origin or malformed Referer falls back to `/`). The cookie is `HttpOnly`, since only the server ever reads it. No flash-of-wrong-theme and no JS required.
 - **Two pure-CSS interaction patterns, no JS.** The mobile nav and the collapsible "Add X" forms on Freelancers/Clients/Leads/Revenue are both built on the checkbox hack: a hidden `<input type="checkbox">` plus a `<label for="...">` and the `~` sibling combinator. Both depend on the checkbox being emitted *before* its siblings in the markup — there's a test asserting that ordering.
@@ -23,6 +27,7 @@ Deploy (`wrangler deploy`) and domain binding are the only steps still on you.
 - **Files:** `src/index.js` (routing), `src/db.js` (data access, parameterized queries only), `src/auth.js` (password hashing, sessions, week math).
 - **Auth mechanism:** PBKDF2 (Web Crypto, 100,000 iterations, SHA-256) for password hashing — no plaintext password ever touches the database or me. Sessions are random 32-byte tokens stored in a `sessions` table, set as `HttpOnly; Secure; SameSite=Lax` cookies, 30-day expiry. Optional Google sign-in and optional TOTP 2FA (with backup codes) sit alongside, all landing on the same session — see section 6.
 - **Roles enforced server-side:** `founder` (full access) vs `freelancer` (own weekly-log row only) — checked on every route, not just hidden in the UI.
+- **Account management (`/team`, founders only):** create founder or freelancer logins, re-issue a one-time invite link, or revoke access. The role is validated against a fixed list server-side, never taken from the form as submitted, so a freelancer cannot mint a founder even by forging a request. A freelancer login must be linked to an existing freelancer profile at creation, because `/log` resolves rows through `freelancer_id` and an unlinked account would sign in to an error. Revoking clears credentials, 2FA and any Google link, and deletes live sessions immediately — being signed out everywhere is the point. Two lockout guards: you cannot revoke yourself, and you cannot revoke the last founder who actually has a working login. Every action is audited.
 - **Zero third-party runtime dependencies** — only `wrangler` itself as a devDependency. Nothing to audit for supply-chain risk.
 
 ## 3. Database
@@ -50,16 +55,12 @@ Cloudflare D1 (managed SQLite), already created and live: `catalyst7-kpi` (`ba62
 
 `users` also gained a `google_sub` column, holding Google's stable subject id once an account has been linked.
 
-**The two newest tables are not yet on the live database.** They were added after it was provisioned, so apply the migration before deploying:
-
-```bash
-npx wrangler d1 execute catalyst7-kpi --remote --file=./migrations/001_google_auth_and_backup_codes.sql
-```
+Migration `001` (the two newest tables plus `users.google_sub`) **has been applied to the live database** — verified against a rebuild of the previous schema, producing a structurally identical result. `migrations/001_...sql` is kept for rebuilding from scratch.
 
 - All queries are parameterized (`.bind()`) — no string-concatenated SQL, so no SQL injection surface.
 - `CHECK` constraints enforce valid values at the database layer (e.g. lead stage, revenue type) — tested live, confirmed rejecting bad data.
 - No ORM. Deliberate — this schema is small enough that a query layer adds more indirection than value.
-- All of the above verified with 54 end-to-end tests (`tests/run.mjs`) run against a real SQLite engine (Node's `node:sqlite`) loaded with this exact schema and exercising the actual `src/` code — not a reimplementation. All 54 pass.
+- All of the above verified with 63 end-to-end tests (`tests/run.mjs`) run against a real SQLite engine (Node's `node:sqlite`) loaded with this exact schema and exercising the actual `src/` code — not a reimplementation. All 63 pass.
 
 ## 4. Privacy — POPIA
 
@@ -118,7 +119,7 @@ This system is a **Responsible Party** under POPIA for the data it holds (it's C
 - **CI/CD: not present in this repo.** Earlier drafts of this document described a `.github/workflows/deploy.yml` ready to auto-deploy on push to `main` via `cloudflare/wrangler-action`; that file is **not** in the current tree. Whenever it is added it will still need two things: the repo actually on GitHub, and a `CLOUDFLARE_API_TOKEN` repo secret. Until then, `npx wrangler deploy` from a terminal is the deploy path. `npm test` is the pre-deploy gate to run by hand.
 - **Backups:** D1 has point-in-time recovery built into the Cloudflare platform (up to 30 days) with no extra configuration — worth confirming this is enabled on your account tier, but nothing for us to build.
 - **No staging environment** — one production database, no preview/test copy. Fine for now given the low change frequency; worth revisiting if you start iterating on the schema often.
-- **Test coverage:** 54 end-to-end tests (`npm test`) exercise the actual shipped code (not a reimplementation) against a real SQLite engine standing in for D1 — login, rate limiting, CSRF enforcement, 2FA enable + login flow, retention scan + erasure, audit logging, role-based access, theme cookie plumbing, and the checkbox-hack markup contracts all covered. All 54 pass. Not wired into CI yet (see above) — currently a manual `node` script, not something that runs automatically on every change.
+- **Test coverage:** 63 end-to-end tests (`npm test`) exercise the actual shipped code (not a reimplementation) against a real SQLite engine standing in for D1 — login, rate limiting, CSRF enforcement, 2FA enable + login flow, retention scan + erasure, audit logging, role-based access, theme cookie plumbing, and the checkbox-hack markup contracts all covered. All 63 pass. Not wired into CI yet (see above) — currently a manual `node` script, not something that runs automatically on every change.
 - **Local preview:** `npm run preview` (`tests/devserver.mjs`) runs the real Worker against a seeded in-memory database on `http://localhost:8788`, pre-authenticated as a demo founder. It exists so a design change can be eyeballed at any viewport in seconds, offline, without Cloudflare credentials. `wrangler dev` remains the higher-fidelity check against the real D1 binding.
 
 ## 8. What's still needed — punch list, in priority order
@@ -128,7 +129,7 @@ This system is a **Responsible Party** under POPIA for the data it holds (it's C
 3. **Turn on 2FA** for your founder account from `/security` once you're in — the mechanism is built, it's just off by default.
 4. **Add the other two founders** (manual D1 insert for now — documented in the README).
 5. **Decide who owns the retention review** — check `/retention` periodically (it'll be empty until records go stale for 365+ days, so this is a "set a calendar reminder for a few months out" item, not urgent).
-6. Genuinely optional from here: wire up the GitHub Actions workflow if a repo gets created, add 2FA backup codes, add Cloudflare Notification alerts, build edit/delete UI for records, self-serve founder invites.
+6. Genuinely optional from here: wire up a GitHub Actions workflow if a repo gets created, add Cloudflare Notification alerts, build edit/delete UI for records, and give the CSS-only toggles keyboard support.
 
 ---
 

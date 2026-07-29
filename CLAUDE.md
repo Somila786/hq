@@ -38,7 +38,7 @@ src/views.js    — every page's HTML, plus the shared CSS/layout
 schema.sql      — reference copy of the live D1 schema
 wrangler.toml   — Worker config, D1 binding, monthly Cron Trigger
 tests/d1.mjs    — node:sqlite wrapper matching D1's prepare/bind/first/all/run
-tests/run.mjs   — 54 end-to-end tests (`npm test`)
+tests/run.mjs   — 63 end-to-end tests (`npm test`)
 tests/devserver.mjs — local preview server (`npm run preview`), seeded demo data
 README.md       — deploy steps, day-to-day usage, known limitations
 ARCHITECTURE.md — full frontend/backend/database/privacy/security breakdown
@@ -68,10 +68,10 @@ outstanding at the previous handoff has landed:
 
 The test suite was **not** in the handoff zip and has been rebuilt from the
 description in "Testing" below: `tests/d1.mjs` (the D1 adapter) and
-`tests/run.mjs` (54 tests). It is a reconstruction, not the byte-identical
+`tests/run.mjs` (63 tests). It is a reconstruction, not the byte-identical
 original — it covers the same documented ground (auth, rate limiting, CSRF,
 roles, audit, 2FA, retention/erasure, CHECK constraints) plus the new theme
-routes and the checkbox-hack markup contracts. 54/54 pass.
+routes and the checkbox-hack markup contracts. 63/63 pass.
 
 **A second pass then added Google sign-in, security headers and 2FA backup
 codes** (see "Auth & security" below). That pass introduced migration
@@ -93,7 +93,7 @@ Google sign-in will error on the missing tables.
    dormant and password login is unaffected.
 5. Optional, in rough priority order: keyboard accessibility for the two
    checkbox-hack toggles (see ARCHITECTURE.md §1 — currently mouse/touch only),
-   a `.github/workflows/deploy.yml`, edit/delete UI, self-serve founder invites.
+   a `.github/workflows/deploy.yml`, edit/delete UI for business records.
 
 ## Auth & security
 
@@ -145,7 +145,7 @@ looks visually wrong and you want to diff against the original mockup.
 Security hardening pass is complete: login rate limiting, CSRF protection,
 audit log, optional TOTP 2FA, error log, monthly retention review with a
 founder-approved erasure action. All of it is covered by an end-to-end test
-suite (see Testing below) — 54/54 passing as of the last run.
+suite (see Testing below) — 63/63 passing as of the last run.
 
 ## Testing
 
@@ -176,8 +176,6 @@ npm run preview   # real app + demo data at localhost:8788, for eyeballing UI
 
 - No edit/delete UI for clients/leads/freelancers/revenue rows — add + status
   toggle only. Corrections go via `wrangler d1 execute`.
-- No self-serve founder invite UI — adding a founder is a manual D1 insert
-  (documented in README.md).
 - No CI/CD workflow in the repo at all (see the file map note above).
 - The mobile nav and the collapsible add-forms are CSS-only and therefore not
   keyboard-operable. Deliberate trade-off for the zero-JS constraint, but it is

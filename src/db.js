@@ -241,6 +241,82 @@ export async function clearBackupCodes(env, userId) {
   await env.DB.prepare("DELETE FROM totp_backup_codes WHERE user_id = ?").bind(userId).run();
 }
 
+// ---- Team / user accounts ----
+// Never selects password_hash or password_salt -- nothing that renders a user
+// list has any business holding those in memory.
+export async function listUsers(env) {
+  const { results } = await env.DB.prepare(
+    `SELECT u.id, u.email, u.name, u.role, u.freelancer_id, u.created_at, u.totp_enabled,
+            u.setup_token IS NOT NULL AS invite_pending,
+            u.password_hash IS NOT NULL AS has_password,
+            u.google_sub IS NOT NULL AS google_linked,
+            f.name AS freelancer_name
+     FROM users u
+     LEFT JOIN freelancers f ON f.id = u.freelancer_id
+     ORDER BY CASE u.role WHEN 'founder' THEN 0 ELSE 1 END, u.name`
+  ).all();
+  return results;
+}
+
+export async function getUserById(env, id) {
+  return env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(id).first();
+}
+
+// Freelancer profiles that don't yet have a login attached -- the only valid
+// targets when creating a freelancer account, since /log resolves a user's
+// rows through freelancer_id and breaks without one.
+export async function getFreelancersWithoutUser(env) {
+  const { results } = await env.DB.prepare(
+    `SELECT f.id, f.name FROM freelancers f
+     WHERE f.active = 1
+       AND NOT EXISTS (SELECT 1 FROM users u WHERE u.freelancer_id = f.id)
+     ORDER BY f.name`
+  ).all();
+  return results;
+}
+
+export async function createUser(env, u) {
+  return env.DB.prepare(
+    "INSERT INTO users (email, name, role, freelancer_id, setup_token) VALUES (?, ?, ?, ?, ?)"
+  )
+    .bind(u.email, u.name, u.role, u.freelancer_id || null, u.setup_token)
+    .run();
+}
+
+// Issuing a fresh invite clears any existing password: the link is a way back
+// in for someone locked out, so the old credential must stop working.
+export async function reissueSetupToken(env, id, token) {
+  return env.DB.prepare(
+    "UPDATE users SET setup_token = ?, password_hash = NULL, password_salt = NULL WHERE id = ?"
+  )
+    .bind(token, id)
+    .run();
+}
+
+// Locks an account without deleting it, so audit history and any linked
+// records stay intact -- same principle as the retention flow.
+export async function revokeUserAccess(env, id) {
+  await env.DB.prepare(
+    `UPDATE users SET password_hash = NULL, password_salt = NULL, setup_token = NULL,
+                      totp_secret = NULL, totp_enabled = 0, google_sub = NULL
+     WHERE id = ?`
+  )
+    .bind(id)
+    .run();
+  // Kill any live session immediately -- revoking is pointless if the person
+  // stays signed in on a device they already have open.
+  await env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM pending_logins WHERE user_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM totp_backup_codes WHERE user_id = ?").bind(id).run();
+}
+
+export async function countActiveFounders(env) {
+  const row = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM users WHERE role = 'founder' AND password_hash IS NOT NULL"
+  ).first();
+  return row.n;
+}
+
 // ---- Google account binding ----
 export async function getUserByEmail(env, email) {
   return env.DB.prepare("SELECT * FROM users WHERE email = ?").bind(email).first();

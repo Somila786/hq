@@ -263,7 +263,7 @@ export async function verifyTotp(secretBase32, userCode, timeStepSeconds = 30) {
   return false;
 }
 
-export function totpUri(secretBase32, email, issuer = "Catalyst7 KPI") {
+export function totpUri(secretBase32, email, issuer = "Catalyst7 HQ") {
   return `otpauth://totp/${encodeURIComponent(issuer)}:${encodeURIComponent(email)}?secret=${secretBase32}&issuer=${encodeURIComponent(
     issuer
   )}&algorithm=SHA1&digits=6&period=30`;
