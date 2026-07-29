@@ -22,15 +22,81 @@ import {
   generateTotpSecret,
   totpUri,
   verifyTotp,
+  generateBackupCodes,
+  hashBackupCode,
+  looksLikeBackupCode,
+  googleConfigured,
+  googleAuthUrl,
+  exchangeGoogleCode,
+  decodeJwtPayload,
+  validateGoogleIdToken,
+  randomUrlSafe,
+  pkceChallenge,
+  createOAuthState,
+  consumeOAuthState,
+  purgeExpiredOAuthStates,
 } from "./auth.js";
 import * as db from "./db.js";
 import * as views from "./views.js";
+
+// ---- Security response headers ----
+//
+// The site loads no external resources and ships no script files, so the CSP
+// can be close to maximally strict. Two exceptions, both pre-existing inline
+// event handlers rather than anything this pass introduced:
+//
+//   - `this.form.submit()`   -- lead stage <select> auto-submit
+//   - `return confirm(...)`  -- retention "Erase" confirmation
+//
+// Inline *handlers* cannot be covered by a plain hash the way an inline
+// <script> block can, so they need 'unsafe-hashes' alongside their digests.
+// Despite the name that is not a wildcard: only these two exact source strings
+// can run, and injected script still cannot. Deleting both handlers would let
+// this drop to `script-src 'none'`; tests/run.mjs asserts these digests still
+// match what views.js emits, so they cannot silently drift.
+const INLINE_SCRIPT_HASHES = [
+  "'sha256-osjxnKEPL/pQJbFk1dKsF7PYFmTyMWGmVSiL9inhxJY='", // this.form.submit()
+  "'sha256-h8g6LCqXGbG2tO/pvAHBjSIDgOVHHT7/zXTJSzndxl0='", // retention erase confirm()
+];
+
+// style-src keeps 'unsafe-inline': the layout ships one big inline <style>
+// block (hashable) but also uses a scattering of inline style="" attributes
+// (not hashable without listing every one). Style injection is a far smaller
+// prize than script injection, and script-src stays locked down regardless.
+const CSP = [
+  "default-src 'none'",
+  `script-src 'unsafe-hashes' ${INLINE_SCRIPT_HASHES.join(" ")}`,
+  "style-src 'unsafe-inline'",
+  "img-src 'self' data:",
+  "form-action 'self'",
+  "base-uri 'none'",
+  "frame-ancestors 'none'",
+].join("; ");
+
+const SECURITY_HEADERS = {
+  "Content-Security-Policy": CSP,
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  // Must stay `same-origin`, not `no-referrer`: /theme/toggle reads the
+  // Referer to send you back to the page you were on. Cross-origin requests
+  // (the hop to Google) still leak nothing.
+  "Referrer-Policy": "same-origin",
+  "Permissions-Policy": "geolocation=(), camera=(), microphone=(), payment=(), usb=(), interest-cohort=()",
+  "Cross-Origin-Opener-Policy": "same-origin",
+  "Cross-Origin-Resource-Policy": "same-origin",
+  // Every page is per-user and dynamic; none should sit in a shared or
+  // on-disk cache where it survives logout or the back button.
+  "Cache-Control": "no-store",
+  // Ignored by browsers over plain http (so the local preview is unaffected)
+  // and by Cloudflare's own edge on workers.dev.
+  "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+};
 
 // Set-Cookie cannot be safely comma-joined into a single header (cookie
 // Expires values contain commas), so any extraHeaders["Set-Cookie"] may be
 // a string or an array of strings -- each gets its own header line.
 function buildHeaders(base, extraHeaders) {
-  const headers = new Headers(base);
+  const headers = new Headers({ ...SECURITY_HEADERS, ...base });
   for (const [key, value] of Object.entries(extraHeaders)) {
     if (key === "Set-Cookie" && Array.isArray(value)) {
       for (const v of value) headers.append("Set-Cookie", v);
@@ -52,9 +118,17 @@ function redirect(location, extraHeaders = {}) {
   return new Response(null, { status: 302, headers: buildHeaders({ Location: location }, extraHeaders) });
 }
 
+// A POST with a missing or unparseable body should fall through to the CSRF
+// guard as an empty form (-> a clean 403), not throw and surface as a 500 with
+// a row in error_log. Real browser submissions always parse; the ones that
+// don't are junk or probing traffic, and shouldn't be able to fill the log.
 async function readForm(request) {
-  const form = await request.formData();
-  return Object.fromEntries(form.entries());
+  try {
+    const form = await request.formData();
+    return Object.fromEntries(form.entries());
+  } catch {
+    return {};
+  }
 }
 
 function clientIp(request) {
@@ -97,7 +171,139 @@ export default {
       if (path === "/login" && method === "GET") {
         const existing = await getSessionUser(request, env);
         if (existing) return redirect("/");
-        return html(views.loginPage({ theme }));
+        return html(views.loginPage({ theme, googleEnabled: googleConfigured(env) }));
+      }
+
+      // ---------- Public: Google sign-in ----------
+      // Google proves *who* someone is. It never decides whether they may in:
+      // that stays with the users table, checked in the callback below.
+      if (path === "/auth/google" && method === "GET") {
+        if (!googleConfigured(env)) {
+          return html(views.errorPage("Google sign-in isn't configured on this deployment.", 404, theme), 404);
+        }
+        const existing = await getSessionUser(request, env);
+        if (existing) return redirect("/");
+
+        await purgeExpiredOAuthStates(env);
+        const redirectUri = `${url.origin}/auth/google/callback`;
+        const nonce = randomUrlSafe(16);
+        const codeVerifier = randomUrlSafe(32);
+        const challenge = await pkceChallenge(codeVerifier);
+        const state = await createOAuthState(env, { nonce, codeVerifier, redirectUri });
+
+        return redirect(googleAuthUrl({ clientId: env.GOOGLE_CLIENT_ID, redirectUri, state, nonce, challenge }));
+      }
+
+      if (path === "/auth/google/callback" && method === "GET") {
+        if (!googleConfigured(env)) {
+          return html(views.errorPage("Google sign-in isn't configured on this deployment.", 404, theme), 404);
+        }
+        const ip = clientIp(request);
+        const googleError = url.searchParams.get("error");
+        if (googleError) {
+          // User cancelled at Google's consent screen, or Google refused.
+          return html(
+            views.loginPage({ theme, googleEnabled: true, error: "Google sign-in was cancelled." }),
+            400
+          );
+        }
+
+        // Single-use: consumeOAuthState deletes the row, so a replayed
+        // callback URL cannot be redeemed twice.
+        const handshake = await consumeOAuthState(env, url.searchParams.get("state"));
+        if (!handshake) {
+          return html(
+            views.loginPage({
+              theme,
+              googleEnabled: true,
+              error: "That sign-in link expired or was already used. Please try again.",
+            }),
+            400
+          );
+        }
+
+        const code = url.searchParams.get("code");
+        if (!code) {
+          return html(views.loginPage({ theme, googleEnabled: true, error: "Google sign-in failed." }), 400);
+        }
+
+        let payload;
+        try {
+          const tokens = await exchangeGoogleCode(env, {
+            code,
+            redirectUri: handshake.redirect_uri,
+            codeVerifier: handshake.code_verifier,
+          });
+          payload = decodeJwtPayload(tokens.id_token);
+        } catch (err) {
+          await db.logError(env, path, err.stack || err.message || String(err));
+          return html(
+            views.loginPage({ theme, googleEnabled: true, error: "Couldn't complete Google sign-in. Please try again." }),
+            502
+          );
+        }
+
+        const check = validateGoogleIdToken(payload, { clientId: env.GOOGLE_CLIENT_ID, nonce: handshake.nonce });
+        if (!check.ok) {
+          await db.logError(env, path, "Rejected Google ID token: " + check.problems.join("; "));
+          await db.logAudit(env, null, "login_google_rejected", "user", null, check.problems.join("; "));
+          return html(views.loginPage({ theme, googleEnabled: true, error: "Google sign-in failed verification." }), 401);
+        }
+
+        const email = String(payload.email).trim().toLowerCase();
+        const limit = await checkRateLimit(env, email, ip);
+        if (limit.blocked) {
+          return html(views.loginPage({ theme, googleEnabled: true, error: limit.reason }), 429);
+        }
+
+        const user = await db.getUserByEmail(env, email);
+
+        // The allowlist. A valid Google identity for an address we don't know
+        // is still a failed login.
+        if (!user) {
+          await recordLoginAttempt(env, email, ip, false);
+          await db.logAudit(env, null, "login_google_denied", "user", null, email);
+          return html(
+            views.loginPage({
+              theme,
+              googleEnabled: true,
+              error: "That Google account isn't authorised for this app. Ask a founder to add you.",
+            }),
+            403
+          );
+        }
+
+        // Email addresses can be reassigned inside a Google Workspace; the
+        // `sub` claim cannot. Once bound, a mismatch means this is not the
+        // same underlying account any more.
+        if (user.google_sub && user.google_sub !== payload.sub) {
+          await recordLoginAttempt(env, email, ip, false);
+          await db.logAudit(env, user, "login_google_sub_mismatch", "user", user.id, email);
+          return html(
+            views.loginPage({
+              theme,
+              googleEnabled: true,
+              error: "This Google account doesn't match the one linked to that address. Ask a founder to re-link it.",
+            }),
+            403
+          );
+        }
+        if (!user.google_sub) {
+          await db.bindGoogleSub(env, user.id, payload.sub);
+          await db.logAudit(env, user, "google_account_linked", "user", user.id, email);
+        }
+
+        await recordLoginAttempt(env, email, ip, true);
+
+        // A federated login doesn't excuse 2FA the user explicitly turned on.
+        if (user.totp_enabled) {
+          const pendingToken = await createPendingLogin(env, user.id);
+          return redirect("/login/2fa", { "Set-Cookie": pendingCookie(pendingToken) });
+        }
+
+        await db.logAudit(env, user, "login_google", "user", user.id, null);
+        const token = await createSession(env, user.id);
+        return redirect("/", { "Set-Cookie": sessionCookie(token) });
       }
 
       if (path === "/login" && method === "POST") {
@@ -107,7 +313,7 @@ export default {
 
         const limit = await checkRateLimit(env, normalizedEmail, ip);
         if (limit.blocked) {
-          return html(views.loginPage({ error: limit.reason, theme }), 429);
+          return html(views.loginPage({ error: limit.reason, theme, googleEnabled: googleConfigured(env) }), 429);
         }
 
         const user = await env.DB.prepare("SELECT * FROM users WHERE email = ?").bind(normalizedEmail).first();
@@ -115,7 +321,10 @@ export default {
         await recordLoginAttempt(env, normalizedEmail, ip, !!ok);
 
         if (!ok) {
-          return html(views.loginPage({ error: "Incorrect email or password.", theme }), 401);
+          return html(
+            views.loginPage({ error: "Incorrect email or password.", theme, googleEnabled: googleConfigured(env) }),
+            401
+          );
         }
 
         if (user.totp_enabled) {
@@ -144,10 +353,30 @@ export default {
         if (limit.blocked) return html(views.totpVerifyPage({ error: limit.reason, theme }), 429);
 
         const { code } = await readForm(request);
-        const ok = await verifyTotp(pending.totp_secret, code || "");
+
+        // Either the current authenticator code, or one of the single-use
+        // backup codes issued when 2FA was switched on.
+        let ok = await verifyTotp(pending.totp_secret, code || "");
+        let usedBackupCode = false;
+        if (!ok && looksLikeBackupCode(code)) {
+          ok = await db.redeemBackupCode(env, pending.user_id, await hashBackupCode(code));
+          usedBackupCode = ok;
+        }
         await recordLoginAttempt(env, rlKey, ip, ok);
 
         if (!ok) return html(views.totpVerifyPage({ error: "Incorrect code. Try again.", theme }), 401);
+
+        if (usedBackupCode) {
+          const left = await db.countUnusedBackupCodes(env, pending.user_id);
+          await db.logAudit(
+            env,
+            { id: pending.user_id, name: pending.name },
+            "2fa_backup_code_used",
+            "user",
+            pending.user_id,
+            `${left} backup code${left === 1 ? "" : "s"} remaining`
+          );
+        }
 
         await destroyPendingLogin(env, pending.pendingToken);
         const token = await createSession(env, pending.user_id);
@@ -198,7 +427,9 @@ export default {
 
       // ================= SECURITY / 2FA SELF-SERVICE (any role) =================
       if (path === "/security" && method === "GET") {
-        const fresh = await env.DB.prepare("SELECT totp_secret, totp_enabled FROM users WHERE id = ?").bind(user.id).first();
+        const fresh = await env.DB.prepare("SELECT totp_secret, totp_enabled, google_sub FROM users WHERE id = ?")
+          .bind(user.id)
+          .first();
         const pendingSecret = !fresh.totp_enabled && fresh.totp_secret ? fresh.totp_secret : null;
         return html(
           views.securityPage({
@@ -207,6 +438,9 @@ export default {
             theme,
             pendingSecret,
             pendingUri: pendingSecret ? totpUri(pendingSecret, user.email) : null,
+            backupCodesLeft: await db.countUnusedBackupCodes(env, user.id),
+            googleLinked: !!fresh.google_sub,
+            googleEnabled: googleConfigured(env),
           })
         );
       }
@@ -241,7 +475,60 @@ export default {
         }
         await env.DB.prepare("UPDATE users SET totp_enabled = 1 WHERE id = ?").bind(user.id).run();
         await db.logAudit(env, user, "2fa_enabled", "user", user.id, null);
-        return html(views.securityPage({ user: { ...user, totp_enabled: 1 }, csrf, theme, message: "Two-factor authentication is now enabled." }));
+
+        // Issue recovery codes immediately: an authenticator enrolled without
+        // them is one lost phone away from a manual D1 rescue.
+        const codes = generateBackupCodes();
+        await db.replaceBackupCodes(env, user.id, await Promise.all(codes.map(hashBackupCode)));
+        await db.logAudit(env, user, "2fa_backup_codes_generated", "user", user.id, `${codes.length} codes`);
+
+        return html(
+          views.securityPage({
+            user: { ...user, totp_enabled: 1 },
+            csrf,
+            theme,
+            message: "Two-factor authentication is now enabled.",
+            newBackupCodes: codes,
+            backupCodesLeft: codes.length,
+            googleEnabled: googleConfigured(env),
+          })
+        );
+      }
+
+      // Regenerating invalidates every previous code -- that's the point when
+      // a printout goes missing.
+      if (path === "/security/2fa/backup-codes" && method === "POST") {
+        const f = await readForm(request);
+        const fail = csrfGuard(user, f, theme);
+        if (fail) return fail;
+        const fresh = await env.DB.prepare("SELECT totp_enabled FROM users WHERE id = ?").bind(user.id).first();
+        if (!fresh.totp_enabled) {
+          return html(
+            views.securityPage({
+              user,
+              csrf,
+              theme,
+              error: "Turn on two-factor authentication first — backup codes only apply to it.",
+              backupCodesLeft: 0,
+              googleEnabled: googleConfigured(env),
+            }),
+            400
+          );
+        }
+        const codes = generateBackupCodes();
+        await db.replaceBackupCodes(env, user.id, await Promise.all(codes.map(hashBackupCode)));
+        await db.logAudit(env, user, "2fa_backup_codes_regenerated", "user", user.id, `${codes.length} codes`);
+        return html(
+          views.securityPage({
+            user: { ...user, totp_enabled: 1 },
+            csrf,
+            theme,
+            message: "New backup codes generated. Your previous codes no longer work.",
+            newBackupCodes: codes,
+            backupCodesLeft: codes.length,
+            googleEnabled: googleConfigured(env),
+          })
+        );
       }
 
       if (path === "/security/2fa/disable" && method === "POST") {
@@ -249,8 +536,20 @@ export default {
         const fail = csrfGuard(user, f, theme);
         if (fail) return fail;
         await env.DB.prepare("UPDATE users SET totp_secret = NULL, totp_enabled = 0 WHERE id = ?").bind(user.id).run();
+        // Codes are useless without the second factor they unlock, and leaving
+        // them behind would silently re-arm on the next enable.
+        await db.clearBackupCodes(env, user.id);
         await db.logAudit(env, user, "2fa_disabled", "user", user.id, null);
-        return html(views.securityPage({ user: { ...user, totp_enabled: 0 }, csrf, theme, message: "Two-factor authentication disabled." }));
+        return html(
+          views.securityPage({
+            user: { ...user, totp_enabled: 0 },
+            csrf,
+            theme,
+            message: "Two-factor authentication disabled.",
+            backupCodesLeft: 0,
+            googleEnabled: googleConfigured(env),
+          })
+        );
       }
 
       // ================= FREELANCER ROUTES =================

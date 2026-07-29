@@ -11,13 +11,20 @@
 
 import { createServer } from "node:http";
 import worker from "../src/index.js";
-import { setPassword, createSession } from "../src/auth.js";
+import { setPassword, createSession, generateTotpSecret, generateBackupCodes, hashBackupCode } from "../src/auth.js";
 import * as db from "../src/db.js";
 import { makeEnv } from "./d1.mjs";
 
 const PORT = Number(process.env.PORT || 8788);
 
 const env = makeEnv();
+
+// Google sign-in renders whenever a client id is present. Real credentials are
+// picked up from the shell if you export them; otherwise a placeholder makes
+// the button visible for layout checks (clicking it will not complete a real
+// sign-in, which is fine -- the flow itself is covered by tests/run.mjs).
+env.GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "preview-placeholder.apps.googleusercontent.com";
+env.GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "preview-placeholder-secret";
 
 // ------------------------------------------------------------------- seed --
 
@@ -89,6 +96,13 @@ await db.upsertWeeklyEntry(env, {
   status: "on_track",
 });
 
+// 2FA on with a full set of backup codes, so /security shows its populated
+// state rather than the empty one.
+await env.DB.prepare("UPDATE users SET totp_secret = ?, totp_enabled = 1 WHERE id = ?")
+  .bind(generateTotpSecret(), founder.id)
+  .run();
+await db.replaceBackupCodes(env, founder.id, await Promise.all(generateBackupCodes().map(hashBackupCode)));
+
 await db.logAudit(env, founder, "client_created", "client", clients[0].id, "Umlazi Foods");
 await db.logAudit(env, founder, "lead_stage_changed", "lead", 4, "won");
 await db.logAudit(env, founder, "revenue_logged", "revenue", null, "12400 (project)");
@@ -108,7 +122,10 @@ function toRequest(req, session) {
   // browser is holding untouched so /theme/toggle behaves exactly as it does
   // in production.
   const cookie = headers.get("Cookie") || "";
-  if (!cookie.includes("c7_session=")) {
+  // Leave the auth pages genuinely signed out so they can be previewed;
+  // everything else arrives pre-authenticated.
+  const isAuthPage = /^\/(login|auth|setup)(\/|$)/.test(new URL(url).pathname);
+  if (!isAuthPage && !cookie.includes("c7_session=")) {
     headers.set("Cookie", (cookie ? cookie + "; " : "") + `c7_session=${session}`);
   }
 

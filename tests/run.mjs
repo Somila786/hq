@@ -9,7 +9,7 @@
 // default and the flag is unnecessary.
 
 import worker from "../src/index.js";
-import { setPassword, totpCodeNow, generateTotpSecret } from "../src/auth.js";
+import { setPassword, totpCodeNow, generateTotpSecret, hashBackupCode, normalizeBackupCode } from "../src/auth.js";
 import * as db from "../src/db.js";
 import { makeEnv } from "./d1.mjs";
 
@@ -122,6 +122,70 @@ async function founderSession(env) {
 async function auditActions(env) {
   const { results } = await env.DB.prepare("SELECT action FROM audit_log ORDER BY id").all();
   return results.map((r) => r.action);
+}
+
+// ------------------------------------------------------------ google stubs --
+
+const GOOGLE_CLIENT_ID = "test-client.apps.googleusercontent.com";
+
+function googleEnv() {
+  const env = makeEnv();
+  env.GOOGLE_CLIENT_ID = GOOGLE_CLIENT_ID;
+  env.GOOGLE_CLIENT_SECRET = "test-client-secret";
+  return env;
+}
+
+const b64url = (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url");
+
+// The signature is never inspected -- see validateGoogleIdToken's comment on
+// why a token fetched directly from Google's endpoint over TLS isn't
+// re-verified locally. These tests exercise the claim checks.
+function fakeIdToken(claims) {
+  return `${b64url({ alg: "RS256", typ: "JWT" })}.${b64url(claims)}.sig`;
+}
+
+function googleClaims(overrides = {}) {
+  return {
+    iss: "https://accounts.google.com",
+    aud: GOOGLE_CLIENT_ID,
+    sub: "1029384756",
+    email: "thembalethu@catalyst7.co.za",
+    email_verified: true,
+    exp: Math.floor(Date.now() / 1000) + 600,
+    ...overrides,
+  };
+}
+
+// Intercepts only Google's token endpoint; anything else falls through.
+function stubGoogleTokenEndpoint(idToken, { status = 200, body = null } = {}) {
+  const original = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async (input, init) => {
+    if (String(input).includes("oauth2.googleapis.com/token")) {
+      calls++;
+      const payload = body !== null ? body : JSON.stringify({ id_token: idToken, token_type: "Bearer" });
+      return new Response(payload, { status, headers: { "Content-Type": "application/json" } });
+    }
+    return original(input, init);
+  };
+  return {
+    restore: () => {
+      globalThis.fetch = original;
+    },
+    get calls() {
+      return calls;
+    },
+  };
+}
+
+// Walks the front half of the handshake and hands back the live state/nonce.
+async function beginGoogleHandshake(env) {
+  const res = await worker.fetch(req("/auth/google"), env);
+  eq(res.status, 302, "auth start should redirect to Google");
+  const dest = new URL(res.headers.get("Location"));
+  const state = dest.searchParams.get("state");
+  const row = await env.DB.prepare("SELECT * FROM oauth_states WHERE state = ?").bind(state).first();
+  return { res, dest, state, row };
 }
 
 // ====================================================================== //
@@ -739,6 +803,403 @@ await test("every add-form page emits the checkbox before its sibling panel", as
     // `~` is a following-sibling combinator: the checkbox must come first.
     assert(cb < head && head < panel, `${path}: checkbox must precede the head row and the panel`);
     has(body, 'for="add-toggle"', `${path}: a label is bound to the toggle`);
+  }
+});
+
+console.log("\nGoogle sign-in");
+
+await test("Google routes stay dark when no client is configured", async () => {
+  const env = makeEnv(); // no GOOGLE_CLIENT_ID / SECRET
+  const start = await worker.fetch(req("/auth/google"), env);
+  eq(start.status, 404, "start route is not exposed");
+  const cb = await worker.fetch(req("/auth/google/callback?code=x&state=y"), env);
+  eq(cb.status, 404, "callback is not exposed");
+  const login = await (await worker.fetch(req("/login"), env)).text();
+  lacks(login, "/auth/google", "no Google button on the sign-in page");
+  has(login, 'action="/login"', "password form still there");
+});
+
+await test("the sign-in page offers Google once a client is configured", async () => {
+  const env = googleEnv();
+  const body = await (await worker.fetch(req("/login"), env)).text();
+  has(body, 'href="/auth/google"', "Google button rendered");
+  has(body, "Continue with Google", "button label");
+  has(body, "<svg", "Google mark is inlined, not fetched");
+  lacks(body, "https://www.google.com", "no external asset requests");
+});
+
+await test("/auth/google builds a correct authorization request", async () => {
+  const env = googleEnv();
+  const { dest, state, row } = await beginGoogleHandshake(env);
+
+  eq(dest.origin + dest.pathname, "https://accounts.google.com/o/oauth2/v2/auth", "Google endpoint");
+  eq(dest.searchParams.get("client_id"), GOOGLE_CLIENT_ID, "client id");
+  eq(dest.searchParams.get("response_type"), "code", "authorization code flow");
+  eq(dest.searchParams.get("redirect_uri"), `${ORIGIN}/auth/google/callback`, "redirect uri");
+  eq(dest.searchParams.get("code_challenge_method"), "S256", "PKCE method");
+  assert(dest.searchParams.get("code_challenge"), "PKCE challenge present");
+  assert(dest.searchParams.get("scope").includes("openid"), "openid scope");
+  lacks(dest.searchParams.get("scope"), "offline", "no offline access requested");
+
+  assert(row, "handshake persisted server-side");
+  eq(row.state, state, "state matches");
+  assert(row.nonce && row.nonce.length >= 16, "nonce generated");
+  assert(row.code_verifier && row.code_verifier.length >= 32, "verifier stored server-side, never sent to the browser");
+  eq(dest.searchParams.get("nonce"), row.nonce, "nonce forwarded to Google");
+  lacks(dest.search, row.code_verifier, "raw verifier is never put in the URL");
+});
+
+await test("a known user is signed in and their Google account is bound", async () => {
+  const env = googleEnv();
+  const f = await seedFounder(env);
+  const { state, row } = await beginGoogleHandshake(env);
+  const stub = stubGoogleTokenEndpoint(fakeIdToken(googleClaims({ nonce: row.nonce, email: f.email })));
+  try {
+    const res = await worker.fetch(req(`/auth/google/callback?code=abc&state=${state}`), env);
+    eq(res.status, 302, "signed in");
+    eq(res.headers.get("Location"), "/", "lands on the app");
+    const session = setCookie(res, "c7_session");
+    assert(session, "session cookie issued");
+    eq(stub.calls, 1, "token endpoint called exactly once");
+
+    const u = await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(f.id).first();
+    eq(u.google_sub, "1029384756", "google_sub bound on first use");
+    const actions = await auditActions(env);
+    assert(actions.includes("google_account_linked"), "link audited");
+    assert(actions.includes("login_google"), "login audited");
+  } finally {
+    stub.restore();
+  }
+});
+
+await test("a Google account that isn't in the users table is refused", async () => {
+  const env = googleEnv();
+  await seedFounder(env); // a different, known account exists
+  const { state, row } = await beginGoogleHandshake(env);
+  const stub = stubGoogleTokenEndpoint(
+    fakeIdToken(googleClaims({ nonce: row.nonce, email: "stranger@gmail.com", sub: "999" }))
+  );
+  try {
+    const res = await worker.fetch(req(`/auth/google/callback?code=abc&state=${state}`), env);
+    eq(res.status, 403, "refused");
+    eq(setCookie(res, "c7_session"), null, "no session issued");
+    has(await res.text(), "authorised for this app", "explains why");
+
+    const { results } = await env.DB.prepare("SELECT * FROM users WHERE email = 'stranger@gmail.com'").all();
+    eq(results.length, 0, "no account is auto-provisioned");
+    assert((await auditActions(env)).includes("login_google_denied"), "denial audited");
+    const attempt = await env.DB.prepare("SELECT * FROM login_attempts WHERE email = 'stranger@gmail.com'").first();
+    assert(attempt && attempt.success === 0, "counts against the rate limiter");
+  } finally {
+    stub.restore();
+  }
+});
+
+await test("a callback state can only be redeemed once", async () => {
+  const env = googleEnv();
+  const f = await seedFounder(env);
+  const { state, row } = await beginGoogleHandshake(env);
+  const stub = stubGoogleTokenEndpoint(fakeIdToken(googleClaims({ nonce: row.nonce, email: f.email })));
+  try {
+    const first = await worker.fetch(req(`/auth/google/callback?code=abc&state=${state}`), env);
+    eq(first.status, 302, "first redemption works");
+    const replay = await worker.fetch(req(`/auth/google/callback?code=abc&state=${state}`), env);
+    eq(replay.status, 400, "replayed callback is rejected");
+    eq(setCookie(replay, "c7_session"), null, "no session from a replay");
+    const left = await env.DB.prepare("SELECT * FROM oauth_states WHERE state = ?").bind(state).first();
+    eq(left, null, "handshake row consumed");
+  } finally {
+    stub.restore();
+  }
+});
+
+await test("an unknown or forged state is rejected outright", async () => {
+  const env = googleEnv();
+  await seedFounder(env);
+  const stub = stubGoogleTokenEndpoint(fakeIdToken(googleClaims()));
+  try {
+    const res = await worker.fetch(req("/auth/google/callback?code=abc&state=made-up-state"), env);
+    eq(res.status, 400, "rejected");
+    eq(stub.calls, 0, "we never even talk to Google without a valid handshake");
+    eq(setCookie(res, "c7_session"), null, "no session");
+  } finally {
+    stub.restore();
+  }
+});
+
+await test("ID token claim checks reject tampered or replayed tokens", async () => {
+  const cases = [
+    ["nonce mismatch (replay)", { nonce: "not-the-nonce" }, 401],
+    ["issued for another client", { aud: "someone-elses-client.apps.googleusercontent.com" }, 401],
+    ["expired token", { exp: Math.floor(Date.now() / 1000) - 60 }, 401],
+    ["unverified email", { email_verified: false }, 401],
+    ["wrong issuer", { iss: "https://evil.example.com" }, 401],
+  ];
+  for (const [label, override, expected] of cases) {
+    const env = googleEnv();
+    const f = await seedFounder(env);
+    const { state, row } = await beginGoogleHandshake(env);
+    const claims = googleClaims({ nonce: row.nonce, email: f.email, ...override });
+    const stub = stubGoogleTokenEndpoint(fakeIdToken(claims));
+    try {
+      const res = await worker.fetch(req(`/auth/google/callback?code=abc&state=${state}`), env);
+      eq(res.status, expected, `${label}: status`);
+      eq(setCookie(res, "c7_session"), null, `${label}: must not issue a session`);
+    } finally {
+      stub.restore();
+    }
+  }
+});
+
+await test("a bound account rejects a different Google subject on the same email", async () => {
+  const env = googleEnv();
+  const f = await seedFounder(env);
+  await db.bindGoogleSub(env, f.id, "the-original-sub");
+  const { state, row } = await beginGoogleHandshake(env);
+  const stub = stubGoogleTokenEndpoint(
+    fakeIdToken(googleClaims({ nonce: row.nonce, email: f.email, sub: "a-different-sub" }))
+  );
+  try {
+    const res = await worker.fetch(req(`/auth/google/callback?code=abc&state=${state}`), env);
+    eq(res.status, 403, "refused");
+    eq(setCookie(res, "c7_session"), null, "no session");
+    assert((await auditActions(env)).includes("login_google_sub_mismatch"), "mismatch audited");
+    const u = await env.DB.prepare("SELECT google_sub FROM users WHERE id = ?").bind(f.id).first();
+    eq(u.google_sub, "the-original-sub", "the original binding is not overwritten");
+  } finally {
+    stub.restore();
+  }
+});
+
+await test("Google sign-in still has to clear 2FA when it is enabled", async () => {
+  const env = googleEnv();
+  const f = await seedFounder(env);
+  const secret = generateTotpSecret();
+  await env.DB.prepare("UPDATE users SET totp_secret = ?, totp_enabled = 1 WHERE id = ?").bind(secret, f.id).run();
+
+  const { state, row } = await beginGoogleHandshake(env);
+  const stub = stubGoogleTokenEndpoint(fakeIdToken(googleClaims({ nonce: row.nonce, email: f.email })));
+  try {
+    const res = await worker.fetch(req(`/auth/google/callback?code=abc&state=${state}`), env);
+    eq(res.status, 302, "status");
+    eq(res.headers.get("Location"), "/login/2fa", "routed through the second factor");
+    eq(setCookie(res, "c7_session"), null, "federated login does not bypass 2FA");
+    assert(setCookie(res, "c7_pending"), "pending cookie issued");
+  } finally {
+    stub.restore();
+  }
+});
+
+console.log("\n2FA backup codes");
+
+// Walks the real enable flow and returns the codes as the user would see them.
+async function enable2fa(env, session, csrf) {
+  await worker.fetch(req("/security/2fa/start", { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf } }), env);
+  const row = await env.DB.prepare("SELECT totp_secret FROM users WHERE totp_secret IS NOT NULL").first();
+  const res = await worker.fetch(
+    req("/security/2fa/confirm", {
+      method: "POST",
+      cookies: { c7_session: session },
+      form: { code: await totpCodeNow(row.totp_secret), _csrf: csrf },
+    }),
+    env
+  );
+  const body = await res.text();
+  const codes = [...body.matchAll(/<div class="code-chip">([A-Z0-9-]+)<\/div>/g)].map((m) => m[1]);
+  return { secret: row.totp_secret, codes, body };
+}
+
+await test("enabling 2FA issues ten backup codes, shown once and stored hashed", async () => {
+  const env = makeEnv();
+  const { id, session, csrf } = await founderSession(env);
+  const { codes, body } = await enable2fa(env, session, csrf);
+
+  eq(codes.length, 10, "ten codes issued");
+  eq(new Set(codes).size, 10, "all distinct");
+  has(body, "only time they'll be shown", "warned that this is the one showing");
+  for (const c of codes) assert(/^[A-Z0-9]{5}-[A-Z0-9]{5}$/.test(c), `well-formed code: ${c}`);
+
+  const { results } = await env.DB.prepare("SELECT * FROM totp_backup_codes WHERE user_id = ?").bind(id).all();
+  eq(results.length, 10, "ten rows stored");
+  const stored = results.map((r) => r.code_hash);
+  for (const c of codes) {
+    lacks(stored.join("|"), normalizeBackupCode(c), "plaintext code must never be stored");
+    assert(stored.includes(await hashBackupCode(c)), "hash of the shown code is on file");
+  }
+  eq(await db.countUnusedBackupCodes(env, id), 10, "all unused");
+
+  // Revisiting the page must not re-reveal them.
+  const revisit = await (await worker.fetch(req("/security", { cookies: { c7_session: session } }), env)).text();
+  for (const c of codes) lacks(revisit, c, "codes are not shown again on reload");
+  has(revisit, "10", "remaining count is shown instead");
+  assert((await auditActions(env)).includes("2fa_backup_codes_generated"), "generation audited");
+});
+
+await test("a backup code signs you in and then cannot be reused", async () => {
+  const env = makeEnv();
+  const { id, session, csrf } = await founderSession(env);
+  const { codes } = await enable2fa(env, session, csrf);
+  const f = await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(id).first();
+
+  const first = await worker.fetch(req("/login", { method: "POST", form: { email: f.email, password: FOUNDER_PW } }), env);
+  const pending = setCookie(first, "c7_pending");
+
+  const used = codes[3];
+  const ok = await worker.fetch(req("/login/2fa", { method: "POST", cookies: { c7_pending: pending }, form: { code: used } }), env);
+  eq(ok.status, 302, "backup code accepted in place of a TOTP code");
+  assert(setCookie(ok, "c7_session"), "session issued");
+  eq(await db.countUnusedBackupCodes(env, id), 9, "one code consumed");
+  assert((await auditActions(env)).includes("2fa_backup_code_used"), "redemption audited");
+
+  // Same code again, fresh pending login.
+  const second = await worker.fetch(req("/login", { method: "POST", form: { email: f.email, password: FOUNDER_PW } }), env);
+  const pending2 = setCookie(second, "c7_pending");
+  const replay = await worker.fetch(
+    req("/login/2fa", { method: "POST", cookies: { c7_pending: pending2 }, form: { code: used } }),
+    env
+  );
+  eq(replay.status, 401, "a spent code is rejected");
+  eq(setCookie(replay, "c7_session"), null, "no session from a spent code");
+  eq(await db.countUnusedBackupCodes(env, id), 9, "count unchanged by the failed replay");
+});
+
+await test("backup codes are accepted regardless of case and dashes", async () => {
+  const env = makeEnv();
+  const { id, session, csrf } = await founderSession(env);
+  const { codes } = await enable2fa(env, session, csrf);
+  const f = await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(id).first();
+
+  const login = await worker.fetch(req("/login", { method: "POST", form: { email: f.email, password: FOUNDER_PW } }), env);
+  const pending = setCookie(login, "c7_pending");
+  const messy = "  " + codes[0].toLowerCase().replace("-", "") + " ";
+  const res = await worker.fetch(req("/login/2fa", { method: "POST", cookies: { c7_pending: pending }, form: { code: messy } }), env);
+  eq(res.status, 302, "retyped code still works");
+  eq(await db.countUnusedBackupCodes(env, id), 9, "consumed exactly one");
+});
+
+await test("regenerating replaces the whole set, and disabling 2FA clears it", async () => {
+  const env = makeEnv();
+  const { id, session, csrf } = await founderSession(env);
+  const { codes: original } = await enable2fa(env, session, csrf);
+
+  const regen = await worker.fetch(
+    req("/security/2fa/backup-codes", { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf } }),
+    env
+  );
+  eq(regen.status, 200, "status");
+  const fresh = [...(await regen.text()).matchAll(/<div class="code-chip">([A-Z0-9-]+)<\/div>/g)].map((m) => m[1]);
+  eq(fresh.length, 10, "a new set of ten");
+  eq(original.filter((c) => fresh.includes(c)).length, 0, "no code carried over");
+  eq(await db.countUnusedBackupCodes(env, id), 10, "exactly ten live codes");
+
+  const stored = (await env.DB.prepare("SELECT code_hash FROM totp_backup_codes WHERE user_id = ?").bind(id).all()).results.map(
+    (r) => r.code_hash
+  );
+  for (const c of original) lacks(stored.join("|"), await hashBackupCode(c), "old codes are gone from the database");
+  assert((await auditActions(env)).includes("2fa_backup_codes_regenerated"), "regeneration audited");
+
+  await worker.fetch(req("/security/2fa/disable", { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf } }), env);
+  eq(await db.countUnusedBackupCodes(env, id), 0, "disabling 2FA clears the codes");
+});
+
+await test("backup code endpoints are behind CSRF and require 2FA to be on", async () => {
+  const env = makeEnv();
+  const { id, session, csrf } = await founderSession(env);
+
+  const noCsrf = await worker.fetch(req("/security/2fa/backup-codes", { method: "POST", cookies: { c7_session: session } }), env);
+  eq(noCsrf.status, 403, "no token, no codes");
+  eq(await db.countUnusedBackupCodes(env, id), 0, "nothing generated");
+
+  const notEnabled = await worker.fetch(
+    req("/security/2fa/backup-codes", { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf } }),
+    env
+  );
+  eq(notEnabled.status, 400, "refused while 2FA is off");
+  eq(await db.countUnusedBackupCodes(env, id), 0, "still nothing generated");
+});
+
+console.log("\nSecurity headers");
+
+await test("every response carries the security header set", async () => {
+  const env = makeEnv();
+  const { session } = await founderSession(env);
+  const expected = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "same-origin",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cache-Control": "no-store",
+  };
+
+  const pages = [
+    await worker.fetch(req("/login"), env),
+    await worker.fetch(req("/dashboard", { cookies: { c7_session: session } }), env),
+    await worker.fetch(req("/"), env), // a redirect
+  ];
+  for (const res of pages) {
+    for (const [h, v] of Object.entries(expected)) eq(res.headers.get(h), v, `${h} on ${res.status}`);
+    has(res.headers.get("Content-Security-Policy"), "default-src 'none'", "CSP locked down by default");
+    has(res.headers.get("Strict-Transport-Security"), "max-age=31536000", "HSTS");
+    has(res.headers.get("Permissions-Policy"), "geolocation=()", "Permissions-Policy");
+  }
+});
+
+await test("Referrer-Policy stays permissive enough for /theme/toggle to work", async () => {
+  // `no-referrer` would silently break the toggle's return-to-page behaviour,
+  // which is why this is asserted rather than left to a future tidy-up.
+  const env = makeEnv();
+  const res = await worker.fetch(req("/login"), env);
+  const policy = res.headers.get("Referrer-Policy");
+  assert(policy !== "no-referrer", "must not be no-referrer");
+  assert(["same-origin", "strict-origin-when-cross-origin"].includes(policy), `same-origin referrers must survive, got ${policy}`);
+
+  const toggled = await worker.fetch(req("/theme/toggle", { headers: { Referer: `${ORIGIN}/revenue` } }), env);
+  eq(toggled.headers.get("Location"), "/revenue", "still returns to the calling page");
+});
+
+await test("the CSP script hashes match the inline handlers actually emitted", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  await db.createLead(env, { name: "Zanele", stage: "new" });
+  const lead = (await db.getLeads(env))[0];
+  await db.flagForRetentionReview(env, "lead", lead.id, "stale");
+
+  const csp = (await worker.fetch(req("/dashboard", { cookies: { c7_session: session } }), env)).headers.get(
+    "Content-Security-Policy"
+  );
+  const scriptSrc = csp.split(";").map((d) => d.trim()).find((d) => d.startsWith("script-src"));
+  assert(scriptSrc, "CSP declares a script-src");
+  has(scriptSrc, "'unsafe-hashes'", "inline handlers need unsafe-hashes alongside their digests");
+  // 'unsafe-inline' is fine in style-src (see the CSP comment in index.js) but
+  // must never appear in script-src -- that would defeat the whole directive.
+  lacks(scriptSrc, "'unsafe-inline'", "script-src must never fall back to unsafe-inline");
+  lacks(csp, "'unsafe-eval'", "no eval anywhere");
+
+  const pages = await Promise.all(
+    ["/leads", "/retention"].map(async (p) => (await worker.fetch(req(p, { cookies: { c7_session: session } }), env)).text())
+  );
+
+  const handlers = new Set();
+  for (const body of pages) {
+    for (const m of body.matchAll(/\son(?:change|submit|click|load|error)="([^"]*)"/g)) handlers.add(m[1]);
+  }
+  assert(handlers.size > 0, "the pages really do carry inline handlers to cover");
+
+  for (const h of handlers) {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(h));
+    const b64 = Buffer.from(new Uint8Array(digest)).toString("base64");
+    has(csp, `'sha256-${b64}'`, `CSP is missing the digest for inline handler ${JSON.stringify(h)}`);
+  }
+
+  // And nothing stale: every hash in the CSP should correspond to a real handler.
+  const cspHashes = [...csp.matchAll(/'sha256-([A-Za-z0-9+/=]+)'/g)].map((m) => m[1]);
+  const liveHashes = await Promise.all(
+    [...handlers].map(async (h) =>
+      Buffer.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(h)))).toString("base64")
+    )
+  );
+  for (const hash of cspHashes) {
+    assert(liveHashes.includes(hash), `CSP carries a digest no page emits any more: sha256-${hash}`);
   }
 });
 

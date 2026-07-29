@@ -15,26 +15,30 @@ third-party SaaS.
   zero runtime dependencies. `wrangler` is the only devDependency.
 - **Database:** Cloudflare D1 (managed SQLite). Already created and live:
   `catalyst7-kpi`, id `ba622992-c6dc-4a9b-a099-3b8a5fbe3a83`. Schema in
-  `schema.sql` — 12 tables (see ARCHITECTURE.md for the full breakdown).
+  `schema.sql` — 14 tables (see ARCHITECTURE.md for the full breakdown).
+  Pending migrations live in `migrations/`.
 - **Frontend:** server-rendered HTML strings in `src/views.js`. No React, no
   build step, no client bundle. Forms POST and the page reloads. This is
   deliberate (perf-first, zero dependency surface) — don't introduce a
   framework without a real reason.
 - **Auth:** PBKDF2 password hashing + D1-backed sessions + CSRF tokens + rate
-  limiting + optional TOTP 2FA, all hand-rolled on Workers' native Web Crypto
-  API (no auth library). See `src/auth.js`.
+  limiting + optional TOTP 2FA with backup codes + optional Google sign-in, all
+  hand-rolled on Workers' native Web Crypto API (no auth library, no OAuth
+  library). See `src/auth.js` and "Auth & security" below.
 
 ## File map
 
 ```
 src/index.js    — router, all HTTP handling, the scheduled() Cron handler
 src/db.js       — data access layer, every query lives here, all parameterized
-src/auth.js     — password hashing, sessions, CSRF, rate limiting, TOTP
+src/auth.js     — password hashing, sessions, CSRF, rate limiting, TOTP,
+                  backup codes, Google OAuth helpers
+migrations/     — incremental SQL for the already-live database
 src/views.js    — every page's HTML, plus the shared CSS/layout
 schema.sql      — reference copy of the live D1 schema
 wrangler.toml   — Worker config, D1 binding, monthly Cron Trigger
 tests/d1.mjs    — node:sqlite wrapper matching D1's prepare/bind/first/all/run
-tests/run.mjs   — 36 end-to-end tests (`npm test`)
+tests/run.mjs   — 54 end-to-end tests (`npm test`)
 tests/devserver.mjs — local preview server (`npm run preview`), seeded demo data
 README.md       — deploy steps, day-to-day usage, known limitations
 ARCHITECTURE.md — full frontend/backend/database/privacy/security breakdown
@@ -64,20 +68,73 @@ outstanding at the previous handoff has landed:
 
 The test suite was **not** in the handoff zip and has been rebuilt from the
 description in "Testing" below: `tests/d1.mjs` (the D1 adapter) and
-`tests/run.mjs` (36 tests). It is a reconstruction, not the byte-identical
+`tests/run.mjs` (54 tests). It is a reconstruction, not the byte-identical
 original — it covers the same documented ground (auth, rate limiting, CSRF,
 roles, audit, 2FA, retention/erasure, CHECK constraints) plus the new theme
-routes and the checkbox-hack markup contracts. 36/36 pass.
+routes and the checkbox-hack markup contracts. 54/54 pass.
+
+**A second pass then added Google sign-in, security headers and 2FA backup
+codes** (see "Auth & security" below). That pass introduced migration
+`migrations/001_google_auth_and_backup_codes.sql`, which has **not** been run
+against the live D1 database yet — do that before deploying, or `/security` and
+Google sign-in will error on the missing tables.
 
 ### What's actually left
 
-1. **Deploy** — `npx wrangler login && npx wrangler deploy`. Still a human step;
+1. **Run the migration** — `npx wrangler d1 execute catalyst7-kpi --remote
+   --file=./migrations/001_google_auth_and_backup_codes.sql`.
+2. **Deploy** — `npx wrangler login && npx wrangler deploy`. Still a human step;
    no tool here pushes Worker code live.
-2. **Push to GitHub** — the repo is committed locally but has no remote yet.
-3. Optional, in rough priority order: keyboard accessibility for the two
+3. **Push to GitHub** — the repo is committed locally but has no remote yet.
+   Note README.md still contains a live founder setup token; make the repo
+   private or rotate that token first.
+4. **Optionally configure Google sign-in** — needs an OAuth client created in
+   Google Cloud Console (steps in README.md). Without it the feature stays
+   dormant and password login is unaffected.
+5. Optional, in rough priority order: keyboard accessibility for the two
    checkbox-hack toggles (see ARCHITECTURE.md §1 — currently mouse/touch only),
-   2FA backup codes, a `.github/workflows/deploy.yml`, edit/delete UI,
-   self-serve founder invites.
+   a `.github/workflows/deploy.yml`, edit/delete UI, self-serve founder invites.
+
+## Auth & security
+
+Three ways in, all landing on the same session:
+
+- **Password** — PBKDF2, 100k iterations, SHA-256. Unchanged.
+- **Google sign-in** — optional, off unless `GOOGLE_CLIENT_ID` +
+  `GOOGLE_CLIENT_SECRET` are set. Authorization-code flow with PKCE, a
+  single-use server-side `state` row, and a `nonce`. **Allowlist-only:** Google
+  establishes identity, the `users` table decides authorisation, and an unknown
+  email is a failed login, never an auto-provisioned account. `google_sub` is
+  bound on first use so a reassigned email address can't inherit an account.
+- **2FA** — TOTP as before, plus ten single-use backup codes. Both federated
+  and password logins are gated by it when it's on.
+
+The Google ID token's signature is deliberately *not* re-verified locally: it
+is fetched server-to-server from Google's token endpoint over TLS, which is the
+case Google's own guidance says needs no local check. Claims (`iss`, `aud`,
+`exp`, `nonce`, `email_verified`) are all validated. If a token ever starts
+arriving from anywhere else — the browser, a webhook — that code must grow
+full JWKS/RS256 verification first.
+
+Backup codes are hashed with a single SHA-256 pass rather than PBKDF2. That's
+intentional and explained at the call site: they're 50 bits of CSPRNG output,
+not a human-chosen secret, so there's no dictionary to stretch against and
+redemption would otherwise cost ~1s.
+
+Responses carry a strict CSP (`default-src 'none'`), HSTS, `X-Frame-Options`,
+`nosniff`, `Referrer-Policy`, `Permissions-Policy`, COOP/CORP and
+`Cache-Control: no-store`. Two caveats worth knowing before you touch them:
+
+- `Referrer-Policy` **must** stay `same-origin` (or
+  `strict-origin-when-cross-origin`). `no-referrer` silently breaks
+  `/theme/toggle`, which reads the Referer to return you to the right page.
+  There's a test pinning this.
+- `script-src` uses `'unsafe-hashes'` plus a digest for each of the two
+  pre-existing inline handlers. Despite the name it is not a wildcard — only
+  those two exact strings can run. A test recomputes the digests from the
+  rendered HTML, so editing either handler fails the suite rather than silently
+  breaking the page. Delete both handlers and this could become
+  `script-src 'none'`.
 
 The 10 source design files this port was extracted from
 (`Dashboard.dc.html`, `Freelancers.dc.html`, etc. + `support.js`) are a
@@ -88,7 +145,7 @@ looks visually wrong and you want to diff against the original mockup.
 Security hardening pass is complete: login rate limiting, CSRF protection,
 audit log, optional TOTP 2FA, error log, monthly retention review with a
 founder-approved erasure action. All of it is covered by an end-to-end test
-suite (see Testing below) — 36/36 passing as of the last run.
+suite (see Testing below) — 54/54 passing as of the last run.
 
 ## Testing
 
@@ -121,7 +178,6 @@ npm run preview   # real app + demo data at localhost:8788, for eyeballing UI
   toggle only. Corrections go via `wrangler d1 execute`.
 - No self-serve founder invite UI — adding a founder is a manual D1 insert
   (documented in README.md).
-- No 2FA backup/recovery codes.
 - No CI/CD workflow in the repo at all (see the file map note above).
 - The mobile nav and the collapsible add-forms are CSS-only and therefore not
   keyboard-operable. Deliberate trade-off for the zero-JS constraint, but it is

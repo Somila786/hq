@@ -7,6 +7,17 @@ binding = "DB"
 database_name = "catalyst7-kpi"
 database_id = "ba622992-c6dc-4a9b-a099-3b8a5fbe3a83"
 
+# Google sign-in. The client id is public (it ships in the redirect URL), so it
+# lives here; the secret must NOT. Set it once, out of band:
+#
+#   npx wrangler secret put GOOGLE_CLIENT_SECRET
+#
+# Leave GOOGLE_CLIENT_ID empty and Google sign-in stays switched off entirely --
+# the button disappears and /auth/google returns 404. Password login is
+# unaffected either way.
+[vars]
+GOOGLE_CLIENT_ID = ""
+
 # Monthly retention review scan (03:00 UTC on the 1st). Flags stale lost-leads
 # and inactive freelancers for a founder to keep or erase at /retention.
 # Never deletes anything on its own.

@@ -25,7 +25,10 @@ CREATE TABLE IF NOT EXISTS users (
   setup_token TEXT UNIQUE,
   created_at TEXT DEFAULT (datetime('now')),
   totp_secret TEXT,
-  totp_enabled INTEGER DEFAULT 0
+  totp_enabled INTEGER DEFAULT 0,
+  -- Google's stable subject id, bound on first Google sign-in. Email addresses
+  -- can be reassigned; `sub` cannot, so this is what we pin identity to.
+  google_sub TEXT
 );
 
 CREATE TABLE IF NOT EXISTS clients (
@@ -124,3 +127,26 @@ CREATE TABLE IF NOT EXISTS pending_logins (
   user_id INTEGER NOT NULL,
   expires_at TEXT NOT NULL
 );
+
+-- In-flight Google OAuth handshakes. Server-side and single-use: the row is
+-- deleted the moment the callback consumes it, so a replayed callback fails.
+CREATE TABLE IF NOT EXISTS oauth_states (
+  state TEXT PRIMARY KEY,
+  nonce TEXT NOT NULL,
+  code_verifier TEXT NOT NULL,
+  redirect_uri TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now')),
+  expires_at TEXT NOT NULL
+);
+
+-- Single-use 2FA recovery codes. Stored hashed; the plaintext is shown to the
+-- user exactly once, at generation.
+CREATE TABLE IF NOT EXISTS totp_backup_codes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  code_hash TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now')),
+  used_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_backup_codes_user ON totp_backup_codes (user_id, used_at);

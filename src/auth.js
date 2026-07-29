@@ -268,3 +268,166 @@ export function totpUri(secretBase32, email, issuer = "Catalyst7 KPI") {
     issuer
   )}&algorithm=SHA1&digits=6&period=30`;
 }
+
+// ---- 2FA backup / recovery codes ----
+// Ten single-use codes, shown once at generation and stored only as hashes.
+//
+// Hashed with a single SHA-256 pass rather than PBKDF2, unlike passwords. That
+// is deliberate: these are 50 bits of CSPRNG output from a 32-character
+// alphabet, not a human-chosen secret, so there is no dictionary to stretch
+// against and the login rate limiter already caps guessing. PBKDF2 here would
+// cost ~1s per redemption (every stored code has to be tried) and buy nothing.
+const BACKUP_ALPHABET = "ABCDEFGHJKMNPQRSTVWXYZ23456789"; // no I/L/O/U/0/1 -- unambiguous when read aloud
+const BACKUP_CODE_COUNT = 10;
+const BACKUP_CODE_LEN = 10;
+
+export function generateBackupCode() {
+  const bytes = new Uint8Array(BACKUP_CODE_LEN);
+  crypto.getRandomValues(bytes);
+  let out = "";
+  for (const b of bytes) out += BACKUP_ALPHABET[b % BACKUP_ALPHABET.length];
+  return out.slice(0, 5) + "-" + out.slice(5);
+}
+
+export function generateBackupCodes(n = BACKUP_CODE_COUNT) {
+  return Array.from({ length: n }, generateBackupCode);
+}
+
+// Case- and format-insensitive: users retype these by hand off a printout.
+export function normalizeBackupCode(code) {
+  return String(code || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+}
+
+export async function hashBackupCode(code) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(normalizeBackupCode(code)));
+  return bytesToHex(new Uint8Array(digest));
+}
+
+export function looksLikeBackupCode(input) {
+  return normalizeBackupCode(input).length === BACKUP_CODE_LEN;
+}
+
+// ---- Google sign-in (OAuth 2.0 authorization code + PKCE) ----
+// No library: the whole flow is two fetches and some claim checking.
+
+export const GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
+export const GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
+
+export function googleConfigured(env) {
+  return !!(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET);
+}
+
+function base64UrlFromBytes(bytes) {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+export function randomUrlSafe(bytes = 32) {
+  const arr = new Uint8Array(bytes);
+  crypto.getRandomValues(arr);
+  return base64UrlFromBytes(arr);
+}
+
+export async function pkceChallenge(verifier) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  return base64UrlFromBytes(new Uint8Array(digest));
+}
+
+export function googleAuthUrl({ clientId, redirectUri, state, nonce, challenge }) {
+  const params = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    response_type: "code",
+    scope: "openid email profile",
+    state,
+    nonce,
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    // We only ever *authenticate* with Google; nothing here needs offline
+    // access or a refresh token, so don't ask for one.
+    prompt: "select_account",
+  });
+  return `${GOOGLE_AUTH_ENDPOINT}?${params.toString()}`;
+}
+
+export async function exchangeGoogleCode(env, { code, redirectUri, codeVerifier }) {
+  const res = await fetch(GOOGLE_TOKEN_ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      code,
+      client_id: env.GOOGLE_CLIENT_ID,
+      client_secret: env.GOOGLE_CLIENT_SECRET,
+      redirect_uri: redirectUri,
+      grant_type: "authorization_code",
+      code_verifier: codeVerifier,
+    }),
+  });
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`Google token exchange failed (${res.status}): ${detail.slice(0, 300)}`);
+  }
+  return res.json();
+}
+
+export function decodeJwtPayload(jwt) {
+  const parts = String(jwt || "").split(".");
+  if (parts.length !== 3) throw new Error("Malformed ID token");
+  const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+  const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+  return JSON.parse(atob(padded));
+}
+
+// Validates the claims of an ID token received *directly* from Google's token
+// endpoint over TLS.
+//
+// The signature is deliberately not re-verified. Google's own guidance is that
+// a token fetched server-to-server from the token endpoint over HTTPS needs no
+// local signature check, because the TLS channel already authenticates the
+// issuer. This never accepts a token from the browser or any other source --
+// see the callback route in index.js. If that ever changes, this must grow
+// full JWKS/RS256 verification first.
+export function validateGoogleIdToken(payload, { clientId, nonce, now = Date.now() }) {
+  const problems = [];
+  const issuers = ["https://accounts.google.com", "accounts.google.com"];
+
+  if (!issuers.includes(payload.iss)) problems.push(`unexpected issuer: ${payload.iss}`);
+  if (payload.aud !== clientId) problems.push("token was issued for a different client");
+  if (!payload.exp || payload.exp * 1000 <= now) problems.push("token has expired");
+  if (payload.nonce !== nonce) problems.push("nonce mismatch (possible replay)");
+  if (!payload.sub) problems.push("token carries no subject");
+  if (!payload.email) problems.push("token carries no email");
+  if (payload.email_verified !== true && payload.email_verified !== "true") {
+    problems.push("Google has not verified this email address");
+  }
+  return { ok: problems.length === 0, problems };
+}
+
+// ---- OAuth handshake state (server-side, single-use) ----
+export async function createOAuthState(env, { nonce, codeVerifier, redirectUri }) {
+  const state = randomUrlSafe(24);
+  const expires = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  await env.DB.prepare(
+    "INSERT INTO oauth_states (state, nonce, code_verifier, redirect_uri, expires_at) VALUES (?, ?, ?, ?, ?)"
+  )
+    .bind(state, nonce, codeVerifier, redirectUri, expires)
+    .run();
+  return state;
+}
+
+// Consumes the row: a given state can only ever be redeemed once.
+export async function consumeOAuthState(env, state) {
+  if (!state) return null;
+  const row = await env.DB.prepare("SELECT * FROM oauth_states WHERE state = ? AND expires_at > datetime('now')")
+    .bind(state)
+    .first();
+  await env.DB.prepare("DELETE FROM oauth_states WHERE state = ?").bind(state).run();
+  return row || null;
+}
+
+export async function purgeExpiredOAuthStates(env) {
+  await env.DB.prepare("DELETE FROM oauth_states WHERE expires_at <= datetime('now')").run();
+}

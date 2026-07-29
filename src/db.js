@@ -201,6 +201,55 @@ export async function getDashboard(env, weekStart, prevWeekStart) {
   };
 }
 
+// ---- 2FA backup codes ----
+// Codes arrive here already hashed; plaintext never reaches the database.
+export async function replaceBackupCodes(env, userId, codeHashes) {
+  await env.DB.prepare("DELETE FROM totp_backup_codes WHERE user_id = ?").bind(userId).run();
+  for (const hash of codeHashes) {
+    await env.DB.prepare("INSERT INTO totp_backup_codes (user_id, code_hash) VALUES (?, ?)").bind(userId, hash).run();
+  }
+}
+
+export async function countUnusedBackupCodes(env, userId) {
+  const row = await env.DB.prepare(
+    "SELECT COUNT(*) as n FROM totp_backup_codes WHERE user_id = ? AND used_at IS NULL"
+  )
+    .bind(userId)
+    .first();
+  return row.n;
+}
+
+// Redeems a backup code if it matches an unused one. Returns true exactly once
+// per code -- the UPDATE's `used_at IS NULL` guard is what makes it single-use
+// even if two requests race.
+export async function redeemBackupCode(env, userId, codeHash) {
+  const row = await env.DB.prepare(
+    "SELECT id FROM totp_backup_codes WHERE user_id = ? AND code_hash = ? AND used_at IS NULL"
+  )
+    .bind(userId, codeHash)
+    .first();
+  if (!row) return false;
+  const res = await env.DB.prepare(
+    "UPDATE totp_backup_codes SET used_at = datetime('now') WHERE id = ? AND used_at IS NULL"
+  )
+    .bind(row.id)
+    .run();
+  return res.meta.changes === 1;
+}
+
+export async function clearBackupCodes(env, userId) {
+  await env.DB.prepare("DELETE FROM totp_backup_codes WHERE user_id = ?").bind(userId).run();
+}
+
+// ---- Google account binding ----
+export async function getUserByEmail(env, email) {
+  return env.DB.prepare("SELECT * FROM users WHERE email = ?").bind(email).first();
+}
+
+export async function bindGoogleSub(env, userId, sub) {
+  await env.DB.prepare("UPDATE users SET google_sub = ? WHERE id = ?").bind(sub, userId).run();
+}
+
 // ---- Audit log ----
 export async function logAudit(env, user, action, entityType, entityId, detail) {
   await env.DB.prepare(

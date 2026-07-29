@@ -256,6 +256,21 @@ select.stage-lost{border-color:var(--red-text);background:var(--red-tint-bg);col
 .security-body{padding:24px}
 .security-copy{font-size:14px;color:var(--text-muted);line-height:1.6;max-width:480px;margin-bottom:20px}
 .setup-grid{display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start}
+.security-section{border-top:1px solid var(--border);margin-top:24px;padding-top:24px}
+.security-section:first-child{border-top:none;margin-top:0;padding-top:0}
+h3.sub-label{font-size:13px;font-weight:600;margin:0 0 8px}
+
+/* federated sign-in */
+.btn-google{width:100%;text-align:center;margin-top:6px;padding:11px 16px;display:flex;align-items:center;justify-content:center;gap:9px}
+.gmark{width:16px;height:16px;flex-shrink:0}
+.or-divider{display:flex;align-items:center;gap:12px;margin:20px 0;color:var(--text-muted);font-size:11px;letter-spacing:.08em;text-transform:uppercase}
+.or-divider::before,.or-divider::after{content:"";flex:1;height:1px;background:var(--border)}
+
+/* backup codes */
+.codes-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin:14px 0}
+.code-chip{font-family:var(--font-mono);font-size:13.5px;letter-spacing:.04em;background:var(--input-bg);border:1px solid var(--border);border-radius:var(--radius);padding:9px 12px;text-align:center}
+.code-chip.spent{opacity:.45;text-decoration:line-through}
+.codes-warn{font-size:13px;line-height:1.6;max-width:520px}
 </style>
 </head>
 <body>
@@ -267,8 +282,18 @@ ${body}
 </html>`;
 }
 
+// Google's mark, inlined as an SVG so the login page still makes zero
+// external requests (and the CSP can keep default-src 'none').
+const GOOGLE_MARK = `<svg class="gmark" viewBox="0 0 48 48" aria-hidden="true" focusable="false"><path fill="#4285F4" d="M45.1 24.5c0-1.6-.1-3.1-.4-4.5H24v8.5h11.8c-.5 2.7-2 5-4.4 6.6v5.5h7.1c4.1-3.8 6.6-9.4 6.6-16.1z"/><path fill="#34A853" d="M24 46c6 0 11-2 14.6-5.4l-7.1-5.5c-2 1.3-4.5 2.1-7.5 2.1-5.8 0-10.7-3.9-12.4-9.1H4.3v5.7C7.9 41 15.4 46 24 46z"/><path fill="#FBBC05" d="M11.6 28.1c-.4-1.3-.7-2.7-.7-4.1s.2-2.8.7-4.1v-5.7H4.3C2.8 17.1 2 20.4 2 24s.8 6.9 2.3 9.8l7.3-5.7z"/><path fill="#EA4335" d="M24 10.8c3.3 0 6.2 1.1 8.5 3.3l6.3-6.3C35 4.3 30 2 24 2 15.4 2 7.9 7 4.3 14.2l7.3 5.7c1.7-5.2 6.6-9.1 12.4-9.1z"/></svg>`;
+
 // ---------- Auth pages ----------
-export function loginPage({ error, theme } = {}) {
+export function loginPage({ error, theme, googleEnabled = false } = {}) {
+  const google = googleEnabled
+    ? `
+      <a href="/auth/google" class="btn btn-google">${GOOGLE_MARK}<span>Continue with Google</span></a>
+      <div class="or-divider">or</div>`
+    : "";
+
   return layout({
     title: "Log in",
     theme,
@@ -277,8 +302,9 @@ export function loginPage({ error, theme } = {}) {
       <h1>Sign in</h1>
       <p class="lead">Enter your Catalyst 7 credentials.</p>
       ${error ? `<div class="msg msg-error">${esc(error)}</div>` : ""}
+      ${google}
       <form class="plain" method="post" action="/login">
-        <div class="field"><label>Email</label><input type="email" name="email" required autofocus placeholder="you@catalyst7.co.za" /></div>
+        <div class="field"><label>Email</label><input type="email" name="email" required placeholder="you@catalyst7.co.za" /></div>
         <div class="field"><label>Password</label><input type="password" name="password" required placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;" /></div>
         <button type="submit" class="btn btn-primary">Continue</button>
       </form>
@@ -297,10 +323,10 @@ export function totpVerifyPage({ error, theme } = {}) {
       <p class="lead">Open your authenticator app and enter the 6-digit code to finish signing in.</p>
       ${error ? `<div class="msg msg-error">${esc(error)}</div>` : ""}
       <form class="plain" method="post" action="/login/2fa">
-        <div class="field"><label>Authentication code</label><input name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required autofocus placeholder="000000" /></div>
+        <div class="field"><label>Authentication or backup code</label><input name="code" autocomplete="one-time-code" maxlength="12" required autofocus placeholder="000000" /></div>
         <button type="submit" class="btn btn-primary">Verify</button>
       </form>
-      <div class="helper">Lost your device? Contact a founder to disable 2FA on your account.</div>
+      <div class="helper">Lost your device? Use one of the backup codes you saved when you turned 2FA on &mdash; each works once. No backup codes left? A founder can disable 2FA on your account.</div>
     </div>`,
   });
 }
@@ -324,16 +350,52 @@ export function setupPage({ token, name, error, theme }) {
 }
 
 // ---------- Security / 2FA self-service ----------
-export function securityPage({ user, csrf, pendingSecret, pendingUri, error, message, theme }) {
+export function securityPage({
+  user,
+  csrf,
+  pendingSecret,
+  pendingUri,
+  error,
+  message,
+  theme,
+  newBackupCodes = null,
+  backupCodesLeft = 0,
+  googleLinked = false,
+  googleEnabled = false,
+}) {
   let stateBody;
   if (user.totp_enabled) {
+    const codesBlock = newBackupCodes
+      ? `
+      <div class="msg msg-ok codes-warn">
+        <strong>Save these now — this is the only time they'll be shown.</strong><br />
+        Each code works once, in place of your authenticator app. Print them or put them in a password manager; don't leave them in this browser tab.
+      </div>
+      <div class="codes-grid">${newBackupCodes.map((c) => `<div class="code-chip">${esc(c)}</div>`).join("")}</div>`
+      : `<div class="security-copy" style="margin-bottom:14px">${
+          backupCodesLeft > 0
+            ? `You have <strong>${backupCodesLeft}</strong> unused backup code${backupCodesLeft === 1 ? "" : "s"}. Each one signs you in once if you lose your authenticator.`
+            : `You have <strong>no unused backup codes</strong>. If you lose your authenticator you'll need another founder to clear 2FA for you. Generate a set now.`
+        }</div>`;
+
     stateBody = `
-      <div class="security-status">${pill("2FA on", "green")}</div>
-      <div class="security-copy">Two-factor authentication is protecting this account. You'll be asked for a code from your authenticator app each time you sign in.</div>
-      <form method="post" action="/security/2fa/disable">
-        ${csrfField(csrf)}
-        <button type="submit" class="btn btn-danger">Disable 2FA</button>
-      </form>`;
+      <div class="security-section">
+        <div class="security-status">${pill("2FA on", "green")}</div>
+        <div class="security-copy">Two-factor authentication is protecting this account. You'll be asked for a code from your authenticator app each time you sign in.</div>
+        <form method="post" action="/security/2fa/disable">
+          ${csrfField(csrf)}
+          <button type="submit" class="btn btn-danger">Disable 2FA</button>
+        </form>
+      </div>
+      <div class="security-section">
+        <h3 class="sub-label">Backup codes</h3>
+        ${codesBlock}
+        <form method="post" action="/security/2fa/backup-codes">
+          ${csrfField(csrf)}
+          <button type="submit" class="btn">${newBackupCodes || backupCodesLeft ? "Regenerate backup codes" : "Generate backup codes"}</button>
+        </form>
+        <div class="hint" style="margin-top:8px">Regenerating immediately invalidates every code from the previous set.</div>
+      </div>`;
   } else if (pendingSecret) {
     stateBody = `
       <div class="security-status">${pill("Setup in progress")}</div>
@@ -372,6 +434,19 @@ export function securityPage({ user, csrf, pendingSecret, pendingUri, error, mes
     ${error ? `<div class="msg msg-error">${esc(error)}</div>` : ""}
     ${message ? `<div class="msg msg-ok">${esc(message)}</div>` : ""}
     <div class="panel"><div class="security-body">${stateBody}</div></div>
+    ${
+      googleEnabled
+        ? `<div class="panel"><div class="security-body">
+            <h3 class="sub-label">Google sign-in</h3>
+            <div class="security-status">${googleLinked ? pill("linked", "green") : pill("not linked")}</div>
+            <div class="security-copy">${
+              googleLinked
+                ? `This account is linked to the Google account for ${esc(user.email)}, so you can sign in with either Google or your password. Two-factor still applies to both.`
+                : `You can sign in with Google using ${esc(user.email)} — the link is made automatically the first time you use "Continue with Google" on the sign-in page. Your password keeps working either way.`
+            }</div>
+          </div></div>`
+        : ""
+    }
   `,
   });
 }

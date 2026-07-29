@@ -21,7 +21,7 @@ Deploy (`wrangler deploy`) and domain binding are the only steps still on you.
 
 - **Runtime:** Cloudflare Worker, plain JavaScript (ES modules), no framework (no Hono/Express) — one `fetch(request, env)` handler routing on pathname + method.
 - **Files:** `src/index.js` (routing), `src/db.js` (data access, parameterized queries only), `src/auth.js` (password hashing, sessions, week math).
-- **Auth mechanism:** PBKDF2 (Web Crypto, 100,000 iterations, SHA-256) for password hashing — no plaintext password ever touches the database or me. Sessions are random 32-byte tokens stored in a `sessions` table, set as `HttpOnly; Secure; SameSite=Lax` cookies, 30-day expiry.
+- **Auth mechanism:** PBKDF2 (Web Crypto, 100,000 iterations, SHA-256) for password hashing — no plaintext password ever touches the database or me. Sessions are random 32-byte tokens stored in a `sessions` table, set as `HttpOnly; Secure; SameSite=Lax` cookies, 30-day expiry. Optional Google sign-in and optional TOTP 2FA (with backup codes) sit alongside, all landing on the same session — see section 6.
 - **Roles enforced server-side:** `founder` (full access) vs `freelancer` (own weekly-log row only) — checked on every route, not just hidden in the UI.
 - **Zero third-party runtime dependencies** — only `wrangler` itself as a devDependency. Nothing to audit for supply-chain risk.
 
@@ -43,13 +43,23 @@ Cloudflare D1 (managed SQLite), already created and live: `catalyst7-kpi` (`ba62
 | `audit_log` | Who-did-what history | User name/id per action |
 | `error_log` | Unhandled app errors | Request path + error message |
 | `retention_flags` | Records due for a retention decision | Entity link + reason |
+| `oauth_states` | In-flight Google sign-in handshakes (10 min TTL, single-use) | None — nonce + PKCE verifier only |
+| `totp_backup_codes` | Single-use 2FA recovery codes | None — SHA-256 hashes only |
 
-12 tables total now (7 original + 5 added in the security hardening pass).
+14 tables total now (7 original + 5 in the security hardening pass + 2 for Google sign-in and backup codes).
+
+`users` also gained a `google_sub` column, holding Google's stable subject id once an account has been linked.
+
+**The two newest tables are not yet on the live database.** They were added after it was provisioned, so apply the migration before deploying:
+
+```bash
+npx wrangler d1 execute catalyst7-kpi --remote --file=./migrations/001_google_auth_and_backup_codes.sql
+```
 
 - All queries are parameterized (`.bind()`) — no string-concatenated SQL, so no SQL injection surface.
 - `CHECK` constraints enforce valid values at the database layer (e.g. lead stage, revenue type) — tested live, confirmed rejecting bad data.
 - No ORM. Deliberate — this schema is small enough that a query layer adds more indirection than value.
-- All of the above verified with 36 end-to-end tests (`tests/run.mjs`) run against a real SQLite engine (Node's `node:sqlite`) loaded with this exact schema and exercising the actual `src/` code — not a reimplementation. All 36 pass.
+- All of the above verified with 54 end-to-end tests (`tests/run.mjs`) run against a real SQLite engine (Node's `node:sqlite`) loaded with this exact schema and exercising the actual `src/` code — not a reimplementation. All 54 pass.
 
 ## 4. Privacy — POPIA
 
@@ -92,8 +102,14 @@ This system is a **Responsible Party** under POPIA for the data it holds (it's C
 - **Error log** — unhandled exceptions now land in `error_log` with path + message, viewable at `/errors` (founders only), in addition to Cloudflare's own free Workers Analytics.
 - **Retention review** — monthly Cron Trigger flags stale records; founders resolve each one as Keep or Erase at `/retention`.
 
+**Closed in the Google-auth / hardening pass:**
+- **Google sign-in (optional)** — OAuth 2.0 authorization-code flow with PKCE, a single-use server-side `state` row and a `nonce`, all hand-rolled on Web Crypto and `fetch` (no OAuth library, still zero runtime dependencies). **Authentication is federated; authorisation is not.** A valid Google identity for an email that isn't already in `users` is a *failed login* — nothing is auto-provisioned. Google's `sub` is bound on first sign-in, so a Workspace address later reassigned to a different person is refused and audited. 2FA is not bypassed by it. Off entirely unless `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` are configured.
+  - *Design note:* the ID token's signature is not re-verified locally, because it's fetched server-to-server from Google's token endpoint over TLS — the case Google's own guidance exempts. All claims (`iss`, `aud`, `exp`, `nonce`, `email_verified`) are checked. This is only sound while the token never arrives from an untrusted path; the code comment says so, and any move to a browser-delivered token needs full JWKS/RS256 verification first.
+- **2FA backup codes** — ten single-use recovery codes issued when 2FA is enabled, shown once, stored as SHA-256 hashes (deliberately not PBKDF2: they're 50 bits of CSPRNG output, not a human-chosen secret). Redeemable at the code prompt in place of TOTP, regenerable from `/security`, and cleared when 2FA is switched off. Redemption is audited with the remaining count.
+- **Security response headers** — strict CSP (`default-src 'none'`, no external origin permitted at all, `script-src` limited to digests of the two pre-existing inline handlers), HSTS, `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: same-origin`, `Permissions-Policy`, COOP/CORP, and `Cache-Control: no-store` so authenticated pages don't survive logout in the browser cache. Verified in a real browser: both inline handlers still compile, `fetch()` is blocked by `connect-src`, and no violations are reported.
+- **Malformed POST bodies** no longer surface as 500s that write to `error_log` — an unparseable body is treated as an empty form and falls through to the CSRF guard as a clean 403.
+
 **Still open — genuinely lower priority, not built this pass:**
-- **No 2FA backup/recovery codes** — a lost authenticator needs another founder to clear it via a direct D1 update. Worth adding backup codes if 2FA sees real use.
 - **No brute-force protection on the CSRF/session layer beyond rate limiting** — e.g. no anomaly detection on session reuse from a new IP/device. Reasonable to defer at this scale.
 - **No automated *alerting*** — the error log and audit log are places you can *look*, but nothing pushes a notification when something's wrong. Cloudflare Notifications (dashboard, free) can alert on error-rate spikes; nothing here does that yet.
 
@@ -102,12 +118,12 @@ This system is a **Responsible Party** under POPIA for the data it holds (it's C
 - **CI/CD: not present in this repo.** Earlier drafts of this document described a `.github/workflows/deploy.yml` ready to auto-deploy on push to `main` via `cloudflare/wrangler-action`; that file is **not** in the current tree. Whenever it is added it will still need two things: the repo actually on GitHub, and a `CLOUDFLARE_API_TOKEN` repo secret. Until then, `npx wrangler deploy` from a terminal is the deploy path. `npm test` is the pre-deploy gate to run by hand.
 - **Backups:** D1 has point-in-time recovery built into the Cloudflare platform (up to 30 days) with no extra configuration — worth confirming this is enabled on your account tier, but nothing for us to build.
 - **No staging environment** — one production database, no preview/test copy. Fine for now given the low change frequency; worth revisiting if you start iterating on the schema often.
-- **Test coverage:** 36 end-to-end tests (`npm test`) exercise the actual shipped code (not a reimplementation) against a real SQLite engine standing in for D1 — login, rate limiting, CSRF enforcement, 2FA enable + login flow, retention scan + erasure, audit logging, role-based access, theme cookie plumbing, and the checkbox-hack markup contracts all covered. All 36 pass. Not wired into CI yet (see above) — currently a manual `node` script, not something that runs automatically on every change.
+- **Test coverage:** 54 end-to-end tests (`npm test`) exercise the actual shipped code (not a reimplementation) against a real SQLite engine standing in for D1 — login, rate limiting, CSRF enforcement, 2FA enable + login flow, retention scan + erasure, audit logging, role-based access, theme cookie plumbing, and the checkbox-hack markup contracts all covered. All 54 pass. Not wired into CI yet (see above) — currently a manual `node` script, not something that runs automatically on every change.
 - **Local preview:** `npm run preview` (`tests/devserver.mjs`) runs the real Worker against a seeded in-memory database on `http://localhost:8788`, pre-authenticated as a demo founder. It exists so a design change can be eyeballed at any viewport in seconds, offline, without Cloudflare credentials. `wrangler dev` remains the higher-fidelity check against the real D1 binding.
 
 ## 8. What's still needed — punch list, in priority order
 
-1. **Deploy it** — `npm install && npx wrangler login && npx wrangler deploy` (on you — no tool available to me pushes Worker code live).
+1. **Apply the migration, then deploy** — `npx wrangler d1 execute catalyst7-kpi --remote --file=./migrations/001_google_auth_and_backup_codes.sql`, then `npm install && npx wrangler login && npx wrangler deploy` (on you — no tool available to me pushes Worker code live). The migration must land first: `/security` and Google sign-in both read tables it creates.
 2. **Bind the custom domain** and activate your founder login via the `/setup/<token>` link.
 3. **Turn on 2FA** for your founder account from `/security` once you're in — the mechanism is built, it's just off by default.
 4. **Add the other two founders** (manual D1 insert for now — documented in the README).

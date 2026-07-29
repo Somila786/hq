@@ -4,10 +4,10 @@ Self-hosted on your own Cloudflare account. Cloudflare Worker (app + API) + D1 (
 
 ## What's already done for you
 
-- **Database created and live**: `catalyst7-kpi` (id `ba622992-c6dc-4a9b-a099-3b8a5fbe3a83`) in your Cloudflare account, schema applied (12 tables).
+- **Database created and live**: `catalyst7-kpi` (id `ba622992-c6dc-4a9b-a099-3b8a5fbe3a83`) in your Cloudflare account, schema applied (12 tables; a migration adds 2 more — see below).
 - **Your founder account is seeded**: `catalyst948@gmail.com`, role `founder`, waiting on a password.
 - **All application code is written and integration-tested** — auth, dashboard, freelancer/client/lead/revenue management, freelancer weekly log-in flow, plus the full security layer below.
-- **Security hardening pass complete**: login rate limiting, CSRF protection, an audit log, optional TOTP 2FA, an in-app error log, and a monthly data-retention review — see "Security & compliance features" below. 36 end-to-end tests cover all of it against a real SQLite engine standing in for D1; all 36 pass.
+- **Security hardening pass complete**: login rate limiting, CSRF protection, an audit log, optional TOTP 2FA, an in-app error log, and a monthly data-retention review — see "Security & compliance features" below. 54 end-to-end tests cover all of it against a real SQLite engine standing in for D1; all 54 pass.
 - **Brand design system applied**: the real Catalyst 7 palette (black / cream / red) with a working dark ↔ light toggle, a mobile nav, and collapsible add-forms — all server-rendered, still no client JS bundle. See "Look & feel" below.
 
 ## What I could NOT do for you
@@ -61,13 +61,37 @@ Your domain is already on Cloudflare (same account as this Worker), so:
 ## Testing & local preview
 
 ```bash
-npm test        # 36 end-to-end tests against a real SQLite engine, no framework needed
+npm test        # 54 end-to-end tests against a real SQLite engine, no framework needed
 npm run preview # real app + seeded demo data at http://localhost:8788, no Cloudflare login
 ```
 
 `npm test` runs the actual Worker code against `node:sqlite` standing in for D1 — worth running before any deploy. On Node 20 or 22 you'll need `node --experimental-sqlite tests/run.mjs`; on Node 23+ it works as-is.
 
 `npm run preview` is for eyeballing design changes offline; it signs you in automatically as a demo founder and uses a throwaway in-memory database, so nothing you click there touches real data. Use `npx wrangler dev` when you want the real D1 binding.
+
+## Turning on Google sign-in (optional)
+
+Google sign-in sits *alongside* password login — nobody is forced onto it, and freelancers without Google accounts keep using their invite link and password. Leave it unconfigured and the button simply doesn't appear.
+
+**Google proves who someone is; your database decides whether they're allowed in.** A successful Google login for an email that isn't already in the `users` table is rejected. There is no auto-provisioning, so no one can sign themselves up by owning a Gmail address.
+
+1. Go to [console.cloud.google.com](https://console.cloud.google.com/) → create (or pick) a project → **APIs & Services → Credentials → Create Credentials → OAuth client ID** → type **Web application**.
+2. Under **Authorised redirect URIs**, add every origin the app runs on, each with `/auth/google/callback`:
+   ```
+   https://catalyst7-kpi.<your-subdomain>.workers.dev/auth/google/callback
+   https://kpi.catalyst7.<yourdomain>/auth/google/callback
+   ```
+   These must match character for character — Google rejects anything else.
+3. Put the **client ID** in `wrangler.toml` under `[vars]` (it's public — it appears in the redirect URL anyway).
+4. Put the **client secret** in as a real secret, never in the repo:
+   ```bash
+   npx wrangler secret put GOOGLE_CLIENT_SECRET
+   ```
+5. `npx wrangler deploy`. The sign-in page now offers "Continue with Google".
+
+The first time a known user signs in with Google, their Google account ID is bound to their row. If a different Google account later shows up claiming the same email address, it's refused and logged — that's the protection against a Workspace address being reassigned to someone new.
+
+If a user has 2FA switched on, Google sign-in **still** asks for their second factor. Federating identity doesn't override a control they deliberately turned on.
 
 ## Security & compliance features
 
@@ -77,6 +101,9 @@ npm run preview # real app + seeded demo data at http://localhost:8788, no Cloud
 - **Optional 2FA** (`/security`, any account) — standard TOTP, works with Google Authenticator, Authy, 1Password, etc. No external library — implemented directly against Workers' Web Crypto API and cross-checked against an independent Python HMAC-SHA1 implementation to confirm it's RFC 6238-correct. Recommended for founder accounts.
 - **Error log** (`/errors`, founders only) — unhandled application errors land here with path and message. Cloudflare's own Workers Analytics (dashboard → catalyst7-kpi → Metrics) covers request volume/latency/uptime on top of this for free, zero setup.
 - **Retention review** (`/retention`, founders only) — a Cron Trigger runs monthly (1st, 03:00 UTC) and flags lost leads and inactive freelancers with 365+ days of no activity. It never deletes anything itself — a founder reviews each flag and chooses "Keep" or "Erase personal info" (name/email/contact cleared, financial history like past revenue/hours stays intact for accurate historical reporting).
+- **2FA backup codes** — turning on 2FA now hands you ten single-use recovery codes, shown once and stored only as hashes. Any one of them signs you in at the code prompt if you lose your authenticator, so a lost phone no longer needs another founder to run a manual database update. Regenerate them any time from `/security`; regenerating instantly kills the previous set.
+- **Google sign-in** (optional, see above) — allowlist-only, PKCE + one-time state + nonce on every handshake, and it never bypasses 2FA.
+- **Security response headers** — a strict Content-Security-Policy (`default-src 'none'`, no `unsafe-inline` scripts, no external origins permitted at all), plus HSTS, `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy`, `Permissions-Policy`, COOP/CORP, and `Cache-Control: no-store` so authenticated pages don't linger in the browser cache after logout.
 
 ## Known v1 limitations (easy to extend later, intentionally left out to ship fast)
 
