@@ -95,10 +95,13 @@ export function clearPendingCookie() {
   return `c7_pending=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`;
 }
 
-// UI preference only -- read server-side in index.js to pick the theme, never
-// by client JS, so HttpOnly is fine. One year, survives sessions.
+// UI preference only -- never a credential, and nothing security-relevant
+// reads it. Deliberately NOT HttpOnly: the theme toggle flips this from the
+// page so the switch is instant instead of a server round-trip, and a browser
+// silently refuses a document.cookie write over an HttpOnly cookie of the same
+// name -- the theme would revert on the next page load.
 export function themeCookie(theme) {
-  return `c7_theme=${theme}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=31536000`;
+  return `c7_theme=${theme}; Secure; SameSite=Lax; Path=/; Max-Age=31536000`;
 }
 
 // ---- Sessions (CSRF token minted at session creation, lives with the session) ----

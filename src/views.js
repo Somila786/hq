@@ -54,6 +54,28 @@ const FREELANCER_NAV = [
   ["security", "/security", "Security"],
 ];
 
+// The one piece of client script on the site, and it is a pure speed
+// optimisation: it makes the light/dark switch instant instead of a page
+// reload. The <a href="/theme/toggle"> underneath still works by itself, so
+// with JS blocked the toggle degrades to the old server round-trip rather
+// than breaking.
+//
+// A delegated listener rather than an inline onclick, so it hashes as an
+// ordinary script block and doesn't lean on CSP's 'unsafe-hashes'. No fetch,
+// so connect-src stays 'none'. Kept byte-for-byte stable because index.js
+// pins its SHA-256 in the CSP -- edit this and the suite will tell you.
+const THEME_SCRIPT = `<script>
+document.addEventListener("click",function(e){
+var a=e.target.closest("[data-theme-toggle]");
+if(!a||e.metaKey||e.ctrlKey||e.shiftKey||e.button)return;
+e.preventDefault();
+var n=document.documentElement.dataset.theme==="light"?"dark":"light";
+document.documentElement.dataset.theme=n;
+document.querySelectorAll("[data-theme-toggle]").forEach(function(t){t.textContent=n==="dark"?"Dark":"Light"});
+document.cookie="c7_theme="+n+"; Path=/; Max-Age=31536000; SameSite=Lax; Secure";
+});
+</script>`;
+
 function layout({ title, user, active, body, theme = "dark" }) {
   const safeTheme = theme === "light" ? "light" : "dark";
   const themeLabel = safeTheme === "dark" ? "Dark" : "Light";
@@ -67,7 +89,10 @@ function layout({ title, user, active, body, theme = "dark" }) {
     .join("");
 
   const brand = `<div class="brandwrap"><span class="brand">Catalyst 7</span><span class="brand-sub">HQ</span></div>`;
-  const modeToggle = `<a href="/theme/toggle" class="mode-toggle">${themeLabel}</a>`;
+  // The href is the no-JS path and still works on its own (server flips the
+  // cookie and redirects back). The script below intercepts the click to make
+  // the switch instant; if it never runs, nothing is lost but the speed.
+  const modeToggle = `<a href="/theme/toggle" class="mode-toggle" data-theme-toggle>${themeLabel}</a>`;
 
   const header = user
     ? `
@@ -285,6 +310,7 @@ ${header}
 <main${user ? "" : ' class="authmain"'}>
 ${body}
 </main>
+${THEME_SCRIPT}
 </body>
 </html>`;
 }

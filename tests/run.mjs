@@ -719,10 +719,15 @@ await test("/theme/toggle is public and flips dark to light", async () => {
   eq(res.headers.get("Location"), "/", "default destination");
   const raw = rawSetCookie(res, "c7_theme");
   has(raw, "c7_theme=light", "flips to light");
-  has(raw, "HttpOnly", "HttpOnly");
   has(raw, "Secure", "Secure");
   has(raw, "SameSite=Lax", "SameSite");
   has(raw, "Max-Age=31536000", "one-year lifetime");
+  // Deliberately NOT HttpOnly, unlike the session cookie. The in-page toggle
+  // writes this via document.cookie for an instant switch, and a browser
+  // silently drops that write if an HttpOnly cookie of the same name exists --
+  // the theme would snap back on the next load. It carries no secret.
+  lacks(raw, "HttpOnly", "theme cookie must stay readable by the page");
+  has(rawSetCookie(await worker.fetch(req("/login"), env), "c7_session") || "none", "none", "sanity: no session cookie here");
 });
 
 await test("/theme/toggle flips light back to dark", async () => {
@@ -743,6 +748,33 @@ await test("/theme/toggle ignores a cross-origin Referer", async () => {
   eq(evil.headers.get("Location"), "/", "no open redirect");
   const junk = await worker.fetch(req("/theme/toggle", { headers: { Referer: "not a url" } }), env);
   eq(junk.headers.get("Location"), "/", "malformed Referer is ignored");
+});
+
+await test("the theme switch works instantly in-page, and still works without JS", async () => {
+  const env = makeEnv();
+  const { session } = await founderSession(env);
+  const body = await (await worker.fetch(req("/dashboard", { cookies: { c7_session: session } }), env)).text();
+
+  // The no-JS path: a real link to the server route, so the toggle keeps
+  // working if the script is blocked or fails.
+  has(body, 'href="/theme/toggle"', "server fallback link present");
+  has(body, "data-theme-toggle", "hook the script binds to");
+
+  const script = body.match(/<script>([\s\S]*?)<\/script>/);
+  assert(script, "the enhancement script is on the page");
+  has(script[1], "preventDefault", "it takes over the click rather than following the link");
+  has(script[1], "document.cookie", "it persists the choice itself, so there's no round-trip");
+  has(script[1], "dataset.theme", "it flips the attribute the CSS keys off");
+  lacks(script[1], "fetch(", "no network call -- connect-src stays 'none'");
+  lacks(script[1], "HttpOnly", "the cookie it writes cannot be HttpOnly");
+
+  // Modified clicks must fall through to normal browser behaviour.
+  has(script[1], "metaKey", "ctrl/cmd-click still opens normally");
+
+  // And the whole thing must be exactly one small script, not a bundle.
+  eq((body.match(/<script/g) || []).length, 1, "exactly one script tag on the page");
+  assert(script[1].length < 800, `script stays tiny (${script[1].length} bytes)`);
+  lacks(body, "<script src", "no external script is ever loaded");
 });
 
 await test("the theme cookie drives the rendered page on public pages", async () => {
@@ -1712,11 +1744,15 @@ await test("the CSP script hashes match the inline handlers actually emitted", a
     ["/leads", "/retention", "/team"].map(async (p) => (await worker.fetch(req(p, { cookies: { c7_session: session } }), env)).text())
   );
 
+  // Two kinds of inline script need covering: event-handler attributes (which
+  // require 'unsafe-hashes' alongside their digest) and real <script> blocks
+  // (which a plain digest authorises on its own). Both must be represented.
   const handlers = new Set();
   for (const body of pages) {
     for (const m of body.matchAll(/\son(?:change|submit|click|load|error)="([^"]*)"/g)) handlers.add(m[1]);
+    for (const m of body.matchAll(/<script>([\s\S]*?)<\/script>/g)) handlers.add(m[1]);
   }
-  assert(handlers.size > 0, "the pages really do carry inline handlers to cover");
+  assert(handlers.size > 0, "the pages really do carry inline script to cover");
 
   for (const h of handlers) {
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(h));

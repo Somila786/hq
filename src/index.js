@@ -60,6 +60,9 @@ const INLINE_SCRIPT_HASHES = [
   "'sha256-osjxnKEPL/pQJbFk1dKsF7PYFmTyMWGmVSiL9inhxJY='", // this.form.submit()
   "'sha256-h8g6LCqXGbG2tO/pvAHBjSIDgOVHHT7/zXTJSzndxl0='", // retention erase confirm()
   "'sha256-sBUkWCcHNuXUK0ODUDXA2EfK7BwSPxu7JXNkACjavvM='", // team revoke-access confirm()
+  // THEME_SCRIPT in views.js -- a real <script> block, so this hash alone
+  // authorises it; it does not depend on 'unsafe-hashes'.
+  "'sha256-HL1QaYdiRLv5+16Djw9KPpJ60rNx9rKFZ0S5NRqVCA0='",
 ];
 
 // style-src keeps 'unsafe-inline': the layout ships one big inline <style>
