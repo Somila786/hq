@@ -328,7 +328,7 @@ ${THEME_SCRIPT}
 const GOOGLE_MARK = `<svg class="gmark" viewBox="0 0 48 48" aria-hidden="true" focusable="false"><path fill="#4285F4" d="M45.1 24.5c0-1.6-.1-3.1-.4-4.5H24v8.5h11.8c-.5 2.7-2 5-4.4 6.6v5.5h7.1c4.1-3.8 6.6-9.4 6.6-16.1z"/><path fill="#34A853" d="M24 46c6 0 11-2 14.6-5.4l-7.1-5.5c-2 1.3-4.5 2.1-7.5 2.1-5.8 0-10.7-3.9-12.4-9.1H4.3v5.7C7.9 41 15.4 46 24 46z"/><path fill="#FBBC05" d="M11.6 28.1c-.4-1.3-.7-2.7-.7-4.1s.2-2.8.7-4.1v-5.7H4.3C2.8 17.1 2 20.4 2 24s.8 6.9 2.3 9.8l7.3-5.7z"/><path fill="#EA4335" d="M24 10.8c3.3 0 6.2 1.1 8.5 3.3l6.3-6.3C35 4.3 30 2 24 2 15.4 2 7.9 7 4.3 14.2l7.3 5.7c1.7-5.2 6.6-9.1 12.4-9.1z"/></svg>`;
 
 // ---------- Auth pages ----------
-export function loginPage({ error, theme, googleEnabled = false } = {}) {
+export function loginPage({ error, theme, googleEnabled = false, next = null } = {}) {
   const google = googleEnabled
     ? `
       <a href="/auth/google" class="btn btn-google">${GOOGLE_MARK}<span>Continue with Google</span></a>
@@ -345,6 +345,7 @@ export function loginPage({ error, theme, googleEnabled = false } = {}) {
       ${error ? `<div class="msg msg-error">${esc(error)}</div>` : ""}
       ${google}
       <form class="plain" method="post" action="/login">
+        ${next ? `<input type="hidden" name="next" value="${esc(next)}" />` : ""}
         <div class="field"><label>Email</label><input type="email" name="email" required placeholder="you@catalyst7.co.za" /></div>
         <div class="field"><label>Password</label><input type="password" name="password" required placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;" /></div>
         <button type="submit" class="btn btn-primary">Continue</button>
@@ -377,7 +378,7 @@ export function registerPage({ error, theme, name = "", email = "" } = {}) {
   });
 }
 
-export function totpVerifyPage({ error, theme } = {}) {
+export function totpVerifyPage({ error, theme, next = null } = {}) {
   return layout({
     title: "Verify it's you",
     theme,
@@ -387,6 +388,7 @@ export function totpVerifyPage({ error, theme } = {}) {
       <p class="lead">Open your authenticator app and enter the 6-digit code to finish signing in.</p>
       ${error ? `<div class="msg msg-error">${esc(error)}</div>` : ""}
       <form class="plain" method="post" action="/login/2fa">
+        ${next ? `<input type="hidden" name="next" value="${esc(next)}" />` : ""}
         <div class="field"><label>Authentication or backup code</label><input name="code" autocomplete="one-time-code" maxlength="12" required autofocus placeholder="000000" /></div>
         <button type="submit" class="btn btn-primary">Verify</button>
       </form>
@@ -426,6 +428,8 @@ export function securityPage({
   backupCodesLeft = 0,
   googleLinked = false,
   googleEnabled = false,
+  mcpGrants = [],
+  mcpUrl = "/mcp",
 }) {
   let stateBody;
   if (user.totp_enabled) {
@@ -498,6 +502,30 @@ export function securityPage({
     ${error ? `<div class="msg msg-error">${esc(error)}</div>` : ""}
     ${message ? `<div class="msg msg-ok">${esc(message)}</div>` : ""}
     <div class="panel"><div class="security-body">${stateBody}</div></div>
+    <div class="panel"><div class="security-body">
+      <h3 class="sub-label">Connected apps</h3>
+      ${
+        mcpGrants.length
+          ? `<div class="security-copy">These applications can read Catalyst 7 HQ data as you. They cannot change anything.</div>
+             <div class="table-wrap"><table><thead><tr><th>Application</th><th>Connected</th><th>Last used</th><th class="right">Action</th></tr></thead><tbody>${mcpGrants
+               .map(
+                 (g) => `<tr>
+                   <td class="strong">${esc(g.client_name || "Unnamed application")}</td>
+                   <td class="mono muted nowrap">${esc(String(g.granted_at || "").slice(0, 16))}</td>
+                   <td class="mono muted nowrap">${g.last_used_at ? esc(String(g.last_used_at).slice(0, 16)) : "never"}</td>
+                   <td class="right"><form method="post" action="/security/connectors/revoke" class="row-actions">${csrfField(
+                     csrf
+                   )}<input type="hidden" name="client_id" value="${esc(g.client_id)}" /><button type="submit" class="btn btn-sm btn-danger">Disconnect</button></form></td>
+                 </tr>`
+               )
+               .join("")}</tbody></table></div>`
+          : `<div class="security-copy">No applications are connected to your account.<br /><br />
+             To connect Claude, add a custom connector pointing at <span class="mono-box" style="display:inline-block;margin:6px 0 0">${esc(
+               mcpUrl
+             )}</span> and approve it when asked. It gets read-only access, limited to what your role can already see.</div>`
+      }
+    </div></div>
+
     ${
       googleEnabled
         ? `<div class="panel"><div class="security-body">
@@ -937,6 +965,82 @@ export function historyPage({ user, rows, theme }) {
       </div>
     </div>
   `,
+  });
+}
+
+// ---------- MCP connector: consent + info ----------
+// The consent screen is the whole point of choosing OAuth over a shared API
+// key: the token gets bound to whoever is signed in here, so the audit log
+// keeps naming a person.
+export function consentPage({ user, theme, csrf, clientName, scope, query }) {
+  const who = esc(clientName || "An application");
+  return layout({
+    user,
+    title: "Authorise access",
+    theme,
+    body: `
+    <div class="page-head">
+      <div class="page-title">${who} wants to read your Catalyst 7 HQ data</div>
+      <div class="page-sub">You're signed in as ${esc(user.name)}${user.title ? ` &middot; ${esc(user.title)}` : ""} &middot; ${esc(user.email)}</div>
+    </div>
+
+    <div class="panel"><div class="security-body">
+      <div class="security-status">${pill(esc(scope), "green")}</div>
+      <div class="security-copy">
+        It will be able to <strong>read</strong>, as you:
+        <ul style="margin:10px 0 0 18px;line-height:1.8">
+          ${
+            user.role === "founder"
+              ? `<li>This week's numbers — hours, revenue, pipeline, log compliance</li>
+                 <li>Your leads, clients, revenue entries and freelancer roster</li>`
+              : `<li>Your own weekly log and history</li>`
+          }
+        </ul>
+        <br />
+        It <strong>cannot</strong> change anything — no adding, editing or deleting. It cannot see passwords,
+        2FA secrets, or the audit log. Access follows your role, so it can never read more than you can.
+        <br /><br />
+        You can withdraw this at any time from <strong>Security</strong> in the nav.
+      </div>
+      <div class="row-actions" style="justify-content:flex-start;gap:10px">
+        <form method="post" action="/oauth/authorize${esc(query)}">
+          ${csrfField(csrf)}
+          <input type="hidden" name="decision" value="allow" />
+          <button type="submit" class="btn btn-primary">Allow access</button>
+        </form>
+        <form method="post" action="/oauth/authorize${esc(query)}">
+          ${csrfField(csrf)}
+          <input type="hidden" name="decision" value="deny" />
+          <button type="submit" class="btn">Cancel</button>
+        </form>
+      </div>
+    </div></div>
+
+    <div class="hint" style="margin-top:14px">
+      If you didn't just try to connect something, press Cancel &mdash; this page only appears when an
+      application asked for access.
+    </div>
+  `,
+  });
+}
+
+export function mcpAboutPage({ theme, origin }) {
+  return layout({
+    title: "Connector",
+    theme,
+    body: `
+    <div class="authcard" style="max-width:640px">
+      <h1>Catalyst 7 HQ connector</h1>
+      <p class="lead">Read-only access to the studio's weekly numbers, for use as a Claude connector.</p>
+      <div class="security-copy">
+        Add it in Claude under <strong>Settings &rarr; Connectors &rarr; Add custom connector</strong>, using:
+        <span class="mono-box">${esc(origin)}/mcp</span>
+        You'll be asked to sign in to HQ and approve access. The connector reads as you and follows your
+        role — a freelancer's connector only ever sees their own weekly log.
+        <br /><br />
+        Nothing it does can change your data. Revoke it any time from Security.
+      </div>
+    </div>`,
   });
 }
 

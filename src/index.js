@@ -27,6 +27,16 @@ import {
   looksLikeBackupCode,
   generateInviteCode,
   hashInviteCode,
+  MCP_SCOPE,
+  MCP_PROTOCOL_VERSION,
+  MCP_SUPPORTED_VERSIONS,
+  mcpTokenTtl,
+  hashOpaque,
+  verifyPkceS256,
+  authorizationServerMetadata,
+  protectedResourceMetadata,
+  wwwAuthenticateHeader,
+  redirectUriAllowed,
   googleConfigured,
   googleAuthUrl,
   exchangeGoogleCode,
@@ -160,6 +170,226 @@ async function claimOnce(env, form) {
   return db.claimSubmission(env, form._nonce);
 }
 
+// Only a same-origin *path* is ever accepted as a post-login destination.
+// A full URL, or anything starting "//", would make /login an open redirector
+// that phishing could point at another site.
+function safeNext(raw) {
+  if (typeof raw !== "string" || !raw.startsWith("/") || raw.startsWith("//")) return null;
+  return raw;
+}
+
+function json(body, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: buildHeaders({ "Content-Type": "application/json" }, extraHeaders),
+  });
+}
+
+// ---- MCP tool surface (read-only) ----
+//
+// Every tool runs with the HQ user the token was issued for, and reuses the
+// same role rules as the web UI: a founder sees the business, a freelancer
+// sees only their own log. Nothing here writes.
+const MCP_TOOLS = [
+  {
+    name: "get_week_summary",
+    description:
+      "This week's Catalyst 7 numbers: freelancer hours, revenue, open pipeline value, deals won, active clients, and who has not submitted their weekly log yet. Compares against last week. Founders only.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "list_leads",
+    description:
+      "The sales pipeline: every lead with its stage, owner and estimated value. Won and lost leads sort last. Founders only.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        stage: {
+          type: "string",
+          enum: ["new", "contacted", "qualified", "proposal", "won", "lost"],
+          description: "Optional: return only leads at this stage.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "list_clients",
+    description: "Client roster with status (active or past), contact name and how they were acquired. Founders only.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "list_revenue",
+    description:
+      "Recent revenue entries: week, client, type and amount in rand, plus invoice status. Newest first. Founders only.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "integer", minimum: 1, maximum: 100, description: "How many entries to return. Default 20." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "list_freelancers",
+    description: "The freelancer roster with role, rate and whether they are currently active. Founders only.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "get_my_weekly_log",
+    description:
+      "Your own weekly log history — hours, deliverables and status for recent weeks. Works for any signed-in user; a freelancer sees only their own entries.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        weeks: { type: "integer", minimum: 1, maximum: 52, description: "How many weeks back. Default 12." },
+      },
+      additionalProperties: false,
+    },
+  },
+];
+
+const FOUNDER_ONLY = new Set(["get_week_summary", "list_leads", "list_clients", "list_revenue", "list_freelancers"]);
+
+const money = (n) => "R" + Number(n || 0).toLocaleString("en-ZA", { maximumFractionDigits: 0 });
+
+async function runMcpTool(name, args, { env, user }) {
+  if (FOUNDER_ONLY.has(name) && user.role !== "founder") {
+    // Same rule as the web UI, enforced server-side rather than by hiding the
+    // tool: a freelancer's token cannot read business data.
+    return `That information is only available to founders. You're signed in as ${user.name} (freelancer).`;
+  }
+
+  if (name === "get_week_summary") {
+    const weekStart = isoWeekStart();
+    const d = await db.getDashboard(env, weekStart, addDays(weekStart, -7));
+    const missing = d.missingFreelancers.map((f) => f.name);
+    return [
+      `Week of ${d.weekStart} (compared with ${d.prevWeekStart})`,
+      ``,
+      `Freelancer hours: ${Number(d.hoursThis).toFixed(1)} (last week ${Number(d.hoursPrev).toFixed(1)})`,
+      `Revenue: ${money(d.revThis)} (last week ${money(d.revPrev)})`,
+      `Open pipeline: ${money(d.pipelineValue)} across ${d.leadsByStage.reduce((n, s) => n + s.n, 0)} leads`,
+      `New leads this week: ${d.newLeads}`,
+      `Deals won this week: ${d.wonThis.n} worth ${money(d.wonThis.val)}`,
+      `Active clients: ${d.activeClients} (${d.newClients} new this week)`,
+      `Weekly logs submitted: ${d.submittedCount} of ${d.activeFreelancerCount}`,
+      missing.length ? `Not yet logged: ${missing.join(", ")}` : `Everyone has logged this week.`,
+    ].join("\n");
+  }
+
+  if (name === "list_leads") {
+    let leads = await db.getLeads(env);
+    if (args.stage) leads = leads.filter((l) => l.stage === args.stage);
+    if (!leads.length) return args.stage ? `No leads at stage "${args.stage}".` : "No leads yet.";
+    return leads
+      .map(
+        (l) =>
+          `${l.name}${l.company ? ` (${l.company})` : ""} — ${l.stage}` +
+          `${l.value_estimate ? `, ${money(l.value_estimate)}` : ""}${l.owner ? `, owner ${l.owner}` : ""}`
+      )
+      .join("\n");
+  }
+
+  if (name === "list_clients") {
+    const clients = await db.getClients(env);
+    if (!clients.length) return "No clients yet.";
+    return clients
+      .map((c) => `${c.name} — ${c.status}${c.contact_name ? `, contact ${c.contact_name}` : ""}${c.source ? `, via ${c.source}` : ""}`)
+      .join("\n");
+  }
+
+  if (name === "list_revenue") {
+    const rows = await db.getRevenueEntries(env, Math.min(Math.max(args.limit || 20, 1), 100));
+    if (!rows.length) return "No revenue logged yet.";
+    return rows
+      .map((r) => `${r.week_start} — ${r.client_name || "no client"} — ${r.type} — ${money(r.amount)} (${r.invoice_status})`)
+      .join("\n");
+  }
+
+  if (name === "list_freelancers") {
+    const rows = await db.getFreelancers(env);
+    if (!rows.length) return "No freelancers on the roster yet.";
+    return rows
+      .map(
+        (f) =>
+          `${f.name}${f.role_title ? ` — ${f.role_title}` : ""} — ${f.rate_type}` +
+          `${f.rate_amount ? ` ${money(f.rate_amount)}` : ""} — ${f.active ? "active" : "inactive"}`
+      )
+      .join("\n");
+  }
+
+  if (name === "get_my_weekly_log") {
+    if (!user.freelancer_id) {
+      return `${user.name} isn't linked to a freelancer profile, so there's no weekly log to read. Founders track the team's logs with get_week_summary.`;
+    }
+    const rows = await db.getFreelancerHistory(env, user.freelancer_id, Math.min(Math.max(args.weeks || 12, 1), 52));
+    if (!rows.length) return "No weekly entries logged yet.";
+    return rows
+      .map((r) => `${r.week_start} — ${r.hours}h — ${r.status}${r.deliverables ? ` — ${r.deliverables}` : ""}`)
+      .join("\n");
+  }
+
+  return `Unknown tool: ${name}`;
+}
+
+// JSON-RPC dispatch. Notifications get 202 with no body; requests get a single
+// JSON object. No SSE: every tool here answers in milliseconds, so streaming
+// would add machinery for nothing.
+async function handleMcp(rpc, ctx) {
+  const reply = (result) => json({ jsonrpc: "2.0", id: rpc.id, result });
+  const fail = (code, message, status = 200) => json({ jsonrpc: "2.0", id: rpc.id ?? null, error: { code, message } }, status);
+
+  if (!rpc || rpc.jsonrpc !== "2.0" || typeof rpc.method !== "string") {
+    return fail(-32600, "Invalid Request", 400);
+  }
+
+  // A notification has no id and expects no response body.
+  if (rpc.id === undefined || rpc.id === null) {
+    return new Response(null, { status: 202, headers: buildHeaders({}, {}) });
+  }
+
+  switch (rpc.method) {
+    case "initialize": {
+      const asked = rpc.params?.protocolVersion;
+      return reply({
+        protocolVersion: MCP_SUPPORTED_VERSIONS.includes(asked) ? asked : MCP_PROTOCOL_VERSION,
+        capabilities: { tools: { listChanged: false } },
+        serverInfo: { name: "Catalyst 7 HQ", version: "1.0.0" },
+        instructions:
+          "Catalyst 7 HQ tracks the studio's weekly numbers: freelancer hours, revenue, clients and sales pipeline. " +
+          "All tools are read-only. Money is in South African rand. Weeks run Monday to Sunday (UTC).",
+      });
+    }
+    case "ping":
+      return reply({});
+    case "tools/list":
+      return reply({ tools: MCP_TOOLS });
+    case "resources/list":
+      return reply({ resources: [] });
+    case "prompts/list":
+      return reply({ prompts: [] });
+    case "tools/call": {
+      const name = rpc.params?.name;
+      const tool = MCP_TOOLS.find((t) => t.name === name);
+      if (!tool) return fail(-32602, `Unknown tool: ${name}`);
+      try {
+        const text = await runMcpTool(name, rpc.params?.arguments || {}, ctx);
+        // Cap well under Claude's ~150k character ceiling.
+        const capped = text.length > 100000 ? text.slice(0, 100000) + "\n…(truncated)" : text;
+        return reply({ content: [{ type: "text", text: capped }], isError: false });
+      } catch (err) {
+        await db.logError(ctx.env, "/mcp:" + name, err.stack || err.message || String(err));
+        // Tool failures are results, not protocol errors -- the model should
+        // see them and can explain or retry.
+        return reply({ content: [{ type: "text", text: `That lookup failed: ${err.message}` }], isError: true });
+      }
+    }
+    default:
+      return fail(-32601, `Method not found: ${rpc.method}`, 404);
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -171,6 +401,255 @@ export default {
     const reqIp = clientIp(request);
 
     try {
+      // ================= MCP CONNECTOR =================
+      // Everything Claude touches lives here: discovery, the OAuth endpoints,
+      // and the JSON-RPC endpoint itself. Placed above the browser routes
+      // because none of it uses cookies -- it authenticates with a bearer
+      // token, and the discovery documents are deliberately public.
+
+      // RFC 9728. Claude probes the path-suffixed form first, then the bare
+      // one; serve both so either probe succeeds.
+      if (
+        path === "/.well-known/oauth-protected-resource" ||
+        path === "/.well-known/oauth-protected-resource/mcp"
+      ) {
+        return json(protectedResourceMetadata(url.origin));
+      }
+
+      // RFC 8414. The OIDC path is included because some clients look there.
+      if (path === "/.well-known/oauth-authorization-server" || path === "/.well-known/openid-configuration") {
+        return json(authorizationServerMetadata(url.origin));
+      }
+
+      // RFC 7591 dynamic client registration. Open by design: registration
+      // creates no access on its own, and nothing is issued until a real HQ
+      // user signs in and consents at /oauth/authorize.
+      if (path === "/oauth/register" && method === "POST") {
+        let body;
+        try {
+          body = await request.json();
+        } catch {
+          return json({ error: "invalid_client_metadata", error_description: "Body must be JSON." }, 400);
+        }
+        const uris = Array.isArray(body.redirect_uris) ? body.redirect_uris.filter((u) => typeof u === "string") : [];
+        if (!uris.length) {
+          return json({ error: "invalid_redirect_uri", error_description: "redirect_uris is required." }, 400);
+        }
+        for (const u of uris) {
+          let parsed;
+          try {
+            parsed = new URL(u);
+          } catch {
+            return json({ error: "invalid_redirect_uri", error_description: `Not a URL: ${u}` }, 400);
+          }
+          const loopback = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(parsed.hostname);
+          if (parsed.protocol !== "https:" && !loopback) {
+            return json(
+              { error: "invalid_redirect_uri", error_description: "Redirect URIs must be https, or loopback for native clients." },
+              400
+            );
+          }
+        }
+        const clientId = randomUrlSafe(24);
+        await db.registerOAuthClient(env, {
+          clientId,
+          clientName: typeof body.client_name === "string" ? body.client_name.slice(0, 120) : null,
+          redirectUris: uris,
+        });
+        return json(
+          {
+            client_id: clientId,
+            client_name: body.client_name || null,
+            redirect_uris: uris,
+            grant_types: ["authorization_code", "refresh_token"],
+            response_types: ["code"],
+            // Public client: PKCE, not a secret, is what protects the code.
+            token_endpoint_auth_method: "none",
+            client_id_issued_at: Math.floor(Date.now() / 1000),
+          },
+          201
+        );
+      }
+
+      // Consent screen. Reuses the ordinary HQ session, so whoever is signed
+      // in here is exactly who the token gets bound to -- including having
+      // passed 2FA.
+      if (path === "/oauth/authorize" && (method === "GET" || method === "POST")) {
+        const q = url.searchParams;
+        const clientId = q.get("client_id") || "";
+        const redirectUri = q.get("redirect_uri") || "";
+        const state = q.get("state") || "";
+        const challenge = q.get("code_challenge") || "";
+        const challengeMethod = q.get("code_challenge_method") || "";
+        const requestedScope = q.get("scope") || MCP_SCOPE;
+
+        const client = await db.getOAuthClient(env, clientId);
+        // Errors before the redirect_uri is validated must NOT redirect --
+        // bouncing to an unverified URI would make this an open redirector.
+        if (!client) {
+          return html(views.errorPage("Unknown OAuth client. Try removing and re-adding the connector.", 400, theme), 400);
+        }
+        if (!redirectUriAllowed(client.redirect_uris, redirectUri)) {
+          return html(views.errorPage("That redirect URI isn't registered for this connector.", 400, theme), 400);
+        }
+
+        const bounce = (params) => {
+          const dest = new URL(redirectUri);
+          for (const [k, v] of Object.entries(params)) dest.searchParams.set(k, v);
+          if (state) dest.searchParams.set("state", state);
+          return redirect(dest.toString());
+        };
+
+        if (q.get("response_type") !== "code") return bounce({ error: "unsupported_response_type" });
+        // S256 only. `plain` is not accepted and Claude never sends it.
+        if (challengeMethod !== "S256" || !challenge) {
+          return bounce({ error: "invalid_request", error_description: "S256 PKCE is required" });
+        }
+
+        const consentUser = await getSessionUser(request, env);
+        if (!consentUser) {
+          // Sign in first, then come back to this exact authorize URL.
+          return redirect(`/login?next=${encodeURIComponent(path + url.search)}`);
+        }
+
+        if (method === "GET") {
+          return html(
+            views.consentPage({
+              user: consentUser,
+              theme,
+              csrf: consentUser.session_csrf,
+              clientName: client.client_name,
+              scope: requestedScope,
+              query: url.search,
+            })
+          );
+        }
+
+        // POST = the user pressed Allow.
+        const f = await readForm(request);
+        const fail = csrfGuard(consentUser, f, theme);
+        if (fail) return fail;
+        if (f.decision !== "allow") return bounce({ error: "access_denied" });
+
+        const code = randomUrlSafe(32);
+        const ttl = mcpTokenTtl();
+        await db.createAuthCode(env, {
+          code_hash: await hashOpaque(code),
+          client_id: clientId,
+          user_id: consentUser.id,
+          redirect_uri: redirectUri,
+          code_challenge: challenge,
+          scope: MCP_SCOPE,
+          expires_at: new Date(Date.now() + ttl.code * 1000).toISOString(),
+        });
+        await db.logAudit(env, consentUser, "mcp_access_granted", "user", consentUser.id, client.client_name || clientId, reqIp);
+        return bounce({ code });
+      }
+
+      // RFC 6749 token endpoint. Must accept form-urlencoded.
+      if (path === "/oauth/token" && method === "POST") {
+        const f = await readForm(request);
+        const grant = f.grant_type;
+        const ttl = mcpTokenTtl();
+
+        const issue = async ({ clientId, userId, scope }) => {
+          const access = randomUrlSafe(32);
+          const refresh = randomUrlSafe(32);
+          await db.storeMcpToken(env, {
+            token_hash: await hashOpaque(access),
+            kind: "access",
+            client_id: clientId,
+            user_id: userId,
+            scope,
+            expires_at: new Date(Date.now() + ttl.access * 1000).toISOString(),
+          });
+          await db.storeMcpToken(env, {
+            token_hash: await hashOpaque(refresh),
+            kind: "refresh",
+            client_id: clientId,
+            user_id: userId,
+            scope,
+            expires_at: new Date(Date.now() + ttl.refresh * 1000).toISOString(),
+          });
+          return json({
+            access_token: access,
+            token_type: "Bearer",
+            expires_in: ttl.access,
+            refresh_token: refresh,
+            scope,
+          });
+        };
+
+        if (grant === "authorization_code") {
+          const row = await db.consumeAuthCode(env, await hashOpaque(f.code || ""));
+          if (!row) return json({ error: "invalid_grant", error_description: "Code is unknown, expired or already used." }, 400);
+          if (row.client_id !== f.client_id) return json({ error: "invalid_grant", error_description: "Client mismatch." }, 400);
+          if (row.redirect_uri !== f.redirect_uri) return json({ error: "invalid_grant", error_description: "redirect_uri mismatch." }, 400);
+          if (!(await verifyPkceS256(f.code_verifier || "", row.code_challenge))) {
+            return json({ error: "invalid_grant", error_description: "PKCE verification failed." }, 400);
+          }
+          return issue({ clientId: row.client_id, userId: row.user_id, scope: row.scope });
+        }
+
+        if (grant === "refresh_token") {
+          // Rotating: consuming deletes the old token, so a stolen copy dies
+          // the moment the real client refreshes.
+          const row = await db.consumeRefreshToken(env, await hashOpaque(f.refresh_token || ""));
+          // RFC 6749 code exactly -- Claude keys its retry behaviour off this.
+          if (!row) return json({ error: "invalid_grant", error_description: "Refresh token is no longer valid." }, 400);
+          return issue({ clientId: row.client_id, userId: row.user_id, scope: row.scope });
+        }
+
+        return json({ error: "unsupported_grant_type" }, 400);
+      }
+
+      // Human-readable page describing the connector, linked from the
+      // discovery documents.
+      if (path === "/mcp/about") {
+        return html(views.mcpAboutPage({ theme, origin: url.origin }));
+      }
+
+      // ---------- The MCP endpoint ----------
+      if (path === "/mcp") {
+        // This revision offers no standalone SSE stream and no sessions.
+        if (method === "GET" || method === "DELETE") {
+          return new Response(null, { status: 405, headers: buildHeaders({ Allow: "POST" }, {}) });
+        }
+        if (method !== "POST") return new Response(null, { status: 405 });
+
+        // DNS-rebinding guard: a browser-originated request carries Origin.
+        // Claude's server-side calls carry none, which is what we expect.
+        const origin = request.headers.get("Origin");
+        if (origin && origin !== url.origin) {
+          return json({ jsonrpc: "2.0", error: { code: -32600, message: "Origin not allowed" } }, 403);
+        }
+
+        const auth = request.headers.get("Authorization") || "";
+        const bearer = auth.startsWith("Bearer ") ? auth.slice(7).trim() : null;
+        // The 401 + WWW-Authenticate pair is what starts Claude's OAuth flow.
+        // A WWW-Authenticate on a 200 is ignored, so the status matters.
+        if (!bearer) {
+          return json({ jsonrpc: "2.0", error: { code: -32001, message: "Authentication required" } }, 401, {
+            "WWW-Authenticate": wwwAuthenticateHeader(url.origin),
+          });
+        }
+        const tokenUser = await db.getMcpTokenUser(env, await hashOpaque(bearer));
+        if (!tokenUser) {
+          return json({ jsonrpc: "2.0", error: { code: -32001, message: "Token invalid or expired" } }, 401, {
+            "WWW-Authenticate": wwwAuthenticateHeader(url.origin, "invalid_token"),
+          });
+        }
+
+        let rpc;
+        try {
+          rpc = await request.json();
+        } catch {
+          return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, 400);
+        }
+
+        return handleMcp(rpc, { env, user: tokenUser, origin: url.origin, ip: reqIp });
+      }
+
       // ---------- Public: theme toggle ----------
       // Public and unauthenticated on purpose -- the login/setup pages need it
       // too. No CSRF token: it's a same-origin-checked GET that flips a UI
@@ -192,7 +671,7 @@ export default {
       if (path === "/login" && method === "GET") {
         const existing = await getSessionUser(request, env);
         if (existing) return redirect("/");
-        return html(views.loginPage({ theme, googleEnabled: googleConfigured(env) }));
+        return html(views.loginPage({ theme, googleEnabled: googleConfigured(env), next: safeNext(url.searchParams.get("next")) }));
       }
 
       // ---------- Public: Google sign-in ----------
@@ -328,7 +807,8 @@ export default {
       }
 
       if (path === "/login" && method === "POST") {
-        const { email, password } = await readForm(request);
+        const f = await readForm(request);
+        const { email, password } = f;
         const normalizedEmail = (email || "").trim().toLowerCase();
         const ip = clientIp(request);
 
@@ -350,18 +830,21 @@ export default {
 
         if (user.totp_enabled) {
           const pendingToken = await createPendingLogin(env, user.id);
-          return redirect("/login/2fa", { "Set-Cookie": pendingCookie(pendingToken) });
+          const nx = safeNext(f.next);
+          return redirect(nx ? `/login/2fa?next=${encodeURIComponent(nx)}` : "/login/2fa", {
+            "Set-Cookie": pendingCookie(pendingToken),
+          });
         }
 
         const token = await createSession(env, user.id);
-        return redirect("/", { "Set-Cookie": sessionCookie(token) });
+        return redirect(safeNext(f.next) || "/", { "Set-Cookie": sessionCookie(token) });
       }
 
       // ---------- Public: 2FA verification step ----------
       if (path === "/login/2fa" && method === "GET") {
         const pending = await getPendingLogin(request, env);
         if (!pending) return redirect("/login");
-        return html(views.totpVerifyPage({ theme }));
+        return html(views.totpVerifyPage({ theme, next: safeNext(url.searchParams.get("next")) }));
       }
 
       if (path === "/login/2fa" && method === "POST") {
@@ -373,7 +856,8 @@ export default {
         const limit = await checkRateLimit(env, rlKey, ip);
         if (limit.blocked) return html(views.totpVerifyPage({ error: limit.reason, theme }), 429);
 
-        const { code } = await readForm(request);
+        const f = await readForm(request);
+        const { code } = f;
 
         // Either the current authenticator code, or one of the single-use
         // backup codes issued when 2FA was switched on.
@@ -401,7 +885,7 @@ export default {
 
         await destroyPendingLogin(env, pending.pendingToken);
         const token = await createSession(env, pending.user_id);
-        return redirect("/", {
+        return redirect(safeNext(f.next) || safeNext(url.searchParams.get("next")) || "/", {
           "Set-Cookie": [sessionCookie(token), clearPendingCookie()],
         });
       }
@@ -555,6 +1039,8 @@ export default {
             backupCodesLeft: await db.countUnusedBackupCodes(env, user.id),
             googleLinked: !!fresh.google_sub,
             googleEnabled: googleConfigured(env),
+            mcpGrants: await db.listMcpGrants(env, user.id),
+            mcpUrl: `${url.origin}/mcp`,
           })
         );
       }
@@ -642,6 +1128,29 @@ export default {
             backupCodesLeft: codes.length,
             googleEnabled: googleConfigured(env),
           })
+        );
+      }
+
+      // Withdraw a connector's access. Deletes its tokens outright, so the
+      // next request Claude makes gets a 401 and the connection is dead.
+      if (path === "/security/connectors/revoke" && method === "POST") {
+        const f = await readForm(request);
+        const fail = csrfGuard(user, f, theme);
+        if (fail) return fail;
+        const removed = await db.revokeMcpGrant(env, user.id, f.client_id || "");
+        await db.logAudit(env, user, "mcp_access_revoked", "user", user.id, `${removed} token(s)`, reqIp);
+        return html(
+          await (async () =>
+            views.securityPage({
+              user,
+              csrf,
+              theme,
+              message: removed ? "Connector access withdrawn. It can no longer read your data." : "That connector was already disconnected.",
+              backupCodesLeft: await db.countUnusedBackupCodes(env, user.id),
+              googleEnabled: googleConfigured(env),
+              mcpGrants: await db.listMcpGrants(env, user.id),
+              mcpUrl: `${url.origin}/mcp`,
+            }))()
         );
       }
 

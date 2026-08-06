@@ -184,3 +184,40 @@ CREATE TABLE IF NOT EXISTS submissions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_submissions_age ON submissions (used_at);
+
+-- ---- MCP connector / OAuth 2.1 (see migrations/005_mcp_oauth.sql) ----
+-- Codes and tokens are stored as SHA-256 hashes only.
+
+CREATE TABLE IF NOT EXISTS oauth_clients (
+  client_id TEXT PRIMARY KEY,
+  client_name TEXT,
+  redirect_uris TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now')),
+  last_used_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS oauth_codes (
+  code_hash TEXT PRIMARY KEY,
+  client_id TEXT NOT NULL,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  redirect_uri TEXT NOT NULL,
+  code_challenge TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS mcp_tokens (
+  token_hash TEXT PRIMARY KEY,
+  kind TEXT NOT NULL CHECK(kind IN ('access','refresh')),
+  client_id TEXT NOT NULL,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  scope TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now')),
+  last_used_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_tokens_user ON mcp_tokens (user_id, kind);
+CREATE INDEX IF NOT EXISTS idx_oauth_codes_expiry ON oauth_codes (expires_at);
+

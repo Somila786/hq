@@ -322,8 +322,10 @@ export async function revokeUserAccess(env, id) {
     .bind(id)
     .run();
   // Kill any live session immediately -- revoking is pointless if the person
-  // stays signed in on a device they already have open.
+  // stays signed in on a device they already have open. Same for MCP tokens:
+  // a connector holding a valid token would otherwise keep reading.
   await env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM mcp_tokens WHERE user_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM pending_logins WHERE user_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM totp_backup_codes WHERE user_id = ?").bind(id).run();
 }
@@ -438,6 +440,123 @@ export async function purgeOldSubmissions(env) {
 
 export async function bindGoogleSub(env, userId, sub) {
   await env.DB.prepare("UPDATE users SET google_sub = ? WHERE id = ?").bind(sub, userId).run();
+}
+
+// ---- MCP connector: OAuth client registry, codes, tokens ----
+
+export async function registerOAuthClient(env, { clientId, clientName, redirectUris }) {
+  await env.DB.prepare("INSERT INTO oauth_clients (client_id, client_name, redirect_uris) VALUES (?, ?, ?)")
+    .bind(clientId, clientName || null, JSON.stringify(redirectUris))
+    .run();
+}
+
+export async function getOAuthClient(env, clientId) {
+  const row = await env.DB.prepare(
+    "SELECT client_id, client_name, redirect_uris FROM oauth_clients WHERE client_id = ?"
+  )
+    .bind(clientId)
+    .first();
+  if (!row) return null;
+  let uris = [];
+  try {
+    uris = JSON.parse(row.redirect_uris);
+  } catch {
+    uris = [];
+  }
+  return { ...row, redirect_uris: Array.isArray(uris) ? uris : [] };
+}
+
+export async function createAuthCode(env, c) {
+  await env.DB.prepare(
+    `INSERT INTO oauth_codes (code_hash, client_id, user_id, redirect_uri, code_challenge, scope, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(c.code_hash, c.client_id, c.user_id, c.redirect_uri, c.code_challenge, c.scope, c.expires_at)
+    .run();
+}
+
+// Single-use: the row is deleted as it's read, so a replayed code fails even
+// inside its 60-second window.
+export async function consumeAuthCode(env, codeHash) {
+  const row = await env.DB.prepare(
+    "SELECT * FROM oauth_codes WHERE code_hash = ? AND expires_at > datetime('now')"
+  )
+    .bind(codeHash)
+    .first();
+  await env.DB.prepare("DELETE FROM oauth_codes WHERE code_hash = ?").bind(codeHash).run();
+  return row || null;
+}
+
+export async function storeMcpToken(env, t) {
+  await env.DB.prepare(
+    `INSERT INTO mcp_tokens (token_hash, kind, client_id, user_id, scope, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  )
+    .bind(t.token_hash, t.kind, t.client_id, t.user_id, t.scope, t.expires_at)
+    .run();
+}
+
+// Resolves a bearer token to the HQ user it was issued for. Returns the same
+// shape the rest of the app expects from a session, so role checks downstream
+// are identical whether a request came from a browser or from Claude.
+export async function getMcpTokenUser(env, tokenHash) {
+  const row = await env.DB.prepare(
+    `SELECT t.token_hash, t.client_id, t.scope, t.user_id,
+            u.id, u.email, u.name, u.role, u.title, u.freelancer_id
+     FROM mcp_tokens t JOIN users u ON u.id = t.user_id
+     WHERE t.token_hash = ? AND t.kind = 'access' AND t.expires_at > datetime('now')
+       AND u.password_hash IS NOT NULL`
+  )
+    .bind(tokenHash)
+    .first();
+  if (!row) return null;
+  await env.DB.prepare("UPDATE mcp_tokens SET last_used_at = datetime('now') WHERE token_hash = ?")
+    .bind(tokenHash)
+    .run();
+  return row;
+}
+
+// Rotation, as the spec requires for public clients: reading a refresh token
+// deletes it, so a stolen copy is dead the moment the real client refreshes.
+export async function consumeRefreshToken(env, tokenHash) {
+  const row = await env.DB.prepare(
+    "SELECT * FROM mcp_tokens WHERE token_hash = ? AND kind = 'refresh' AND expires_at > datetime('now')"
+  )
+    .bind(tokenHash)
+    .first();
+  if (row) await env.DB.prepare("DELETE FROM mcp_tokens WHERE token_hash = ?").bind(tokenHash).run();
+  return row || null;
+}
+
+export async function listMcpGrants(env, userId) {
+  const { results } = await env.DB.prepare(
+    `SELECT c.client_name, t.client_id, MIN(t.created_at) AS granted_at,
+            MAX(t.last_used_at) AS last_used_at, COUNT(*) AS tokens
+     FROM mcp_tokens t LEFT JOIN oauth_clients c ON c.client_id = t.client_id
+     WHERE t.user_id = ? AND t.expires_at > datetime('now')
+     GROUP BY t.client_id ORDER BY granted_at DESC`
+  )
+    .bind(userId)
+    .all();
+  return results;
+}
+
+export async function revokeMcpGrant(env, userId, clientId) {
+  const res = await env.DB.prepare("DELETE FROM mcp_tokens WHERE user_id = ? AND client_id = ?")
+    .bind(userId, clientId)
+    .run();
+  return res.meta.changes;
+}
+
+// Revoking a person's HQ access must also kill any connector tokens issued to
+// them, or Claude keeps reading after they've been locked out.
+export async function revokeAllMcpTokensForUser(env, userId) {
+  await env.DB.prepare("DELETE FROM mcp_tokens WHERE user_id = ?").bind(userId).run();
+}
+
+export async function purgeExpiredOAuth(env) {
+  await env.DB.prepare("DELETE FROM oauth_codes WHERE expires_at <= datetime('now')").run();
+  await env.DB.prepare("DELETE FROM mcp_tokens WHERE expires_at <= datetime('now')").run();
 }
 
 // ---- Audit log ----

@@ -5,9 +5,14 @@ Context file for Claude Code (or any agent) picking up this repo. Read this firs
 ## What this is
 
 A self-hosted weekly KPI tracker for Catalyst 7: freelancer hours/deliverables,
-revenue, clients, and leads. Built for a three-founder studio (Thembalethu,
-Somila, Lethu) in Pretoria. Runs on the studio's own Cloudflare account, not a
-third-party SaaS.
+revenue, clients, and leads. Built for a small studio in Pretoria. Runs on the
+studio's own Cloudflare account, not a third-party SaaS.
+
+Founders on the system: Somila Tenza Sogaxa (CEO and Co-Founder) and
+Thembalethu Ngutshana (COO and Co-Founder), plus `catalyst948@gmail.com`
+("Catalia"), which is a setup/admin account belonging to neither of them.
+Earlier drafts of this file listed a third founder, "Lethu" — that is wrong,
+there is no such person on the team.
 
 ## Stack
 

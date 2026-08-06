@@ -346,6 +346,113 @@ export async function hashInviteCode(code) {
   return bytesToHex(new Uint8Array(digest));
 }
 
+// ---- MCP connector: HQ as an OAuth 2.1 authorisation server ----
+//
+// Everything above lets HQ act as an OAuth *client* (to Google). This section
+// is the other direction: HQ issuing tokens so Claude can read data on behalf
+// of a signed-in founder.
+//
+// Claude speaks the 2025-11-25 MCP auth spec, not the newer draft. That means:
+// RFC 9728 protected-resource metadata, RFC 8414 server metadata, RFC 7591
+// dynamic client registration, authorization code with mandatory S256 PKCE.
+
+export const MCP_SCOPE = "mcp:read";
+export const MCP_PROTOCOL_VERSION = "2025-11-25";
+// Versions this server will accept in a client's `initialize`. Claude may
+// negotiate any of these; we answer with the one it asked for when we know it.
+export const MCP_SUPPORTED_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26"];
+
+const ACCESS_TOKEN_TTL_SECONDS = 3600; // 1 hour; Claude refreshes reactively
+const REFRESH_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
+const AUTH_CODE_TTL_SECONDS = 60;
+
+export function mcpTokenTtl() {
+  return { access: ACCESS_TOKEN_TTL_SECONDS, refresh: REFRESH_TOKEN_TTL_SECONDS, code: AUTH_CODE_TTL_SECONDS };
+}
+
+// Tokens and codes are bearer credentials, so only their digests are stored.
+// High-entropy random, so a single SHA-256 is right -- same reasoning as the
+// 2FA backup codes.
+export async function hashOpaque(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(value)));
+  return bytesToHex(new Uint8Array(digest));
+}
+
+// Verifies an S256 PKCE verifier against the challenge stored with the code.
+// `plain` is deliberately not accepted: the spec requires S256 and Claude
+// always sends it.
+export async function verifyPkceS256(verifier, challenge) {
+  if (!verifier || !challenge) return false;
+  return (await pkceChallenge(verifier)) === challenge;
+}
+
+// RFC 8414. `issuer` MUST equal the origin Claude discovered us at, or the
+// client rejects the document.
+export function authorizationServerMetadata(origin) {
+  return {
+    issuer: origin,
+    authorization_endpoint: `${origin}/oauth/authorize`,
+    token_endpoint: `${origin}/oauth/token`,
+    registration_endpoint: `${origin}/oauth/register`,
+    scopes_supported: [MCP_SCOPE, "offline_access"],
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    // Public clients only: PKCE is what binds a code to its requester, so no
+    // client secret is issued or expected.
+    token_endpoint_auth_methods_supported: ["none"],
+    code_challenge_methods_supported: ["S256"],
+    service_documentation: `${origin}/mcp/about`,
+  };
+}
+
+// RFC 9728. `resource` MUST match the MCP URL exactly as the user typed it
+// into Claude, including the path.
+export function protectedResourceMetadata(origin) {
+  return {
+    resource: `${origin}/mcp`,
+    authorization_servers: [origin],
+    scopes_supported: [MCP_SCOPE],
+    bearer_methods_supported: ["header"],
+    resource_documentation: `${origin}/mcp/about`,
+  };
+}
+
+// Claude only begins the OAuth dance when it sees a 401 carrying this header.
+// A WWW-Authenticate on a 200 is ignored, so the status matters as much as the
+// header does.
+export function wwwAuthenticateHeader(origin, error) {
+  const parts = [`Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource"`];
+  if (error) parts.push(`error="${error}"`);
+  parts.push(`scope="${MCP_SCOPE}"`);
+  return parts.join(", ");
+}
+
+// A redirect_uri must match one the client registered, compared exactly --
+// except for loopback, where RFC 8252 §7.3 requires the port to be ignored so
+// native clients like Claude Code can bind an ephemeral port.
+export function redirectUriAllowed(registered, candidate) {
+  let cand;
+  try {
+    cand = new URL(candidate);
+  } catch {
+    return false;
+  }
+  return registered.some((r) => {
+    if (r === candidate) return true;
+    let reg;
+    try {
+      reg = new URL(r);
+    } catch {
+      return false;
+    }
+    const loopback = (h) => h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1";
+    if (loopback(reg.hostname) && loopback(cand.hostname)) {
+      return reg.protocol === cand.protocol && reg.pathname === cand.pathname;
+    }
+    return false;
+  });
+}
+
 // ---- Google sign-in (OAuth 2.0 authorization code + PKCE) ----
 // No library: the whole flow is two fetches and some claim checking.
 

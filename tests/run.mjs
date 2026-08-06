@@ -1841,6 +1841,363 @@ await test("empty states offer a way to create the first record", async () => {
   }
 });
 
+console.log("\nMCP connector — discovery, OAuth, tools");
+
+const b64u = (buf) => Buffer.from(buf).toString("base64url");
+async function pkcePair() {
+  const verifier = b64u(crypto.getRandomValues(new Uint8Array(32)));
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  return { verifier, challenge: b64u(new Uint8Array(digest)) };
+}
+
+// The current ISO week start, matching the app's Monday-anchored weeks.
+function isoWeek() {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() || 7) - 1));
+  return d.toISOString().slice(0, 10);
+}
+
+async function jsonPost(env, path, body, headers = {}) {
+  const res = await worker.fetch(
+    new Request(ORIGIN + path, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body) }),
+    env
+  );
+  return { res, body: await res.json().catch(() => null) };
+}
+
+async function formPost(env, path, form) {
+  const res = await worker.fetch(
+    new Request(ORIGIN + path, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(form),
+    }),
+    env
+  );
+  return { res, body: await res.json().catch(() => null) };
+}
+
+// Walks the full OAuth dance the way Claude does, ending with a bearer token.
+async function connectAsClaude(env, session, csrf) {
+  const reg = await jsonPost(env, "/oauth/register", {
+    client_name: "Claude",
+    redirect_uris: ["https://claude.ai/api/mcp/auth_callback"],
+  });
+  const clientId = reg.body.client_id;
+  const { verifier, challenge } = await pkcePair();
+  const q = new URLSearchParams({
+    response_type: "code",
+    client_id: clientId,
+    redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    state: "xyz",
+  });
+  const approve = await worker.fetch(
+    req(`/oauth/authorize?${q}`, { method: "POST", cookies: { c7_session: session }, form: { decision: "allow", _csrf: csrf } }),
+    env
+  );
+  const code = new URL(approve.headers.get("Location")).searchParams.get("code");
+  const tok = await formPost(env, "/oauth/token", {
+    grant_type: "authorization_code",
+    code,
+    client_id: clientId,
+    redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+    code_verifier: verifier,
+  });
+  return { clientId, verifier, challenge, ...tok.body };
+}
+
+async function rpc(env, token, method, params) {
+  const res = await worker.fetch(
+    new Request(ORIGIN + "/mcp", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+        "MCP-Protocol-Version": "2025-11-25",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    }),
+    env
+  );
+  return { res, body: await res.json().catch(() => null) };
+}
+
+await test("discovery documents match what Claude expects", async () => {
+  const env = makeEnv();
+  const prm = await (await worker.fetch(req("/.well-known/oauth-protected-resource"), env)).json();
+  eq(prm.resource, `${ORIGIN}/mcp`, "resource must equal the URL the user types into Claude");
+  eq(prm.authorization_servers[0], ORIGIN, "points at our authorization server");
+
+  // Claude probes the path-suffixed form first.
+  const suffixed = await worker.fetch(req("/.well-known/oauth-protected-resource/mcp"), env);
+  eq(suffixed.status, 200, "path-suffixed probe also served");
+
+  const asm = await (await worker.fetch(req("/.well-known/oauth-authorization-server"), env)).json();
+  eq(asm.issuer, ORIGIN, "issuer matches origin");
+  assert(asm.registration_endpoint, "DCR advertised");
+  eq(asm.code_challenge_methods_supported[0], "S256", "S256 PKCE advertised — spec requires it");
+  assert(asm.token_endpoint_auth_methods_supported.includes("none"), "public client");
+  assert(asm.scopes_supported.includes("mcp:read"), "scope advertised");
+});
+
+await test("an unauthenticated /mcp call returns 401 with the discovery pointer", async () => {
+  const env = makeEnv();
+  const { res } = await rpc(env, null, "tools/list");
+  // The 401 is what starts Claude's OAuth flow. A WWW-Authenticate on a 200
+  // is ignored by Claude, so the status code matters as much as the header.
+  eq(res.status, 401, "401, not 200 or 403");
+  const wa = res.headers.get("WWW-Authenticate");
+  has(wa, "Bearer", "Bearer scheme");
+  has(wa, "resource_metadata=", "points at the metadata document");
+  has(wa, "/.well-known/oauth-protected-resource", "at the right path");
+});
+
+await test("the full OAuth flow issues a working token", async () => {
+  const env = makeEnv();
+  const { session, csrf, id } = await founderSession(env);
+  const grant = await connectAsClaude(env, session, csrf);
+
+  assert(grant.access_token, "access token issued");
+  assert(grant.refresh_token, "refresh token issued");
+  eq(grant.token_type, "Bearer", "bearer");
+  eq(grant.scope, "mcp:read", "read-only scope");
+
+  // Tokens are stored hashed, never in the clear.
+  const stored = await env.DB.prepare("SELECT token_hash FROM mcp_tokens").all();
+  eq(stored.results.length, 2, "access + refresh stored");
+  for (const r of stored.results) {
+    lacks(r.token_hash, grant.access_token, "raw access token not in the database");
+    lacks(r.token_hash, grant.refresh_token, "raw refresh token not in the database");
+  }
+
+  const { res, body } = await rpc(env, grant.access_token, "initialize", { protocolVersion: "2025-11-25" });
+  eq(res.status, 200, "initialize works");
+  eq(body.result.protocolVersion, "2025-11-25", "negotiates the version Claude asked for");
+  assert(body.result.capabilities.tools, "advertises tools");
+
+  assert((await auditActions(env)).includes("mcp_access_granted"), "consent audited against the user");
+  const row = await env.DB.prepare("SELECT user_id FROM mcp_tokens LIMIT 1").first();
+  eq(row.user_id, id, "token is bound to the consenting user, not to the app");
+});
+
+await test("PKCE is enforced and codes are single-use", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const reg = await jsonPost(env, "/oauth/register", {
+    client_name: "Claude",
+    redirect_uris: ["https://claude.ai/api/mcp/auth_callback"],
+  });
+  const clientId = reg.body.client_id;
+
+  const mint = async () => {
+    const { verifier, challenge } = await pkcePair();
+    const q = new URLSearchParams({
+      response_type: "code",
+      client_id: clientId,
+      redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+    });
+    const r = await worker.fetch(
+      req(`/oauth/authorize?${q}`, { method: "POST", cookies: { c7_session: session }, form: { decision: "allow", _csrf: csrf } }),
+      env
+    );
+    return { code: new URL(r.headers.get("Location")).searchParams.get("code"), verifier };
+  };
+
+  // Wrong verifier is rejected.
+  const a = await mint();
+  const bad = await formPost(env, "/oauth/token", {
+    grant_type: "authorization_code",
+    code: a.code,
+    client_id: clientId,
+    redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+    code_verifier: "not-the-verifier",
+  });
+  eq(bad.res.status, 400, "bad PKCE verifier rejected");
+  eq(bad.body.error, "invalid_grant", "RFC 6749 error code");
+
+  // A code is single-use even with the right verifier.
+  const b = await mint();
+  const first = await formPost(env, "/oauth/token", {
+    grant_type: "authorization_code",
+    code: b.code,
+    client_id: clientId,
+    redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+    code_verifier: b.verifier,
+  });
+  eq(first.res.status, 200, "first redemption works");
+  const replay = await formPost(env, "/oauth/token", {
+    grant_type: "authorization_code",
+    code: b.code,
+    client_id: clientId,
+    redirect_uri: "https://claude.ai/api/mcp/auth_callback",
+    code_verifier: b.verifier,
+  });
+  eq(replay.res.status, 400, "replayed code rejected");
+});
+
+await test("authorize refuses unregistered redirect URIs without bouncing to them", async () => {
+  const env = makeEnv();
+  const { session } = await founderSession(env);
+  const reg = await jsonPost(env, "/oauth/register", {
+    client_name: "Claude",
+    redirect_uris: ["https://claude.ai/api/mcp/auth_callback"],
+  });
+  const q = new URLSearchParams({
+    response_type: "code",
+    client_id: reg.body.client_id,
+    redirect_uri: "https://evil.example.com/steal",
+    code_challenge: "x".repeat(43),
+    code_challenge_method: "S256",
+  });
+  const res = await worker.fetch(req(`/oauth/authorize?${q}`, { cookies: { c7_session: session } }), env);
+  eq(res.status, 400, "refused");
+  // Crucially it must NOT redirect to the attacker's URI, or this endpoint
+  // becomes an open redirector.
+  eq(res.headers.get("Location"), null, "does not redirect to an unregistered URI");
+});
+
+await test("refresh tokens rotate and the old one dies", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const grant = await connectAsClaude(env, session, csrf);
+
+  const refreshed = await formPost(env, "/oauth/token", {
+    grant_type: "refresh_token",
+    refresh_token: grant.refresh_token,
+    client_id: grant.clientId,
+  });
+  eq(refreshed.res.status, 200, "refresh works");
+  assert(refreshed.body.access_token !== grant.access_token, "new access token");
+  assert(refreshed.body.refresh_token !== grant.refresh_token, "refresh token rotated");
+
+  const reuse = await formPost(env, "/oauth/token", {
+    grant_type: "refresh_token",
+    refresh_token: grant.refresh_token,
+    client_id: grant.clientId,
+  });
+  eq(reuse.res.status, 400, "old refresh token rejected after rotation");
+  eq(reuse.body.error, "invalid_grant", "the code Claude expects");
+});
+
+await test("the tools are read-only and answer with real data", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  await db.createClient(env, { name: "Umlazi Foods", source: "referral" });
+  await db.createLead(env, { name: "Thandi", company: "Braamfontein Bakery", stage: "qualified", value_estimate: 25000 });
+  await db.createRevenueEntry(env, { week_start: isoWeek(), amount: 12400, type: "project" });
+  const grant = await connectAsClaude(env, session, csrf);
+
+  const list = await rpc(env, grant.access_token, "tools/list");
+  const names = list.body.result.tools.map((t) => t.name);
+  eq(names.length, 6, "six tools");
+  for (const n of names) assert(!/^(add|create|update|delete|log|set)_/.test(n), `${n} must not be a write tool`);
+
+  const summary = await rpc(env, grant.access_token, "tools/call", { name: "get_week_summary", arguments: {} });
+  // en-ZA groups thousands with a non-breaking space, not a comma, so compare
+  // with whitespace normalised rather than hardcoding an invisible character.
+  const text = summary.body.result.content[0].text.replace(/\s/g, " ");
+  has(text, "Revenue: R12 400", "real revenue figure");
+  has(text, "Open pipeline: R25 000", "real pipeline figure");
+  eq(summary.body.result.isError, false, "not an error");
+
+  const leads = await rpc(env, grant.access_token, "tools/call", { name: "list_leads", arguments: { stage: "qualified" } });
+  has(leads.body.result.content[0].text, "Braamfontein Bakery", "filtered leads");
+
+  const clients = await rpc(env, grant.access_token, "tools/call", { name: "list_clients", arguments: {} });
+  has(clients.body.result.content[0].text, "Umlazi Foods", "clients");
+
+  // Data is unchanged by any of it.
+  eq((await db.getClients(env)).length, 1, "no writes happened");
+  eq((await db.getLeads(env)).length, 1, "no writes happened");
+});
+
+await test("a freelancer's token cannot read founder data", async () => {
+  const env = makeEnv();
+  const fl = await seedFreelancer(env);
+  await db.createClient(env, { name: "Secret Client" });
+  await db.upsertWeeklyEntry(env, { week_start: isoWeek(), freelancer_id: fl.freelancerId, hours: 21, deliverables: "Brand board" });
+
+  const { session } = await login(env, fl.email, FREELANCER_PW);
+  const csrf = await csrfFor(env, session);
+  const grant = await connectAsClaude(env, session, csrf);
+
+  for (const tool of ["get_week_summary", "list_leads", "list_clients", "list_revenue", "list_freelancers"]) {
+    const r = await rpc(env, grant.access_token, "tools/call", { name: tool, arguments: {} });
+    has(r.body.result.content[0].text, "only available to founders", `${tool} refused`);
+    lacks(r.body.result.content[0].text, "Secret Client", `${tool} leaks nothing`);
+  }
+
+  // But their own log works.
+  const own = await rpc(env, grant.access_token, "tools/call", { name: "get_my_weekly_log", arguments: {} });
+  has(own.body.result.content[0].text, "Brand board", "their own entries are readable");
+});
+
+await test("revoking someone's HQ access kills their connector too", async () => {
+  const env = makeEnv();
+  const founder = await founderSession(env);
+  const fl = await seedFreelancer(env);
+  const { session: theirs } = await login(env, fl.email, FREELANCER_PW);
+  const grant = await connectAsClaude(env, theirs, await csrfFor(env, theirs));
+
+  eq((await rpc(env, grant.access_token, "tools/list")).res.status, 200, "connector works beforehand");
+
+  await worker.fetch(
+    req(`/team/${fl.userId}/revoke`, { method: "POST", cookies: { c7_session: founder.session }, form: { _csrf: founder.csrf } }),
+    env
+  );
+
+  const after = await rpc(env, grant.access_token, "tools/list");
+  eq(after.res.status, 401, "connector is dead the moment access is revoked");
+});
+
+await test("a user can disconnect a connector from Security", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const grant = await connectAsClaude(env, session, csrf);
+  eq((await rpc(env, grant.access_token, "tools/list")).res.status, 200, "working");
+
+  const page = await (await worker.fetch(req("/security", { cookies: { c7_session: session } }), env)).text();
+  has(page, "Connected apps", "listed on the Security page");
+  has(page, "Claude", "by name");
+
+  await worker.fetch(
+    req("/security/connectors/revoke", { method: "POST", cookies: { c7_session: session }, form: { client_id: grant.clientId, _csrf: csrf } }),
+    env
+  );
+  eq((await rpc(env, grant.access_token, "tools/list")).res.status, 401, "disconnected");
+  assert((await auditActions(env)).includes("mcp_access_revoked"), "audited");
+});
+
+await test("the MCP endpoint rejects what it should", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const grant = await connectAsClaude(env, session, csrf);
+
+  // No standalone SSE stream and no sessions in this revision.
+  eq((await worker.fetch(req("/mcp"), env)).status, 405, "GET not allowed");
+
+  // DNS-rebinding guard.
+  const crossOrigin = await worker.fetch(
+    new Request(ORIGIN + "/mcp", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: "https://evil.example.com", Authorization: `Bearer ${grant.access_token}` },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    }),
+    env
+  );
+  eq(crossOrigin.status, 403, "cross-origin browser request refused");
+
+  eq((await rpc(env, "made-up-token", "tools/list")).res.status, 401, "forged token refused");
+  const unknown = await rpc(env, grant.access_token, "does/not/exist");
+  eq(unknown.res.status, 404, "unknown method → 404");
+  eq(unknown.body.error.code, -32601, "with the JSON-RPC method-not-found code");
+});
+
 console.log("\nSecurity headers");
 
 await test("every response carries the security header set", async () => {

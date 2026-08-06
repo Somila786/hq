@@ -356,6 +356,113 @@ async function hashInviteCode(code) {
   return bytesToHex(new Uint8Array(digest));
 }
 
+// ---- MCP connector: HQ as an OAuth 2.1 authorisation server ----
+//
+// Everything above lets HQ act as an OAuth *client* (to Google). This section
+// is the other direction: HQ issuing tokens so Claude can read data on behalf
+// of a signed-in founder.
+//
+// Claude speaks the 2025-11-25 MCP auth spec, not the newer draft. That means:
+// RFC 9728 protected-resource metadata, RFC 8414 server metadata, RFC 7591
+// dynamic client registration, authorization code with mandatory S256 PKCE.
+
+const MCP_SCOPE = "mcp:read";
+const MCP_PROTOCOL_VERSION = "2025-11-25";
+// Versions this server will accept in a client's `initialize`. Claude may
+// negotiate any of these; we answer with the one it asked for when we know it.
+const MCP_SUPPORTED_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26"];
+
+const ACCESS_TOKEN_TTL_SECONDS = 3600; // 1 hour; Claude refreshes reactively
+const REFRESH_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
+const AUTH_CODE_TTL_SECONDS = 60;
+
+function mcpTokenTtl() {
+  return { access: ACCESS_TOKEN_TTL_SECONDS, refresh: REFRESH_TOKEN_TTL_SECONDS, code: AUTH_CODE_TTL_SECONDS };
+}
+
+// Tokens and codes are bearer credentials, so only their digests are stored.
+// High-entropy random, so a single SHA-256 is right -- same reasoning as the
+// 2FA backup codes.
+async function hashOpaque(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(value)));
+  return bytesToHex(new Uint8Array(digest));
+}
+
+// Verifies an S256 PKCE verifier against the challenge stored with the code.
+// `plain` is deliberately not accepted: the spec requires S256 and Claude
+// always sends it.
+async function verifyPkceS256(verifier, challenge) {
+  if (!verifier || !challenge) return false;
+  return (await pkceChallenge(verifier)) === challenge;
+}
+
+// RFC 8414. `issuer` MUST equal the origin Claude discovered us at, or the
+// client rejects the document.
+function authorizationServerMetadata(origin) {
+  return {
+    issuer: origin,
+    authorization_endpoint: `${origin}/oauth/authorize`,
+    token_endpoint: `${origin}/oauth/token`,
+    registration_endpoint: `${origin}/oauth/register`,
+    scopes_supported: [MCP_SCOPE, "offline_access"],
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    // Public clients only: PKCE is what binds a code to its requester, so no
+    // client secret is issued or expected.
+    token_endpoint_auth_methods_supported: ["none"],
+    code_challenge_methods_supported: ["S256"],
+    service_documentation: `${origin}/mcp/about`,
+  };
+}
+
+// RFC 9728. `resource` MUST match the MCP URL exactly as the user typed it
+// into Claude, including the path.
+function protectedResourceMetadata(origin) {
+  return {
+    resource: `${origin}/mcp`,
+    authorization_servers: [origin],
+    scopes_supported: [MCP_SCOPE],
+    bearer_methods_supported: ["header"],
+    resource_documentation: `${origin}/mcp/about`,
+  };
+}
+
+// Claude only begins the OAuth dance when it sees a 401 carrying this header.
+// A WWW-Authenticate on a 200 is ignored, so the status matters as much as the
+// header does.
+function wwwAuthenticateHeader(origin, error) {
+  const parts = [`Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource"`];
+  if (error) parts.push(`error="${error}"`);
+  parts.push(`scope="${MCP_SCOPE}"`);
+  return parts.join(", ");
+}
+
+// A redirect_uri must match one the client registered, compared exactly --
+// except for loopback, where RFC 8252 §7.3 requires the port to be ignored so
+// native clients like Claude Code can bind an ephemeral port.
+function redirectUriAllowed(registered, candidate) {
+  let cand;
+  try {
+    cand = new URL(candidate);
+  } catch {
+    return false;
+  }
+  return registered.some((r) => {
+    if (r === candidate) return true;
+    let reg;
+    try {
+      reg = new URL(r);
+    } catch {
+      return false;
+    }
+    const loopback = (h) => h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1";
+    if (loopback(reg.hostname) && loopback(cand.hostname)) {
+      return reg.protocol === cand.protocol && reg.pathname === cand.pathname;
+    }
+    return false;
+  });
+}
+
 // ---- Google sign-in (OAuth 2.0 authorization code + PKCE) ----
 // No library: the whole flow is two fetches and some claim checking.
 
@@ -807,8 +914,10 @@ async function revokeUserAccess(env, id) {
     .bind(id)
     .run();
   // Kill any live session immediately -- revoking is pointless if the person
-  // stays signed in on a device they already have open.
+  // stays signed in on a device they already have open. Same for MCP tokens:
+  // a connector holding a valid token would otherwise keep reading.
   await env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id).run();
+  await env.DB.prepare("DELETE FROM mcp_tokens WHERE user_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM pending_logins WHERE user_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM totp_backup_codes WHERE user_id = ?").bind(id).run();
 }
@@ -923,6 +1032,123 @@ async function purgeOldSubmissions(env) {
 
 async function bindGoogleSub(env, userId, sub) {
   await env.DB.prepare("UPDATE users SET google_sub = ? WHERE id = ?").bind(sub, userId).run();
+}
+
+// ---- MCP connector: OAuth client registry, codes, tokens ----
+
+async function registerOAuthClient(env, { clientId, clientName, redirectUris }) {
+  await env.DB.prepare("INSERT INTO oauth_clients (client_id, client_name, redirect_uris) VALUES (?, ?, ?)")
+    .bind(clientId, clientName || null, JSON.stringify(redirectUris))
+    .run();
+}
+
+async function getOAuthClient(env, clientId) {
+  const row = await env.DB.prepare(
+    "SELECT client_id, client_name, redirect_uris FROM oauth_clients WHERE client_id = ?"
+  )
+    .bind(clientId)
+    .first();
+  if (!row) return null;
+  let uris = [];
+  try {
+    uris = JSON.parse(row.redirect_uris);
+  } catch {
+    uris = [];
+  }
+  return { ...row, redirect_uris: Array.isArray(uris) ? uris : [] };
+}
+
+async function createAuthCode(env, c) {
+  await env.DB.prepare(
+    `INSERT INTO oauth_codes (code_hash, client_id, user_id, redirect_uri, code_challenge, scope, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(c.code_hash, c.client_id, c.user_id, c.redirect_uri, c.code_challenge, c.scope, c.expires_at)
+    .run();
+}
+
+// Single-use: the row is deleted as it's read, so a replayed code fails even
+// inside its 60-second window.
+async function consumeAuthCode(env, codeHash) {
+  const row = await env.DB.prepare(
+    "SELECT * FROM oauth_codes WHERE code_hash = ? AND expires_at > datetime('now')"
+  )
+    .bind(codeHash)
+    .first();
+  await env.DB.prepare("DELETE FROM oauth_codes WHERE code_hash = ?").bind(codeHash).run();
+  return row || null;
+}
+
+async function storeMcpToken(env, t) {
+  await env.DB.prepare(
+    `INSERT INTO mcp_tokens (token_hash, kind, client_id, user_id, scope, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  )
+    .bind(t.token_hash, t.kind, t.client_id, t.user_id, t.scope, t.expires_at)
+    .run();
+}
+
+// Resolves a bearer token to the HQ user it was issued for. Returns the same
+// shape the rest of the app expects from a session, so role checks downstream
+// are identical whether a request came from a browser or from Claude.
+async function getMcpTokenUser(env, tokenHash) {
+  const row = await env.DB.prepare(
+    `SELECT t.token_hash, t.client_id, t.scope, t.user_id,
+            u.id, u.email, u.name, u.role, u.title, u.freelancer_id
+     FROM mcp_tokens t JOIN users u ON u.id = t.user_id
+     WHERE t.token_hash = ? AND t.kind = 'access' AND t.expires_at > datetime('now')
+       AND u.password_hash IS NOT NULL`
+  )
+    .bind(tokenHash)
+    .first();
+  if (!row) return null;
+  await env.DB.prepare("UPDATE mcp_tokens SET last_used_at = datetime('now') WHERE token_hash = ?")
+    .bind(tokenHash)
+    .run();
+  return row;
+}
+
+// Rotation, as the spec requires for public clients: reading a refresh token
+// deletes it, so a stolen copy is dead the moment the real client refreshes.
+async function consumeRefreshToken(env, tokenHash) {
+  const row = await env.DB.prepare(
+    "SELECT * FROM mcp_tokens WHERE token_hash = ? AND kind = 'refresh' AND expires_at > datetime('now')"
+  )
+    .bind(tokenHash)
+    .first();
+  if (row) await env.DB.prepare("DELETE FROM mcp_tokens WHERE token_hash = ?").bind(tokenHash).run();
+  return row || null;
+}
+
+async function listMcpGrants(env, userId) {
+  const { results } = await env.DB.prepare(
+    `SELECT c.client_name, t.client_id, MIN(t.created_at) AS granted_at,
+            MAX(t.last_used_at) AS last_used_at, COUNT(*) AS tokens
+     FROM mcp_tokens t LEFT JOIN oauth_clients c ON c.client_id = t.client_id
+     WHERE t.user_id = ? AND t.expires_at > datetime('now')
+     GROUP BY t.client_id ORDER BY granted_at DESC`
+  )
+    .bind(userId)
+    .all();
+  return results;
+}
+
+async function revokeMcpGrant(env, userId, clientId) {
+  const res = await env.DB.prepare("DELETE FROM mcp_tokens WHERE user_id = ? AND client_id = ?")
+    .bind(userId, clientId)
+    .run();
+  return res.meta.changes;
+}
+
+// Revoking a person's HQ access must also kill any connector tokens issued to
+// them, or Claude keeps reading after they've been locked out.
+async function revokeAllMcpTokensForUser(env, userId) {
+  await env.DB.prepare("DELETE FROM mcp_tokens WHERE user_id = ?").bind(userId).run();
+}
+
+async function purgeExpiredOAuth(env) {
+  await env.DB.prepare("DELETE FROM oauth_codes WHERE expires_at <= datetime('now')").run();
+  await env.DB.prepare("DELETE FROM mcp_tokens WHERE expires_at <= datetime('now')").run();
 }
 
 // ---- Audit log ----
@@ -1043,7 +1269,7 @@ async function runRetentionScan(env) {
   return { leadsFlagged: staleLeads.length, freelancersFlagged: staleFreelancers.length };
 }
 
-return { getFreelancers, getFreelancerById, createFreelancer, setFreelancerActive, getClients, createClient, setClientStatus, getLeads, createLead, updateLeadStage, getRevenueEntries, createRevenueEntry, getWeeklyEntry, upsertWeeklyEntry, getFreelancerHistory, getDashboard, replaceBackupCodes, countUnusedBackupCodes, redeemBackupCode, clearBackupCodes, listUsers, getUserById, getFreelancersWithoutUser, createUser, setUserTitle, reissueSetupToken, revokeUserAccess, countActiveFounders, createInviteCode, findOpenInviteCode, consumeInviteCode, listInviteCodes, revokeInviteCode, countOpenInviteCodes, getUserByEmail, getUserCredentials, claimSubmission, purgeOldSubmissions, bindGoogleSub, logAudit, getAuditLog, logError, getErrorLog, flagForRetentionReview, getOpenRetentionFlags, resolveRetentionFlag, eraseLeadPII, eraseFreelancerPII, runRetentionScan };
+return { getFreelancers, getFreelancerById, createFreelancer, setFreelancerActive, getClients, createClient, setClientStatus, getLeads, createLead, updateLeadStage, getRevenueEntries, createRevenueEntry, getWeeklyEntry, upsertWeeklyEntry, getFreelancerHistory, getDashboard, replaceBackupCodes, countUnusedBackupCodes, redeemBackupCode, clearBackupCodes, listUsers, getUserById, getFreelancersWithoutUser, createUser, setUserTitle, reissueSetupToken, revokeUserAccess, countActiveFounders, createInviteCode, findOpenInviteCode, consumeInviteCode, listInviteCodes, revokeInviteCode, countOpenInviteCodes, getUserByEmail, getUserCredentials, claimSubmission, purgeOldSubmissions, bindGoogleSub, registerOAuthClient, getOAuthClient, createAuthCode, consumeAuthCode, storeMcpToken, getMcpTokenUser, consumeRefreshToken, listMcpGrants, revokeMcpGrant, revokeAllMcpTokensForUser, purgeExpiredOAuth, logAudit, getAuditLog, logError, getErrorLog, flagForRetentionReview, getOpenRetentionFlags, resolveRetentionFlag, eraseLeadPII, eraseFreelancerPII, runRetentionScan };
 })();
 
 // ===================== src/views.js ====================
@@ -1379,7 +1605,7 @@ ${THEME_SCRIPT}
 const GOOGLE_MARK = `<svg class="gmark" viewBox="0 0 48 48" aria-hidden="true" focusable="false"><path fill="#4285F4" d="M45.1 24.5c0-1.6-.1-3.1-.4-4.5H24v8.5h11.8c-.5 2.7-2 5-4.4 6.6v5.5h7.1c4.1-3.8 6.6-9.4 6.6-16.1z"/><path fill="#34A853" d="M24 46c6 0 11-2 14.6-5.4l-7.1-5.5c-2 1.3-4.5 2.1-7.5 2.1-5.8 0-10.7-3.9-12.4-9.1H4.3v5.7C7.9 41 15.4 46 24 46z"/><path fill="#FBBC05" d="M11.6 28.1c-.4-1.3-.7-2.7-.7-4.1s.2-2.8.7-4.1v-5.7H4.3C2.8 17.1 2 20.4 2 24s.8 6.9 2.3 9.8l7.3-5.7z"/><path fill="#EA4335" d="M24 10.8c3.3 0 6.2 1.1 8.5 3.3l6.3-6.3C35 4.3 30 2 24 2 15.4 2 7.9 7 4.3 14.2l7.3 5.7c1.7-5.2 6.6-9.1 12.4-9.1z"/></svg>`;
 
 // ---------- Auth pages ----------
-function loginPage({ error, theme, googleEnabled = false } = {}) {
+function loginPage({ error, theme, googleEnabled = false, next = null } = {}) {
   const google = googleEnabled
     ? `
       <a href="/auth/google" class="btn btn-google">${GOOGLE_MARK}<span>Continue with Google</span></a>
@@ -1396,6 +1622,7 @@ function loginPage({ error, theme, googleEnabled = false } = {}) {
       ${error ? `<div class="msg msg-error">${esc(error)}</div>` : ""}
       ${google}
       <form class="plain" method="post" action="/login">
+        ${next ? `<input type="hidden" name="next" value="${esc(next)}" />` : ""}
         <div class="field"><label>Email</label><input type="email" name="email" required placeholder="you@catalyst7.co.za" /></div>
         <div class="field"><label>Password</label><input type="password" name="password" required placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;" /></div>
         <button type="submit" class="btn btn-primary">Continue</button>
@@ -1428,7 +1655,7 @@ function registerPage({ error, theme, name = "", email = "" } = {}) {
   });
 }
 
-function totpVerifyPage({ error, theme } = {}) {
+function totpVerifyPage({ error, theme, next = null } = {}) {
   return layout({
     title: "Verify it's you",
     theme,
@@ -1438,6 +1665,7 @@ function totpVerifyPage({ error, theme } = {}) {
       <p class="lead">Open your authenticator app and enter the 6-digit code to finish signing in.</p>
       ${error ? `<div class="msg msg-error">${esc(error)}</div>` : ""}
       <form class="plain" method="post" action="/login/2fa">
+        ${next ? `<input type="hidden" name="next" value="${esc(next)}" />` : ""}
         <div class="field"><label>Authentication or backup code</label><input name="code" autocomplete="one-time-code" maxlength="12" required autofocus placeholder="000000" /></div>
         <button type="submit" class="btn btn-primary">Verify</button>
       </form>
@@ -1477,6 +1705,8 @@ function securityPage({
   backupCodesLeft = 0,
   googleLinked = false,
   googleEnabled = false,
+  mcpGrants = [],
+  mcpUrl = "/mcp",
 }) {
   let stateBody;
   if (user.totp_enabled) {
@@ -1549,6 +1779,30 @@ function securityPage({
     ${error ? `<div class="msg msg-error">${esc(error)}</div>` : ""}
     ${message ? `<div class="msg msg-ok">${esc(message)}</div>` : ""}
     <div class="panel"><div class="security-body">${stateBody}</div></div>
+    <div class="panel"><div class="security-body">
+      <h3 class="sub-label">Connected apps</h3>
+      ${
+        mcpGrants.length
+          ? `<div class="security-copy">These applications can read Catalyst 7 HQ data as you. They cannot change anything.</div>
+             <div class="table-wrap"><table><thead><tr><th>Application</th><th>Connected</th><th>Last used</th><th class="right">Action</th></tr></thead><tbody>${mcpGrants
+               .map(
+                 (g) => `<tr>
+                   <td class="strong">${esc(g.client_name || "Unnamed application")}</td>
+                   <td class="mono muted nowrap">${esc(String(g.granted_at || "").slice(0, 16))}</td>
+                   <td class="mono muted nowrap">${g.last_used_at ? esc(String(g.last_used_at).slice(0, 16)) : "never"}</td>
+                   <td class="right"><form method="post" action="/security/connectors/revoke" class="row-actions">${csrfField(
+                     csrf
+                   )}<input type="hidden" name="client_id" value="${esc(g.client_id)}" /><button type="submit" class="btn btn-sm btn-danger">Disconnect</button></form></td>
+                 </tr>`
+               )
+               .join("")}</tbody></table></div>`
+          : `<div class="security-copy">No applications are connected to your account.<br /><br />
+             To connect Claude, add a custom connector pointing at <span class="mono-box" style="display:inline-block;margin:6px 0 0">${esc(
+               mcpUrl
+             )}</span> and approve it when asked. It gets read-only access, limited to what your role can already see.</div>`
+      }
+    </div></div>
+
     ${
       googleEnabled
         ? `<div class="panel"><div class="security-body">
@@ -1991,6 +2245,82 @@ function historyPage({ user, rows, theme }) {
   });
 }
 
+// ---------- MCP connector: consent + info ----------
+// The consent screen is the whole point of choosing OAuth over a shared API
+// key: the token gets bound to whoever is signed in here, so the audit log
+// keeps naming a person.
+function consentPage({ user, theme, csrf, clientName, scope, query }) {
+  const who = esc(clientName || "An application");
+  return layout({
+    user,
+    title: "Authorise access",
+    theme,
+    body: `
+    <div class="page-head">
+      <div class="page-title">${who} wants to read your Catalyst 7 HQ data</div>
+      <div class="page-sub">You're signed in as ${esc(user.name)}${user.title ? ` &middot; ${esc(user.title)}` : ""} &middot; ${esc(user.email)}</div>
+    </div>
+
+    <div class="panel"><div class="security-body">
+      <div class="security-status">${pill(esc(scope), "green")}</div>
+      <div class="security-copy">
+        It will be able to <strong>read</strong>, as you:
+        <ul style="margin:10px 0 0 18px;line-height:1.8">
+          ${
+            user.role === "founder"
+              ? `<li>This week's numbers — hours, revenue, pipeline, log compliance</li>
+                 <li>Your leads, clients, revenue entries and freelancer roster</li>`
+              : `<li>Your own weekly log and history</li>`
+          }
+        </ul>
+        <br />
+        It <strong>cannot</strong> change anything — no adding, editing or deleting. It cannot see passwords,
+        2FA secrets, or the audit log. Access follows your role, so it can never read more than you can.
+        <br /><br />
+        You can withdraw this at any time from <strong>Security</strong> in the nav.
+      </div>
+      <div class="row-actions" style="justify-content:flex-start;gap:10px">
+        <form method="post" action="/oauth/authorize${esc(query)}">
+          ${csrfField(csrf)}
+          <input type="hidden" name="decision" value="allow" />
+          <button type="submit" class="btn btn-primary">Allow access</button>
+        </form>
+        <form method="post" action="/oauth/authorize${esc(query)}">
+          ${csrfField(csrf)}
+          <input type="hidden" name="decision" value="deny" />
+          <button type="submit" class="btn">Cancel</button>
+        </form>
+      </div>
+    </div></div>
+
+    <div class="hint" style="margin-top:14px">
+      If you didn't just try to connect something, press Cancel &mdash; this page only appears when an
+      application asked for access.
+    </div>
+  `,
+  });
+}
+
+function mcpAboutPage({ theme, origin }) {
+  return layout({
+    title: "Connector",
+    theme,
+    body: `
+    <div class="authcard" style="max-width:640px">
+      <h1>Catalyst 7 HQ connector</h1>
+      <p class="lead">Read-only access to the studio's weekly numbers, for use as a Claude connector.</p>
+      <div class="security-copy">
+        Add it in Claude under <strong>Settings &rarr; Connectors &rarr; Add custom connector</strong>, using:
+        <span class="mono-box">${esc(origin)}/mcp</span>
+        You'll be asked to sign in to HQ and approve access. The connector reads as you and follows your
+        role — a freelancer's connector only ever sees their own weekly log.
+        <br /><br />
+        Nothing it does can change your data. Revoke it any time from Security.
+      </div>
+    </div>`,
+  });
+}
+
 // ---------- Founder: Team / user accounts ----------
 function teamPage({
   user,
@@ -2364,7 +2694,7 @@ function errorPage(message, status = 400, theme = "dark") {
   });
 }
 
-return { loginPage, registerPage, totpVerifyPage, setupPage, securityPage, dashboardPage, freelancersPage, clientsPage, leadsPage, revenuePage, logPage, historyPage, teamPage, auditPage, errorsPage, retentionPage, restrictedPage, errorPage };
+return { loginPage, registerPage, totpVerifyPage, setupPage, securityPage, dashboardPage, freelancersPage, clientsPage, leadsPage, revenuePage, logPage, historyPage, consentPage, mcpAboutPage, teamPage, auditPage, errorsPage, retentionPage, restrictedPage, errorPage };
 })();
 
 // ===================== src/index.js ====================
@@ -2488,6 +2818,226 @@ async function claimOnce(env, form) {
   return db.claimSubmission(env, form._nonce);
 }
 
+// Only a same-origin *path* is ever accepted as a post-login destination.
+// A full URL, or anything starting "//", would make /login an open redirector
+// that phishing could point at another site.
+function safeNext(raw) {
+  if (typeof raw !== "string" || !raw.startsWith("/") || raw.startsWith("//")) return null;
+  return raw;
+}
+
+function json(body, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: buildHeaders({ "Content-Type": "application/json" }, extraHeaders),
+  });
+}
+
+// ---- MCP tool surface (read-only) ----
+//
+// Every tool runs with the HQ user the token was issued for, and reuses the
+// same role rules as the web UI: a founder sees the business, a freelancer
+// sees only their own log. Nothing here writes.
+const MCP_TOOLS = [
+  {
+    name: "get_week_summary",
+    description:
+      "This week's Catalyst 7 numbers: freelancer hours, revenue, open pipeline value, deals won, active clients, and who has not submitted their weekly log yet. Compares against last week. Founders only.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "list_leads",
+    description:
+      "The sales pipeline: every lead with its stage, owner and estimated value. Won and lost leads sort last. Founders only.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        stage: {
+          type: "string",
+          enum: ["new", "contacted", "qualified", "proposal", "won", "lost"],
+          description: "Optional: return only leads at this stage.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "list_clients",
+    description: "Client roster with status (active or past), contact name and how they were acquired. Founders only.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "list_revenue",
+    description:
+      "Recent revenue entries: week, client, type and amount in rand, plus invoice status. Newest first. Founders only.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "integer", minimum: 1, maximum: 100, description: "How many entries to return. Default 20." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "list_freelancers",
+    description: "The freelancer roster with role, rate and whether they are currently active. Founders only.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "get_my_weekly_log",
+    description:
+      "Your own weekly log history — hours, deliverables and status for recent weeks. Works for any signed-in user; a freelancer sees only their own entries.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        weeks: { type: "integer", minimum: 1, maximum: 52, description: "How many weeks back. Default 12." },
+      },
+      additionalProperties: false,
+    },
+  },
+];
+
+const FOUNDER_ONLY = new Set(["get_week_summary", "list_leads", "list_clients", "list_revenue", "list_freelancers"]);
+
+const money = (n) => "R" + Number(n || 0).toLocaleString("en-ZA", { maximumFractionDigits: 0 });
+
+async function runMcpTool(name, args, { env, user }) {
+  if (FOUNDER_ONLY.has(name) && user.role !== "founder") {
+    // Same rule as the web UI, enforced server-side rather than by hiding the
+    // tool: a freelancer's token cannot read business data.
+    return `That information is only available to founders. You're signed in as ${user.name} (freelancer).`;
+  }
+
+  if (name === "get_week_summary") {
+    const weekStart = isoWeekStart();
+    const d = await db.getDashboard(env, weekStart, addDays(weekStart, -7));
+    const missing = d.missingFreelancers.map((f) => f.name);
+    return [
+      `Week of ${d.weekStart} (compared with ${d.prevWeekStart})`,
+      ``,
+      `Freelancer hours: ${Number(d.hoursThis).toFixed(1)} (last week ${Number(d.hoursPrev).toFixed(1)})`,
+      `Revenue: ${money(d.revThis)} (last week ${money(d.revPrev)})`,
+      `Open pipeline: ${money(d.pipelineValue)} across ${d.leadsByStage.reduce((n, s) => n + s.n, 0)} leads`,
+      `New leads this week: ${d.newLeads}`,
+      `Deals won this week: ${d.wonThis.n} worth ${money(d.wonThis.val)}`,
+      `Active clients: ${d.activeClients} (${d.newClients} new this week)`,
+      `Weekly logs submitted: ${d.submittedCount} of ${d.activeFreelancerCount}`,
+      missing.length ? `Not yet logged: ${missing.join(", ")}` : `Everyone has logged this week.`,
+    ].join("\n");
+  }
+
+  if (name === "list_leads") {
+    let leads = await db.getLeads(env);
+    if (args.stage) leads = leads.filter((l) => l.stage === args.stage);
+    if (!leads.length) return args.stage ? `No leads at stage "${args.stage}".` : "No leads yet.";
+    return leads
+      .map(
+        (l) =>
+          `${l.name}${l.company ? ` (${l.company})` : ""} — ${l.stage}` +
+          `${l.value_estimate ? `, ${money(l.value_estimate)}` : ""}${l.owner ? `, owner ${l.owner}` : ""}`
+      )
+      .join("\n");
+  }
+
+  if (name === "list_clients") {
+    const clients = await db.getClients(env);
+    if (!clients.length) return "No clients yet.";
+    return clients
+      .map((c) => `${c.name} — ${c.status}${c.contact_name ? `, contact ${c.contact_name}` : ""}${c.source ? `, via ${c.source}` : ""}`)
+      .join("\n");
+  }
+
+  if (name === "list_revenue") {
+    const rows = await db.getRevenueEntries(env, Math.min(Math.max(args.limit || 20, 1), 100));
+    if (!rows.length) return "No revenue logged yet.";
+    return rows
+      .map((r) => `${r.week_start} — ${r.client_name || "no client"} — ${r.type} — ${money(r.amount)} (${r.invoice_status})`)
+      .join("\n");
+  }
+
+  if (name === "list_freelancers") {
+    const rows = await db.getFreelancers(env);
+    if (!rows.length) return "No freelancers on the roster yet.";
+    return rows
+      .map(
+        (f) =>
+          `${f.name}${f.role_title ? ` — ${f.role_title}` : ""} — ${f.rate_type}` +
+          `${f.rate_amount ? ` ${money(f.rate_amount)}` : ""} — ${f.active ? "active" : "inactive"}`
+      )
+      .join("\n");
+  }
+
+  if (name === "get_my_weekly_log") {
+    if (!user.freelancer_id) {
+      return `${user.name} isn't linked to a freelancer profile, so there's no weekly log to read. Founders track the team's logs with get_week_summary.`;
+    }
+    const rows = await db.getFreelancerHistory(env, user.freelancer_id, Math.min(Math.max(args.weeks || 12, 1), 52));
+    if (!rows.length) return "No weekly entries logged yet.";
+    return rows
+      .map((r) => `${r.week_start} — ${r.hours}h — ${r.status}${r.deliverables ? ` — ${r.deliverables}` : ""}`)
+      .join("\n");
+  }
+
+  return `Unknown tool: ${name}`;
+}
+
+// JSON-RPC dispatch. Notifications get 202 with no body; requests get a single
+// JSON object. No SSE: every tool here answers in milliseconds, so streaming
+// would add machinery for nothing.
+async function handleMcp(rpc, ctx) {
+  const reply = (result) => json({ jsonrpc: "2.0", id: rpc.id, result });
+  const fail = (code, message, status = 200) => json({ jsonrpc: "2.0", id: rpc.id ?? null, error: { code, message } }, status);
+
+  if (!rpc || rpc.jsonrpc !== "2.0" || typeof rpc.method !== "string") {
+    return fail(-32600, "Invalid Request", 400);
+  }
+
+  // A notification has no id and expects no response body.
+  if (rpc.id === undefined || rpc.id === null) {
+    return new Response(null, { status: 202, headers: buildHeaders({}, {}) });
+  }
+
+  switch (rpc.method) {
+    case "initialize": {
+      const asked = rpc.params?.protocolVersion;
+      return reply({
+        protocolVersion: MCP_SUPPORTED_VERSIONS.includes(asked) ? asked : MCP_PROTOCOL_VERSION,
+        capabilities: { tools: { listChanged: false } },
+        serverInfo: { name: "Catalyst 7 HQ", version: "1.0.0" },
+        instructions:
+          "Catalyst 7 HQ tracks the studio's weekly numbers: freelancer hours, revenue, clients and sales pipeline. " +
+          "All tools are read-only. Money is in South African rand. Weeks run Monday to Sunday (UTC).",
+      });
+    }
+    case "ping":
+      return reply({});
+    case "tools/list":
+      return reply({ tools: MCP_TOOLS });
+    case "resources/list":
+      return reply({ resources: [] });
+    case "prompts/list":
+      return reply({ prompts: [] });
+    case "tools/call": {
+      const name = rpc.params?.name;
+      const tool = MCP_TOOLS.find((t) => t.name === name);
+      if (!tool) return fail(-32602, `Unknown tool: ${name}`);
+      try {
+        const text = await runMcpTool(name, rpc.params?.arguments || {}, ctx);
+        // Cap well under Claude's ~150k character ceiling.
+        const capped = text.length > 100000 ? text.slice(0, 100000) + "\n…(truncated)" : text;
+        return reply({ content: [{ type: "text", text: capped }], isError: false });
+      } catch (err) {
+        await db.logError(ctx.env, "/mcp:" + name, err.stack || err.message || String(err));
+        // Tool failures are results, not protocol errors -- the model should
+        // see them and can explain or retry.
+        return reply({ content: [{ type: "text", text: `That lookup failed: ${err.message}` }], isError: true });
+      }
+    }
+    default:
+      return fail(-32601, `Method not found: ${rpc.method}`, 404);
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -2499,6 +3049,255 @@ export default {
     const reqIp = clientIp(request);
 
     try {
+      // ================= MCP CONNECTOR =================
+      // Everything Claude touches lives here: discovery, the OAuth endpoints,
+      // and the JSON-RPC endpoint itself. Placed above the browser routes
+      // because none of it uses cookies -- it authenticates with a bearer
+      // token, and the discovery documents are deliberately public.
+
+      // RFC 9728. Claude probes the path-suffixed form first, then the bare
+      // one; serve both so either probe succeeds.
+      if (
+        path === "/.well-known/oauth-protected-resource" ||
+        path === "/.well-known/oauth-protected-resource/mcp"
+      ) {
+        return json(protectedResourceMetadata(url.origin));
+      }
+
+      // RFC 8414. The OIDC path is included because some clients look there.
+      if (path === "/.well-known/oauth-authorization-server" || path === "/.well-known/openid-configuration") {
+        return json(authorizationServerMetadata(url.origin));
+      }
+
+      // RFC 7591 dynamic client registration. Open by design: registration
+      // creates no access on its own, and nothing is issued until a real HQ
+      // user signs in and consents at /oauth/authorize.
+      if (path === "/oauth/register" && method === "POST") {
+        let body;
+        try {
+          body = await request.json();
+        } catch {
+          return json({ error: "invalid_client_metadata", error_description: "Body must be JSON." }, 400);
+        }
+        const uris = Array.isArray(body.redirect_uris) ? body.redirect_uris.filter((u) => typeof u === "string") : [];
+        if (!uris.length) {
+          return json({ error: "invalid_redirect_uri", error_description: "redirect_uris is required." }, 400);
+        }
+        for (const u of uris) {
+          let parsed;
+          try {
+            parsed = new URL(u);
+          } catch {
+            return json({ error: "invalid_redirect_uri", error_description: `Not a URL: ${u}` }, 400);
+          }
+          const loopback = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(parsed.hostname);
+          if (parsed.protocol !== "https:" && !loopback) {
+            return json(
+              { error: "invalid_redirect_uri", error_description: "Redirect URIs must be https, or loopback for native clients." },
+              400
+            );
+          }
+        }
+        const clientId = randomUrlSafe(24);
+        await db.registerOAuthClient(env, {
+          clientId,
+          clientName: typeof body.client_name === "string" ? body.client_name.slice(0, 120) : null,
+          redirectUris: uris,
+        });
+        return json(
+          {
+            client_id: clientId,
+            client_name: body.client_name || null,
+            redirect_uris: uris,
+            grant_types: ["authorization_code", "refresh_token"],
+            response_types: ["code"],
+            // Public client: PKCE, not a secret, is what protects the code.
+            token_endpoint_auth_method: "none",
+            client_id_issued_at: Math.floor(Date.now() / 1000),
+          },
+          201
+        );
+      }
+
+      // Consent screen. Reuses the ordinary HQ session, so whoever is signed
+      // in here is exactly who the token gets bound to -- including having
+      // passed 2FA.
+      if (path === "/oauth/authorize" && (method === "GET" || method === "POST")) {
+        const q = url.searchParams;
+        const clientId = q.get("client_id") || "";
+        const redirectUri = q.get("redirect_uri") || "";
+        const state = q.get("state") || "";
+        const challenge = q.get("code_challenge") || "";
+        const challengeMethod = q.get("code_challenge_method") || "";
+        const requestedScope = q.get("scope") || MCP_SCOPE;
+
+        const client = await db.getOAuthClient(env, clientId);
+        // Errors before the redirect_uri is validated must NOT redirect --
+        // bouncing to an unverified URI would make this an open redirector.
+        if (!client) {
+          return html(views.errorPage("Unknown OAuth client. Try removing and re-adding the connector.", 400, theme), 400);
+        }
+        if (!redirectUriAllowed(client.redirect_uris, redirectUri)) {
+          return html(views.errorPage("That redirect URI isn't registered for this connector.", 400, theme), 400);
+        }
+
+        const bounce = (params) => {
+          const dest = new URL(redirectUri);
+          for (const [k, v] of Object.entries(params)) dest.searchParams.set(k, v);
+          if (state) dest.searchParams.set("state", state);
+          return redirect(dest.toString());
+        };
+
+        if (q.get("response_type") !== "code") return bounce({ error: "unsupported_response_type" });
+        // S256 only. `plain` is not accepted and Claude never sends it.
+        if (challengeMethod !== "S256" || !challenge) {
+          return bounce({ error: "invalid_request", error_description: "S256 PKCE is required" });
+        }
+
+        const consentUser = await getSessionUser(request, env);
+        if (!consentUser) {
+          // Sign in first, then come back to this exact authorize URL.
+          return redirect(`/login?next=${encodeURIComponent(path + url.search)}`);
+        }
+
+        if (method === "GET") {
+          return html(
+            views.consentPage({
+              user: consentUser,
+              theme,
+              csrf: consentUser.session_csrf,
+              clientName: client.client_name,
+              scope: requestedScope,
+              query: url.search,
+            })
+          );
+        }
+
+        // POST = the user pressed Allow.
+        const f = await readForm(request);
+        const fail = csrfGuard(consentUser, f, theme);
+        if (fail) return fail;
+        if (f.decision !== "allow") return bounce({ error: "access_denied" });
+
+        const code = randomUrlSafe(32);
+        const ttl = mcpTokenTtl();
+        await db.createAuthCode(env, {
+          code_hash: await hashOpaque(code),
+          client_id: clientId,
+          user_id: consentUser.id,
+          redirect_uri: redirectUri,
+          code_challenge: challenge,
+          scope: MCP_SCOPE,
+          expires_at: new Date(Date.now() + ttl.code * 1000).toISOString(),
+        });
+        await db.logAudit(env, consentUser, "mcp_access_granted", "user", consentUser.id, client.client_name || clientId, reqIp);
+        return bounce({ code });
+      }
+
+      // RFC 6749 token endpoint. Must accept form-urlencoded.
+      if (path === "/oauth/token" && method === "POST") {
+        const f = await readForm(request);
+        const grant = f.grant_type;
+        const ttl = mcpTokenTtl();
+
+        const issue = async ({ clientId, userId, scope }) => {
+          const access = randomUrlSafe(32);
+          const refresh = randomUrlSafe(32);
+          await db.storeMcpToken(env, {
+            token_hash: await hashOpaque(access),
+            kind: "access",
+            client_id: clientId,
+            user_id: userId,
+            scope,
+            expires_at: new Date(Date.now() + ttl.access * 1000).toISOString(),
+          });
+          await db.storeMcpToken(env, {
+            token_hash: await hashOpaque(refresh),
+            kind: "refresh",
+            client_id: clientId,
+            user_id: userId,
+            scope,
+            expires_at: new Date(Date.now() + ttl.refresh * 1000).toISOString(),
+          });
+          return json({
+            access_token: access,
+            token_type: "Bearer",
+            expires_in: ttl.access,
+            refresh_token: refresh,
+            scope,
+          });
+        };
+
+        if (grant === "authorization_code") {
+          const row = await db.consumeAuthCode(env, await hashOpaque(f.code || ""));
+          if (!row) return json({ error: "invalid_grant", error_description: "Code is unknown, expired or already used." }, 400);
+          if (row.client_id !== f.client_id) return json({ error: "invalid_grant", error_description: "Client mismatch." }, 400);
+          if (row.redirect_uri !== f.redirect_uri) return json({ error: "invalid_grant", error_description: "redirect_uri mismatch." }, 400);
+          if (!(await verifyPkceS256(f.code_verifier || "", row.code_challenge))) {
+            return json({ error: "invalid_grant", error_description: "PKCE verification failed." }, 400);
+          }
+          return issue({ clientId: row.client_id, userId: row.user_id, scope: row.scope });
+        }
+
+        if (grant === "refresh_token") {
+          // Rotating: consuming deletes the old token, so a stolen copy dies
+          // the moment the real client refreshes.
+          const row = await db.consumeRefreshToken(env, await hashOpaque(f.refresh_token || ""));
+          // RFC 6749 code exactly -- Claude keys its retry behaviour off this.
+          if (!row) return json({ error: "invalid_grant", error_description: "Refresh token is no longer valid." }, 400);
+          return issue({ clientId: row.client_id, userId: row.user_id, scope: row.scope });
+        }
+
+        return json({ error: "unsupported_grant_type" }, 400);
+      }
+
+      // Human-readable page describing the connector, linked from the
+      // discovery documents.
+      if (path === "/mcp/about") {
+        return html(views.mcpAboutPage({ theme, origin: url.origin }));
+      }
+
+      // ---------- The MCP endpoint ----------
+      if (path === "/mcp") {
+        // This revision offers no standalone SSE stream and no sessions.
+        if (method === "GET" || method === "DELETE") {
+          return new Response(null, { status: 405, headers: buildHeaders({ Allow: "POST" }, {}) });
+        }
+        if (method !== "POST") return new Response(null, { status: 405 });
+
+        // DNS-rebinding guard: a browser-originated request carries Origin.
+        // Claude's server-side calls carry none, which is what we expect.
+        const origin = request.headers.get("Origin");
+        if (origin && origin !== url.origin) {
+          return json({ jsonrpc: "2.0", error: { code: -32600, message: "Origin not allowed" } }, 403);
+        }
+
+        const auth = request.headers.get("Authorization") || "";
+        const bearer = auth.startsWith("Bearer ") ? auth.slice(7).trim() : null;
+        // The 401 + WWW-Authenticate pair is what starts Claude's OAuth flow.
+        // A WWW-Authenticate on a 200 is ignored, so the status matters.
+        if (!bearer) {
+          return json({ jsonrpc: "2.0", error: { code: -32001, message: "Authentication required" } }, 401, {
+            "WWW-Authenticate": wwwAuthenticateHeader(url.origin),
+          });
+        }
+        const tokenUser = await db.getMcpTokenUser(env, await hashOpaque(bearer));
+        if (!tokenUser) {
+          return json({ jsonrpc: "2.0", error: { code: -32001, message: "Token invalid or expired" } }, 401, {
+            "WWW-Authenticate": wwwAuthenticateHeader(url.origin, "invalid_token"),
+          });
+        }
+
+        let rpc;
+        try {
+          rpc = await request.json();
+        } catch {
+          return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, 400);
+        }
+
+        return handleMcp(rpc, { env, user: tokenUser, origin: url.origin, ip: reqIp });
+      }
+
       // ---------- Public: theme toggle ----------
       // Public and unauthenticated on purpose -- the login/setup pages need it
       // too. No CSRF token: it's a same-origin-checked GET that flips a UI
@@ -2520,7 +3319,7 @@ export default {
       if (path === "/login" && method === "GET") {
         const existing = await getSessionUser(request, env);
         if (existing) return redirect("/");
-        return html(views.loginPage({ theme, googleEnabled: googleConfigured(env) }));
+        return html(views.loginPage({ theme, googleEnabled: googleConfigured(env), next: safeNext(url.searchParams.get("next")) }));
       }
 
       // ---------- Public: Google sign-in ----------
@@ -2656,7 +3455,8 @@ export default {
       }
 
       if (path === "/login" && method === "POST") {
-        const { email, password } = await readForm(request);
+        const f = await readForm(request);
+        const { email, password } = f;
         const normalizedEmail = (email || "").trim().toLowerCase();
         const ip = clientIp(request);
 
@@ -2678,18 +3478,21 @@ export default {
 
         if (user.totp_enabled) {
           const pendingToken = await createPendingLogin(env, user.id);
-          return redirect("/login/2fa", { "Set-Cookie": pendingCookie(pendingToken) });
+          const nx = safeNext(f.next);
+          return redirect(nx ? `/login/2fa?next=${encodeURIComponent(nx)}` : "/login/2fa", {
+            "Set-Cookie": pendingCookie(pendingToken),
+          });
         }
 
         const token = await createSession(env, user.id);
-        return redirect("/", { "Set-Cookie": sessionCookie(token) });
+        return redirect(safeNext(f.next) || "/", { "Set-Cookie": sessionCookie(token) });
       }
 
       // ---------- Public: 2FA verification step ----------
       if (path === "/login/2fa" && method === "GET") {
         const pending = await getPendingLogin(request, env);
         if (!pending) return redirect("/login");
-        return html(views.totpVerifyPage({ theme }));
+        return html(views.totpVerifyPage({ theme, next: safeNext(url.searchParams.get("next")) }));
       }
 
       if (path === "/login/2fa" && method === "POST") {
@@ -2701,7 +3504,8 @@ export default {
         const limit = await checkRateLimit(env, rlKey, ip);
         if (limit.blocked) return html(views.totpVerifyPage({ error: limit.reason, theme }), 429);
 
-        const { code } = await readForm(request);
+        const f = await readForm(request);
+        const { code } = f;
 
         // Either the current authenticator code, or one of the single-use
         // backup codes issued when 2FA was switched on.
@@ -2729,7 +3533,7 @@ export default {
 
         await destroyPendingLogin(env, pending.pendingToken);
         const token = await createSession(env, pending.user_id);
-        return redirect("/", {
+        return redirect(safeNext(f.next) || safeNext(url.searchParams.get("next")) || "/", {
           "Set-Cookie": [sessionCookie(token), clearPendingCookie()],
         });
       }
@@ -2883,6 +3687,8 @@ export default {
             backupCodesLeft: await db.countUnusedBackupCodes(env, user.id),
             googleLinked: !!fresh.google_sub,
             googleEnabled: googleConfigured(env),
+            mcpGrants: await db.listMcpGrants(env, user.id),
+            mcpUrl: `${url.origin}/mcp`,
           })
         );
       }
@@ -2970,6 +3776,29 @@ export default {
             backupCodesLeft: codes.length,
             googleEnabled: googleConfigured(env),
           })
+        );
+      }
+
+      // Withdraw a connector's access. Deletes its tokens outright, so the
+      // next request Claude makes gets a 401 and the connection is dead.
+      if (path === "/security/connectors/revoke" && method === "POST") {
+        const f = await readForm(request);
+        const fail = csrfGuard(user, f, theme);
+        if (fail) return fail;
+        const removed = await db.revokeMcpGrant(env, user.id, f.client_id || "");
+        await db.logAudit(env, user, "mcp_access_revoked", "user", user.id, `${removed} token(s)`, reqIp);
+        return html(
+          await (async () =>
+            views.securityPage({
+              user,
+              csrf,
+              theme,
+              message: removed ? "Connector access withdrawn. It can no longer read your data." : "That connector was already disconnected.",
+              backupCodesLeft: await db.countUnusedBackupCodes(env, user.id),
+              googleEnabled: googleConfigured(env),
+              mcpGrants: await db.listMcpGrants(env, user.id),
+              mcpUrl: `${url.origin}/mcp`,
+            }))()
         );
       }
 

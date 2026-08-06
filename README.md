@@ -47,7 +47,7 @@ npx wrangler d1 execute catalyst7-kpi --remote --command \
 
 (The `password_hash IS NULL` guard means this is a no-op once you've activated — it can't lock you out of a live account.)
 
-Once you're in, add Somila and Lethu yourself from the **Team** page in the nav — no database commands needed.
+Once you're in, add the other founders yourself from the **Team** page in the nav — no database commands needed.
 
 ## Point it at kpi.catalyst7.[yourdomain]
 
