@@ -66,7 +66,15 @@ function req(path, { method = "GET", cookies = {}, form = null, headers = {} } =
     .join("; ");
   if (cookieStr) h.set("Cookie", cookieStr);
   const init = { method, headers: h };
-  if (form) init.body = new URLSearchParams(form);
+  if (form) {
+    // Mirror what a real rendered form sends: csrfField() emits _csrf AND a
+    // fresh _nonce together, so any form carrying a CSRF token carries a
+    // nonce too. Tests that want to exercise a *replayed* submission pass
+    // _nonce explicitly.
+    const body = { ...form };
+    if (body._csrf !== undefined && body._nonce === undefined) body._nonce = crypto.randomUUID();
+    init.body = new URLSearchParams(body);
+  }
   return new Request(ORIGIN + path, init);
 }
 
@@ -1182,8 +1190,9 @@ await test("a founder can create another founder and gets a one-time invite link
   const created = await db.getUserByEmail(env, "somila@catalyst7.co.za");
   assert(created, "email is normalised to lowercase before storing");
   eq(created.role, "founder", "role applied");
-  eq(created.password_hash, null, "no password until they set one");
-  eq(created.setup_token, token, "token matches the link shown");
+  eq(created.has_password, 0, "no password until they set one");
+  const raw = await env.DB.prepare("SELECT setup_token FROM users WHERE id = ?").bind(created.id).first();
+  eq(raw.setup_token, token, "token matches the link shown");
   assert((await auditActions(env)).includes("founder_created"), "creation audited");
 
   // The link actually works end to end.
@@ -1193,7 +1202,9 @@ await test("a founder can create another founder and gets a one-time invite link
   );
   eq(setup.status, 302, "new founder can activate");
   assert(setCookie(setup, "c7_session"), "and is signed straight in");
-  const after = await db.getUserByEmail(env, "somila@catalyst7.co.za");
+  const after = await env.DB.prepare(
+    "SELECT password_hash, setup_token FROM users WHERE email = 'somila@catalyst7.co.za'"
+  ).first();
   assert(after.password_hash, "password set");
   eq(after.setup_token, null, "token consumed");
 });
@@ -1291,7 +1302,7 @@ await test("reissuing an invite invalidates the old password and link", async ()
   const token = inviteLinkFrom(await res.text());
   assert(token, "new link issued");
 
-  const u = await db.getUserById(env, fl.userId);
+  const u = await env.DB.prepare("SELECT password_hash, setup_token FROM users WHERE id = ?").bind(fl.userId).first();
   eq(u.password_hash, null, "old password cleared");
   eq(u.setup_token, token, "new token stored");
 
@@ -1314,7 +1325,9 @@ await test("revoking access ends sessions and locks the account", async () => {
   );
   eq(res.status, 200, "status");
 
-  const after = await db.getUserById(env, fl.userId);
+  const after = await env.DB.prepare(
+    "SELECT password_hash, setup_token, totp_enabled FROM users WHERE id = ?"
+  ).bind(fl.userId).first();
   assert(after, "the row is kept, not deleted");
   eq(after.password_hash, null, "password cleared");
   eq(after.setup_token, null, "no dangling invite");
@@ -1353,7 +1366,7 @@ await test("the lockout guards hold", async () => {
   eq(other.status, 200, "revoking a pending founder is allowed");
 
   const me = await db.getUserById(env, id);
-  assert(me.password_hash, "my own login is untouched throughout");
+  assert(me.has_password, "my own login is untouched throughout");
 });
 
 await test("team mutations are behind CSRF", async () => {
@@ -1370,7 +1383,7 @@ await test("team mutations are behind CSRF", async () => {
   }
   eq(await db.getUserByEmail(env, "x@y.co"), null, "nothing created");
   const stillThere = await db.getUserById(env, fl.userId);
-  assert(stillThere.password_hash, "freelancer's access untouched");
+  assert(stillThere.has_password, "freelancer's access untouched");
 });
 
 console.log("\nJob titles");
@@ -1512,8 +1525,9 @@ await test("a founder code creates a founder, once", async () => {
   assert(created, "email normalised to lowercase");
   eq(created.name, "Somila Tenza Sogaxa", "name stored");
   eq(created.role, "founder", "role came from the code");
-  assert(created.password_hash, "password set");
-  lacks(created.password_hash, "her-own-password", "plaintext never stored");
+  const cred = await env.DB.prepare("SELECT password_hash FROM users WHERE id = ?").bind(created.id).first();
+  assert(cred.password_hash, "password set");
+  lacks(cred.password_hash, "her-own-password", "plaintext never stored");
 
   eq((await worker.fetch(req("/dashboard", { cookies: { c7_session: theirSession } }), env)).status, 200, "founder access works");
   assert((await auditActions(env)).includes("account_registered"), "audited");
@@ -1676,6 +1690,155 @@ await test("registration attempts are rate limited", async () => {
     env
   );
   eq(blocked.status, 429, "6th attempt is rate limited, so codes can't be ground down");
+});
+
+console.log("\nC7 standard — credential hygiene, idempotency, audit fields");
+
+await test("no credential material leaves the database except where it's verified", async () => {
+  const env = makeEnv();
+  const { session, id } = await founderSession(env);
+
+  // The query that runs on EVERY authenticated request must not carry secrets.
+  const req0 = req("/dashboard", { cookies: { c7_session: session } });
+  const sessionUser = await (await import("../src/auth.js")).getSessionUser(req0, env);
+  assert(sessionUser, "session resolves");
+  eq(sessionUser.password_hash, undefined, "no password hash on the session user");
+  eq(sessionUser.password_salt, undefined, "no salt either");
+  eq(sessionUser.totp_secret, undefined, "no TOTP secret");
+  assert(sessionUser.role && sessionUser.email, "but the fields it does need are present");
+
+  // General-purpose lookups are credential-free too.
+  const byId = await db.getUserById(env, id);
+  eq(byId.password_hash, undefined, "getUserById carries no hash");
+  eq(byId.has_password, 1, "it exposes a flag instead");
+  const byEmail = await db.getUserByEmail(env, sessionUser.email);
+  eq(byEmail.password_hash, undefined, "getUserByEmail carries no hash");
+
+  // Exactly one function is allowed to return it, and it still works.
+  const creds = await db.getUserCredentials(env, sessionUser.email);
+  assert(creds.password_hash && creds.password_salt, "the login path can still verify a password");
+});
+
+await test("a double-submitted create form only creates one record", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+
+  // Same nonce twice = the same form posted twice, which is what a
+  // double-click produces before the first redirect lands.
+  const nonce = crypto.randomUUID();
+  const post = (path, form) =>
+    worker.fetch(req(path, { method: "POST", cookies: { c7_session: session }, form: { ...form, _csrf: csrf, _nonce: nonce } }), env);
+
+  const first = await post("/clients", { name: "Umlazi Foods", source: "referral" });
+  eq(first.status, 302, "first submission accepted");
+  const second = await post("/clients", { name: "Umlazi Foods", source: "referral" });
+  eq(second.status, 302, "second submission also redirects, so the user sees no error");
+
+  eq((await db.getClients(env)).length, 1, "but only one client exists");
+
+  // Same again for the one where duplicates corrupt the numbers.
+  const rNonce = crypto.randomUUID();
+  const rev = (n) =>
+    worker.fetch(
+      req("/revenue", {
+        method: "POST",
+        cookies: { c7_session: session },
+        form: { week_start: "2026-07-27", amount: "12400", type: "project", invoice_status: "paid", _csrf: csrf, _nonce: n },
+      }),
+      env
+    );
+  await rev(rNonce);
+  await rev(rNonce);
+  const entries = await db.getRevenueEntries(env);
+  eq(entries.length, 1, "one revenue row, not two");
+  eq(entries[0].amount, 12400, "and the figure is right");
+});
+
+await test("distinct submissions are unaffected by the idempotency guard", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  for (const name of ["Client A", "Client B", "Client C"]) {
+    const r = await worker.fetch(
+      req("/clients", { method: "POST", cookies: { c7_session: session }, form: { name, _csrf: csrf } }),
+      env
+    );
+    eq(r.status, 302, `${name} accepted`);
+  }
+  eq((await db.getClients(env)).length, 3, "three separate submissions, three clients");
+});
+
+await test("every rendered form carries both a CSRF token and a fresh nonce", async () => {
+  const env = makeEnv();
+  const { session } = await founderSession(env);
+  const body = await (await worker.fetch(req("/clients", { cookies: { c7_session: session } }), env)).text();
+
+  const csrfs = [...body.matchAll(/name="_csrf" value="([^"]*)"/g)].map((m) => m[1]);
+  const nonces = [...body.matchAll(/name="_nonce" value="([^"]*)"/g)].map((m) => m[1]);
+  assert(csrfs.length > 0, "forms are present");
+  eq(nonces.length, csrfs.length, "every CSRF field is paired with a nonce");
+  eq(new Set(csrfs).size, 1, "one CSRF token per session");
+  eq(new Set(nonces).size, nonces.length, "but every nonce is unique");
+
+  // A second render must produce different nonces, or replays would pass.
+  const again = await (await worker.fetch(req("/clients", { cookies: { c7_session: session } }), env)).text();
+  const nonces2 = [...again.matchAll(/name="_nonce" value="([^"]*)"/g)].map((m) => m[1]);
+  eq(nonces.filter((n) => nonces2.includes(n)).length, 0, "no nonce is reused across renders");
+});
+
+await test("audit entries record where the action came from and whether it worked", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  await worker.fetch(
+    req("/clients", {
+      method: "POST",
+      cookies: { c7_session: session },
+      headers: { "CF-Connecting-IP": "41.13.7.9" },
+      form: { name: "Umlazi Foods", _csrf: csrf },
+    }),
+    env
+  );
+
+  const row = await env.DB.prepare("SELECT * FROM audit_log WHERE action = 'client_created'").first();
+  assert(row, "the action was audited");
+  eq(row.ip_address, "41.13.7.9", "IP recorded");
+  eq(row.status, "success", "outcome recorded");
+  assert(row.created_at, "timestamp");
+  assert(row.user_id && row.user_name, "actor");
+  eq(row.entity_type, "client", "target resource");
+
+  // And the audit page still renders with the new columns.
+  const page = await worker.fetch(req("/audit", { cookies: { c7_session: session } }), env);
+  eq(page.status, 200, "audit page renders");
+  has(await page.text(), "client_created", "showing the entry");
+});
+
+await test("blocked pages explain themselves without confirming they exist", async () => {
+  const env = makeEnv();
+  const fl = await seedFreelancer(env);
+  const { session } = await login(env, fl.email, FREELANCER_PW);
+  const res = await worker.fetch(req("/dashboard", { cookies: { c7_session: session } }), env);
+
+  // Status stays 404: a 403 would confirm the page is real. The body explains.
+  eq(res.status, 404, "status stays quiet");
+  const body = await res.text();
+  has(body, "isn't part of your access", "explicit restricted-access state, not a bare 'Not found'");
+  has(body, 'href="/log"', "offers a way back to where they can go");
+  lacks(body, "/revenue", "and doesn't enumerate the pages they can't reach");
+});
+
+await test("empty states offer a way to create the first record", async () => {
+  const env = makeEnv();
+  const { session } = await founderSession(env);
+  for (const [path, cue] of [
+    ["/clients", "Add your first client"],
+    ["/leads", "Add your first lead"],
+    ["/freelancers", "Add your first freelancer"],
+    ["/revenue", "Log your first entry"],
+  ]) {
+    const body = await (await worker.fetch(req(path, { cookies: { c7_session: session } }), env)).text();
+    has(body, cue, `${path} empty state has a creation CTA`);
+    has(body, 'for="add-toggle"', `${path} CTA opens the add form`);
+  }
 });
 
 console.log("\nSecurity headers");

@@ -1,0 +1,51 @@
+name: CI
+
+# Required by the C7 standard: builds must fail on High/Critical CVEs, and the
+# test suite is the pre-deploy gate. This file does nothing until the repo is
+# actually on GitHub — see docs/adr/001-c7-standard-audit.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # node:sqlite is unflagged from Node 23; the suite needs it.
+          node-version: "24"
+          cache: npm
+
+      - run: npm ci
+
+      # Runs against the real source tree.
+      - name: Tests
+        run: npm test
+
+      # And against the single-file build the dashboard deploy pastes, so the
+      # two can never drift apart unnoticed.
+      - name: Tests (single-file build)
+        run: npm run test:bundle
+
+      # Fails the build on High/Critical advisories. Moderate and below are
+      # reported but don't block — wrangler's dev-only tree carries a few and
+      # they never reach the browser or the Worker.
+      - name: Dependency audit
+        run: npm audit --audit-level=high
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # gitleaks needs history, not just the tip
+      - name: Scan for committed secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

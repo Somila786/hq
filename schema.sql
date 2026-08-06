@@ -104,7 +104,11 @@ CREATE TABLE IF NOT EXISTS audit_log (
   entity_type TEXT,
   entity_id INTEGER,
   detail TEXT,
-  created_at TEXT DEFAULT (datetime('now'))
+  created_at TEXT DEFAULT (datetime('now')),
+  -- Who, what, when is not enough for an incident: from where, and did it
+  -- work. Required by the C7 standard and useful for POPIA §17.
+  ip_address TEXT,
+  status TEXT DEFAULT 'success'
 );
 
 CREATE TABLE IF NOT EXISTS error_log (
@@ -170,3 +174,13 @@ CREATE TABLE IF NOT EXISTS invite_codes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_invite_codes_open ON invite_codes (used_at, expires_at);
+
+-- One-time nonces for form idempotency. A double-clicked create form submits
+-- the same nonce twice; the second INSERT collides on the primary key and the
+-- handler redirects instead of writing a duplicate record.
+CREATE TABLE IF NOT EXISTS submissions (
+  nonce TEXT PRIMARY KEY,
+  used_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_submissions_age ON submissions (used_at);

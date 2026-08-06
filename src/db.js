@@ -258,8 +258,18 @@ export async function listUsers(env) {
   return results;
 }
 
+// Credential-free. `has_password` is exposed as a flag rather than the hash
+// itself, because callers only ever need to know *whether* a login works.
 export async function getUserById(env, id) {
-  return env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(id).first();
+  return env.DB.prepare(
+    `SELECT id, email, name, role, title, freelancer_id, totp_enabled, created_at,
+            password_hash IS NOT NULL AS has_password,
+            setup_token IS NOT NULL AS invite_pending,
+            google_sub IS NOT NULL AS google_linked
+     FROM users WHERE id = ?`
+  )
+    .bind(id)
+    .first();
 }
 
 // Freelancer profiles that don't yet have a login attached -- the only valid
@@ -387,8 +397,43 @@ export async function countOpenInviteCodes(env) {
 }
 
 // ---- Google account binding ----
+// Credential-free -- used for existence checks and the Google allowlist.
 export async function getUserByEmail(env, email) {
-  return env.DB.prepare("SELECT * FROM users WHERE email = ?").bind(email).first();
+  return env.DB.prepare(
+    `SELECT id, email, name, role, title, freelancer_id, totp_enabled, google_sub,
+            password_hash IS NOT NULL AS has_password
+     FROM users WHERE email = ?`
+  )
+    .bind(email)
+    .first();
+}
+
+// The ONLY query that returns password material, used by the login handler and
+// nothing else. Keeping it isolated means a careless `user.password_hash`
+// elsewhere reads undefined rather than a real hash.
+export async function getUserCredentials(env, email) {
+  return env.DB.prepare(
+    `SELECT id, email, name, role, password_hash, password_salt, totp_enabled
+     FROM users WHERE email = ?`
+  )
+    .bind(email)
+    .first();
+}
+
+// ---- Form idempotency ----
+// Claims a one-time submission nonce. Returns true only for the first caller:
+// the PRIMARY KEY makes the second INSERT fail, which is how a double-clicked
+// form is detected without any locking.
+export async function claimSubmission(env, nonce) {
+  if (!nonce || typeof nonce !== "string" || nonce.length < 8 || nonce.length > 64) return false;
+  const res = await env.DB.prepare("INSERT OR IGNORE INTO submissions (nonce) VALUES (?)").bind(nonce).run();
+  return res.meta.changes === 1;
+}
+
+// Nonces only need to outlive a user's patience with a stuck form. Purged by
+// the monthly cron alongside the retention scan.
+export async function purgeOldSubmissions(env) {
+  await env.DB.prepare("DELETE FROM submissions WHERE used_at < datetime('now', '-7 days')").run();
 }
 
 export async function bindGoogleSub(env, userId, sub) {
@@ -396,16 +441,31 @@ export async function bindGoogleSub(env, userId, sub) {
 }
 
 // ---- Audit log ----
-export async function logAudit(env, user, action, entityType, entityId, detail) {
+// `ip` and `status` are required by the C7 standard: who/what/when alone
+// doesn't support an incident investigation without where and whether-it-worked.
+export async function logAudit(env, user, action, entityType, entityId, detail, ip = null, status = "success") {
   await env.DB.prepare(
-    `INSERT INTO audit_log (user_id, user_name, action, entity_type, entity_id, detail) VALUES (?, ?, ?, ?, ?, ?)`
+    `INSERT INTO audit_log (user_id, user_name, action, entity_type, entity_id, detail, ip_address, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   )
-    .bind(user ? user.id : null, user ? user.name : "system", action, entityType || null, entityId || null, detail || null)
+    .bind(
+      user ? user.id : null,
+      user ? user.name : "system",
+      action,
+      entityType || null,
+      entityId || null,
+      detail || null,
+      ip || null,
+      status || "success"
+    )
     .run();
 }
 
 export async function getAuditLog(env, limit = 100) {
-  const { results } = await env.DB.prepare("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?")
+  const { results } = await env.DB.prepare(
+    `SELECT created_at, user_name, action, entity_type, entity_id, detail, ip_address, status
+     FROM audit_log ORDER BY created_at DESC LIMIT ?`
+  )
     .bind(limit)
     .all();
   return results;

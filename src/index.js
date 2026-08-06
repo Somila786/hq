@@ -148,12 +148,27 @@ function csrfGuard(user, form, theme) {
   return null;
 }
 
+// Idempotency for HTML forms. Post/Redirect/Get already stops a refresh from
+// resubmitting; this stops the other case -- an impatient double-click firing
+// two requests before the first redirect lands, which would otherwise create
+// two revenue rows or two leads.
+//
+// Returns true if this submission is the first to claim its nonce. A repeat
+// gets `false` and the caller redirects as though it had succeeded, because
+// from the user's point of view it did.
+async function claimOnce(env, form) {
+  return db.claimSubmission(env, form._nonce);
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
     const theme = parseCookies(request)["c7_theme"] === "light" ? "light" : "dark";
+    // Captured once so every audit entry can record where the action came
+    // from, per the C7 standard's audit field list.
+    const reqIp = clientIp(request);
 
     try {
       // ---------- Public: theme toggle ----------
@@ -268,7 +283,7 @@ export default {
         // is still a failed login.
         if (!user) {
           await recordLoginAttempt(env, email, ip, false);
-          await db.logAudit(env, null, "login_google_denied", "user", null, email);
+          await db.logAudit(env, null, "login_google_denied", "user", null, email, reqIp);
           return html(
             views.loginPage({
               theme,
@@ -284,7 +299,7 @@ export default {
         // same underlying account any more.
         if (user.google_sub && user.google_sub !== payload.sub) {
           await recordLoginAttempt(env, email, ip, false);
-          await db.logAudit(env, user, "login_google_sub_mismatch", "user", user.id, email);
+          await db.logAudit(env, user, "login_google_sub_mismatch", "user", user.id, email, reqIp);
           return html(
             views.loginPage({
               theme,
@@ -296,7 +311,7 @@ export default {
         }
         if (!user.google_sub) {
           await db.bindGoogleSub(env, user.id, payload.sub);
-          await db.logAudit(env, user, "google_account_linked", "user", user.id, email);
+          await db.logAudit(env, user, "google_account_linked", "user", user.id, email, reqIp);
         }
 
         await recordLoginAttempt(env, email, ip, true);
@@ -307,7 +322,7 @@ export default {
           return redirect("/login/2fa", { "Set-Cookie": pendingCookie(pendingToken) });
         }
 
-        await db.logAudit(env, user, "login_google", "user", user.id, null);
+        await db.logAudit(env, user, "login_google", "user", user.id, null, reqIp);
         const token = await createSession(env, user.id);
         return redirect("/", { "Set-Cookie": sessionCookie(token) });
       }
@@ -322,7 +337,7 @@ export default {
           return html(views.loginPage({ error: limit.reason, theme, googleEnabled: googleConfigured(env) }), 429);
         }
 
-        const user = await env.DB.prepare("SELECT * FROM users WHERE email = ?").bind(normalizedEmail).first();
+        const user = await db.getUserCredentials(env, normalizedEmail);
         const ok = user && (await verifyPassword(env, user, password || ""));
         await recordLoginAttempt(env, normalizedEmail, ip, !!ok);
 
@@ -474,7 +489,7 @@ export default {
 
         await setPassword(env, created.id, password);
         await recordLoginAttempt(env, rlKey, ip, true);
-        await db.logAudit(env, created, "account_registered", "user", created.id, `${invite.role} via invite code`);
+        await db.logAudit(env, created, "account_registered", "user", created.id, `${invite.role} via invite code`, reqIp);
 
         const token = await createSession(env, created.id);
         return redirect("/", { "Set-Cookie": sessionCookie(token) });
@@ -483,14 +498,18 @@ export default {
       // ---------- Public: first-time setup / invite ----------
       if (path.startsWith("/setup/") && method === "GET") {
         const token = path.split("/setup/")[1];
-        const user = await env.DB.prepare("SELECT * FROM users WHERE setup_token = ?").bind(token).first();
+        const user = await env.DB.prepare(
+          "SELECT id, email, name, role FROM users WHERE setup_token = ?"
+        ).bind(token).first();
         if (!user) return html(views.errorPage("This setup link is invalid or has already been used.", 404, theme), 404);
         return html(views.setupPage({ token, name: user.name, theme }));
       }
 
       if (path.startsWith("/setup/") && method === "POST") {
         const token = path.split("/setup/")[1];
-        const user = await env.DB.prepare("SELECT * FROM users WHERE setup_token = ?").bind(token).first();
+        const user = await env.DB.prepare(
+          "SELECT id, email, name, role FROM users WHERE setup_token = ?"
+        ).bind(token).first();
         if (!user) return html(views.errorPage("This setup link is invalid or has already been used.", 404, theme), 404);
         const { password, confirm } = await readForm(request);
         if (!password || password.length < 8) {
@@ -500,7 +519,7 @@ export default {
           return html(views.setupPage({ token, name: user.name, error: "Passwords don't match.", theme }), 400);
         }
         await setPassword(env, user.id, password);
-        await db.logAudit(env, user, "account_activated", "user", user.id, null);
+        await db.logAudit(env, user, "account_activated", "user", user.id, null, reqIp);
         const sessionToken = await createSession(env, user.id);
         return redirect("/", { "Set-Cookie": sessionCookie(sessionToken) });
       }
@@ -569,13 +588,13 @@ export default {
           );
         }
         await env.DB.prepare("UPDATE users SET totp_enabled = 1 WHERE id = ?").bind(user.id).run();
-        await db.logAudit(env, user, "2fa_enabled", "user", user.id, null);
+        await db.logAudit(env, user, "2fa_enabled", "user", user.id, null, reqIp);
 
         // Issue recovery codes immediately: an authenticator enrolled without
         // them is one lost phone away from a manual D1 rescue.
         const codes = generateBackupCodes();
         await db.replaceBackupCodes(env, user.id, await Promise.all(codes.map(hashBackupCode)));
-        await db.logAudit(env, user, "2fa_backup_codes_generated", "user", user.id, `${codes.length} codes`);
+        await db.logAudit(env, user, "2fa_backup_codes_generated", "user", user.id, `${codes.length} codes`, reqIp);
 
         return html(
           views.securityPage({
@@ -612,7 +631,7 @@ export default {
         }
         const codes = generateBackupCodes();
         await db.replaceBackupCodes(env, user.id, await Promise.all(codes.map(hashBackupCode)));
-        await db.logAudit(env, user, "2fa_backup_codes_regenerated", "user", user.id, `${codes.length} codes`);
+        await db.logAudit(env, user, "2fa_backup_codes_regenerated", "user", user.id, `${codes.length} codes`, reqIp);
         return html(
           views.securityPage({
             user: { ...user, totp_enabled: 1 },
@@ -634,7 +653,7 @@ export default {
         // Codes are useless without the second factor they unlock, and leaving
         // them behind would silently re-arm on the next enable.
         await db.clearBackupCodes(env, user.id);
-        await db.logAudit(env, user, "2fa_disabled", "user", user.id, null);
+        await db.logAudit(env, user, "2fa_disabled", "user", user.id, null, reqIp);
         return html(
           views.securityPage({
             user: { ...user, totp_enabled: 0 },
@@ -671,7 +690,7 @@ export default {
             status: f.status,
             notes: f.notes,
           });
-          await db.logAudit(env, user, "weekly_log_submitted", "freelancer", freelancer.id, `${f.hours}h, week ${weekStart}`);
+          await db.logAudit(env, user, "weekly_log_submitted", "freelancer", freelancer.id, `${f.hours}h, week ${weekStart}`, reqIp);
           return redirect("/log");
         }
 
@@ -680,7 +699,7 @@ export default {
           return html(views.historyPage({ user, rows, theme }));
         }
 
-        return html(views.errorPage("Not found.", 404, theme), 404);
+        return html(views.restrictedPage({ user, theme }), 404);
       }
 
       // ================= FOUNDER ROUTES =================
@@ -701,6 +720,7 @@ export default {
           const f = await readForm(request);
           const fail = csrfGuard(user, f, theme);
           if (fail) return fail;
+          if (!(await claimOnce(env, f))) return redirect("/freelancers");
           await db.createFreelancer(env, {
             name: f.name,
             email: f.email,
@@ -708,7 +728,7 @@ export default {
             rate_type: f.rate_type,
             rate_amount: f.rate_amount ? parseFloat(f.rate_amount) : null,
           });
-          await db.logAudit(env, user, "freelancer_created", "freelancer", null, f.name);
+          await db.logAudit(env, user, "freelancer_created", "freelancer", null, f.name, reqIp);
           return redirect("/freelancers");
         }
         const inviteMatch = path.match(/^\/freelancers\/(\d+)\/invite$/);
@@ -720,7 +740,9 @@ export default {
           const freelancer = await db.getFreelancerById(env, id);
           if (!freelancer) return html(views.errorPage("Freelancer not found.", 404, theme), 404);
           const token = randomToken();
-          const existingUser = await env.DB.prepare("SELECT * FROM users WHERE freelancer_id = ?").bind(id).first();
+          const existingUser = await env.DB.prepare(
+            "SELECT id FROM users WHERE freelancer_id = ?"
+          ).bind(id).first();
           if (existingUser) {
             await env.DB.prepare("UPDATE users SET setup_token = ?, password_hash = NULL, password_salt = NULL WHERE id = ?")
               .bind(token, existingUser.id)
@@ -733,7 +755,7 @@ export default {
               .bind(email, freelancer.name, id, token)
               .run();
           }
-          await db.logAudit(env, user, "freelancer_invited", "freelancer", id, null);
+          await db.logAudit(env, user, "freelancer_invited", "freelancer", id, null, reqIp);
           const freelancers = await db.getFreelancers(env);
           const link = `${url.origin}/setup/${token}`;
           return html(views.freelancersPage({ user, freelancers, inviteLink: link, csrf, theme }));
@@ -747,7 +769,7 @@ export default {
           const freelancer = await db.getFreelancerById(env, id);
           if (freelancer) {
             await db.setFreelancerActive(env, id, !freelancer.active);
-            await db.logAudit(env, user, freelancer.active ? "freelancer_deactivated" : "freelancer_activated", "freelancer", id, null);
+            await db.logAudit(env, user, freelancer.active ? "freelancer_deactivated" : "freelancer_activated", "freelancer", id, null, reqIp);
           }
           return redirect("/freelancers");
         }
@@ -761,8 +783,9 @@ export default {
           const c = await readForm(request);
           const fail = csrfGuard(user, c, theme);
           if (fail) return fail;
+          if (!(await claimOnce(env, c))) return redirect("/clients");
           await db.createClient(env, c);
-          await db.logAudit(env, user, "client_created", "client", null, c.name);
+          await db.logAudit(env, user, "client_created", "client", null, c.name, reqIp);
           return redirect("/clients");
         }
         const clientToggle = path.match(/^\/clients\/(\d+)\/toggle$/);
@@ -775,7 +798,7 @@ export default {
           if (client) {
             const newStatus = client.status === "active" ? "past" : "active";
             await db.setClientStatus(env, client.id, newStatus);
-            await db.logAudit(env, user, "client_status_changed", "client", client.id, newStatus);
+            await db.logAudit(env, user, "client_status_changed", "client", client.id, newStatus, reqIp);
           }
           return redirect("/clients");
         }
@@ -789,8 +812,9 @@ export default {
           const l = await readForm(request);
           const fail = csrfGuard(user, l, theme);
           if (fail) return fail;
+          if (!(await claimOnce(env, l))) return redirect("/leads");
           await db.createLead(env, { ...l, value_estimate: l.value_estimate ? parseFloat(l.value_estimate) : null });
-          await db.logAudit(env, user, "lead_created", "lead", null, l.name);
+          await db.logAudit(env, user, "lead_created", "lead", null, l.name, reqIp);
           return redirect("/leads");
         }
         const stageMatch = path.match(/^\/leads\/(\d+)\/stage$/);
@@ -799,7 +823,7 @@ export default {
           const fail = csrfGuard(user, f, theme);
           if (fail) return fail;
           await db.updateLeadStage(env, stageMatch[1], f.stage);
-          await db.logAudit(env, user, "lead_stage_changed", "lead", stageMatch[1], f.stage);
+          await db.logAudit(env, user, "lead_stage_changed", "lead", stageMatch[1], f.stage, reqIp);
           return redirect("/leads");
         }
 
@@ -812,6 +836,7 @@ export default {
           const r = await readForm(request);
           const fail = csrfGuard(user, r, theme);
           if (fail) return fail;
+          if (!(await claimOnce(env, r))) return redirect("/revenue");
           await db.createRevenueEntry(env, {
             week_start: r.week_start,
             client_id: r.client_id || null,
@@ -819,7 +844,7 @@ export default {
             type: r.type,
             invoice_status: r.invoice_status,
           });
-          await db.logAudit(env, user, "revenue_logged", "revenue", null, `${r.amount} (${r.type})`);
+          await db.logAudit(env, user, "revenue_logged", "revenue", null, `${r.amount} (${r.type})`, reqIp);
           return redirect("/revenue");
         }
 
@@ -890,7 +915,7 @@ export default {
             freelancer_id: freelancerId,
             setup_token: token,
           });
-          await db.logAudit(env, user, role === "founder" ? "founder_created" : "user_created", "user", null, `${name} <${email}>`);
+          await db.logAudit(env, user, role === "founder" ? "founder_created" : "user_created", "user", null, `${name} <${email}>`, reqIp);
 
           return html(
             await teamPage({
@@ -911,7 +936,7 @@ export default {
 
           const token = randomToken();
           await db.reissueSetupToken(env, target.id, token);
-          await db.logAudit(env, user, "invite_reissued", "user", target.id, `${target.name} <${target.email}>`);
+          await db.logAudit(env, user, "invite_reissued", "user", target.id, `${target.name} <${target.email}>`, reqIp);
           return html(
             await teamPage({
               message: `New link for ${target.name}. Any previous link or password for this account has stopped working.`,
@@ -933,7 +958,7 @@ export default {
 
           const title = (f.title || "").trim().slice(0, 60);
           await db.setUserTitle(env, target.id, title);
-          await db.logAudit(env, user, "title_changed", "user", target.id, `${target.name}: ${title || "(cleared)"}`);
+          await db.logAudit(env, user, "title_changed", "user", target.id, `${target.name}: ${title || "(cleared)"}`, reqIp);
           return html(await teamPage({ message: `Updated ${target.name}'s title.` }));
         }
 
@@ -970,7 +995,7 @@ export default {
             created_by: user.id,
             expires_at: new Date(Date.now() + days * 86400000).toISOString(),
           });
-          await db.logAudit(env, user, "invite_code_created", "user", null, `${role}, expires in ${days}d${f.note ? " — " + f.note : ""}`);
+          await db.logAudit(env, user, "invite_code_created", "user", null, `${role}, expires in ${days}d${f.note ? " — " + f.note : ""}`, reqIp);
 
           return html(
             await teamPage({
@@ -986,7 +1011,7 @@ export default {
           const fail = csrfGuard(user, f, theme);
           if (fail) return fail;
           const gone = await db.revokeInviteCode(env, codeRevoke[1]);
-          await db.logAudit(env, user, "invite_code_revoked", "user", null, gone ? "revoked" : "already used or gone");
+          await db.logAudit(env, user, "invite_code_revoked", "user", null, gone ? "revoked" : "already used or gone", reqIp);
           return html(
             await teamPage({
               message: gone ? "That invite code has been cancelled." : "That code was already used or no longer exists.",
@@ -1010,7 +1035,7 @@ export default {
           // Only blocks when the target is itself a *working* founder login.
           // Revoking a founder who never activated removes nothing, and
           // blocking that would strand a sole founder who mistyped an invite.
-          if (target.role === "founder" && target.password_hash && (await db.countActiveFounders(env)) <= 1) {
+          if (target.role === "founder" && target.has_password && (await db.countActiveFounders(env)) <= 1) {
             return html(
               await teamPage({ error: "That's the last founder with a working login — revoking it would lock everyone out." }),
               400
@@ -1018,7 +1043,7 @@ export default {
           }
 
           await db.revokeUserAccess(env, target.id);
-          await db.logAudit(env, user, "access_revoked", "user", target.id, `${target.name} <${target.email}>`);
+          await db.logAudit(env, user, "access_revoked", "user", target.id, `${target.name} <${target.email}>`, reqIp);
           return html(await teamPage({ message: `${target.name}'s access has been revoked and their sessions ended.` }));
         }
 
@@ -1045,23 +1070,25 @@ export default {
           const fail = csrfGuard(user, f, theme);
           if (fail) return fail;
           const flagId = retentionMatch[1];
-          const flag = await env.DB.prepare("SELECT * FROM retention_flags WHERE id = ?").bind(flagId).first();
+          const flag = await env.DB.prepare(
+            "SELECT id, entity_type, entity_id FROM retention_flags WHERE id = ?"
+          ).bind(flagId).first();
           if (flag && f.decision === "erase") {
             if (flag.entity_type === "lead") await db.eraseLeadPII(env, flag.entity_id);
             if (flag.entity_type === "freelancer") await db.eraseFreelancerPII(env, flag.entity_id);
             await db.resolveRetentionFlag(env, flagId, "erased");
-            await db.logAudit(env, user, "retention_erased", flag.entity_type, flag.entity_id, null);
+            await db.logAudit(env, user, "retention_erased", flag.entity_type, flag.entity_id, null, reqIp);
           } else if (flag) {
             await db.resolveRetentionFlag(env, flagId, "kept");
-            await db.logAudit(env, user, "retention_kept", flag.entity_type, flag.entity_id, null);
+            await db.logAudit(env, user, "retention_kept", flag.entity_type, flag.entity_id, null, reqIp);
           }
           return redirect("/retention");
         }
 
-        return html(views.errorPage("Not found.", 404, theme), 404);
+        return html(views.restrictedPage({ user, theme }), 404);
       }
 
-      return html(views.errorPage("Not found.", 404, theme), 404);
+      return html(views.restrictedPage({ user, theme }), 404);
     } catch (err) {
       await db.logError(env, path, err.stack || err.message || String(err));
       return html(views.errorPage("Something went wrong: " + err.message, 500, theme), 500);
@@ -1071,6 +1098,11 @@ export default {
   // Monthly Cron Trigger (see wrangler.toml [triggers]) -- flags stale
   // records for a human retention decision. Never deletes anything itself.
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(db.runRetentionScan(env));
+    ctx.waitUntil(
+      (async () => {
+        await db.runRetentionScan(env);
+        await db.purgeOldSubmissions(env);
+      })()
+    );
   },
 };

@@ -126,8 +126,15 @@ export async function getSessionUser(request, env) {
   const cookies = parseCookies(request);
   const token = cookies["c7_session"];
   if (!token) return null;
+  // Explicit projection, not `u.*`. This runs on every authenticated request,
+  // and `u.*` was loading password_hash, password_salt and totp_secret into
+  // memory each time for no reason. Credentials are fetched only by the code
+  // that actually verifies them (getUserCredentials / getPendingLogin).
   const row = await env.DB.prepare(
-    `SELECT u.*, s.csrf_token as session_csrf FROM sessions s JOIN users u ON u.id = s.user_id
+    `SELECT u.id, u.email, u.name, u.role, u.title, u.freelancer_id, u.totp_enabled,
+            u.google_sub IS NOT NULL AS google_linked,
+            s.csrf_token as session_csrf
+     FROM sessions s JOIN users u ON u.id = s.user_id
      WHERE s.token = ? AND s.expires_at > datetime('now')`
   )
     .bind(token)
@@ -156,8 +163,11 @@ export async function getPendingLogin(request, env) {
   const cookies = parseCookies(request);
   const token = cookies["c7_pending"];
   if (!token) return null;
+  // Needs totp_secret to verify the code -- but not the password hash.
   const row = await env.DB.prepare(
-    `SELECT p.*, u.* FROM pending_logins p JOIN users u ON u.id = p.user_id
+    `SELECT p.token, p.user_id, p.expires_at,
+            u.email, u.name, u.role, u.totp_secret
+     FROM pending_logins p JOIN users u ON u.id = p.user_id
      WHERE p.token = ? AND p.expires_at > datetime('now')`
   )
     .bind(token)

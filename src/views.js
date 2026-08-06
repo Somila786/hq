@@ -11,8 +11,16 @@ function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+// Every mutating form carries two hidden fields:
+//   _csrf  -- session-bound, the security control (same value all session)
+//   _nonce -- fresh per render, the idempotency control (single use)
+// The nonce costs nothing to mint and is only recorded server-side when a
+// submission is actually accepted, so a page with ten forms writes nothing.
 function csrfField(csrf) {
-  return `<input type="hidden" name="_csrf" value="${esc(csrf)}" />`;
+  return (
+    `<input type="hidden" name="_csrf" value="${esc(csrf)}" />` +
+    `<input type="hidden" name="_nonce" value="${crypto.randomUUID()}" />`
+  );
 }
 
 function money(n) {
@@ -663,7 +671,7 @@ export function freelancersPage({ user, freelancers, inviteLink, csrf, theme }) 
         ${
           rows
             ? `<table><thead><tr><th>Name</th><th>Role</th><th>Rate</th><th>Status</th><th class="right">Actions</th></tr></thead><tbody>${rows}</tbody></table>`
-            : `<div class="empty">No freelancers yet.</div>`
+            : `<div class="empty">No freelancers yet.<br/><label for="add-toggle" class="btn btn-primary" style="margin-top:12px">Add your first freelancer</label></div>`
         }
       </div>
     </div>
@@ -724,7 +732,7 @@ export function clientsPage({ user, clients, csrf, theme }) {
         ${
           rows
             ? `<table><thead><tr><th>Client</th><th>Status</th><th>Contact</th><th>Source</th><th class="right">Actions</th></tr></thead><tbody>${rows}</tbody></table>`
-            : `<div class="empty">No clients yet.</div>`
+            : `<div class="empty">No clients yet.<br/><label for="add-toggle" class="btn btn-primary" style="margin-top:12px">Add your first client</label></div>`
         }
       </div>
     </div>
@@ -791,7 +799,7 @@ export function leadsPage({ user, leads, csrf, theme }) {
         ${
           rows
             ? `<table><thead><tr><th>Lead</th><th>Owner</th><th>Value</th><th class="right">Stage</th></tr></thead><tbody>${rows}</tbody></table>`
-            : `<div class="empty">No leads yet.</div>`
+            : `<div class="empty">No leads yet.<br/><label for="add-toggle" class="btn btn-primary" style="margin-top:12px">Add your first lead</label></div>`
         }
       </div>
     </div>
@@ -857,7 +865,7 @@ export function revenuePage({ user, entries, clients, csrf, theme }) {
         ${
           rows
             ? `<table><thead><tr><th>Week</th><th>Client</th><th>Type</th><th>Amount</th><th class="right">Invoice</th></tr></thead><tbody>${rows}</tbody></table>`
-            : `<div class="empty">No revenue logged yet.</div>`
+            : `<div class="empty">No revenue logged yet.<br/><label for="add-toggle" class="btn btn-primary" style="margin-top:12px">Log your first entry</label></div>`
         }
       </div>
     </div>
@@ -1155,6 +1163,8 @@ export function auditPage({ user, rows, theme }) {
       <td class="nowrap">${pill(r.action, kind)}</td>
       <td class="muted nowrap">${esc(r.entity_type || "—")}${r.entity_id ? " #" + r.entity_id : ""}</td>
       <td class="detail">${esc(r.detail || "—")}</td>
+      <td class="mono muted nowrap">${esc(r.ip_address || "—")}</td>
+      <td class="nowrap">${r.status && r.status !== "success" ? pill(r.status, "red") : pill("ok", "green")}</td>
     </tr>`;
     })
     .join("");
@@ -1166,13 +1176,13 @@ export function auditPage({ user, rows, theme }) {
     body: `
     <div class="page-head">
       <div class="page-title">Audit log</div>
-      <div class="page-sub">Who changed what, and when. Last 100 actions.</div>
+      <div class="page-sub">Who changed what, when, from where, and whether it worked. Last 100 actions.</div>
     </div>
     <div class="panel">
       <div class="table-wrap">
         ${
           trs
-            ? `<table><thead><tr><th>When</th><th>Who</th><th>Action</th><th>Entity</th><th>Detail</th></tr></thead><tbody>${trs}</tbody></table>`
+            ? `<table><thead><tr><th>When</th><th>Who</th><th>Action</th><th>Entity</th><th>Detail</th><th>From</th><th>Result</th></tr></thead><tbody>${trs}</tbody></table>`
             : `<div class="empty">No activity logged yet.</div>`
         }
       </div>
@@ -1260,6 +1270,37 @@ export function retentionPage({ user, flags, csrf, theme }) {
         }
       </div>
     </div>
+  `,
+  });
+}
+
+// The C7 standard asks for an explicit Unauthorized state. The HTTP status
+// stays 404 on purpose -- a 403 would confirm the page exists, which tells an
+// account more than it should learn about what it cannot reach. The *page*
+// explains; the status code stays quiet.
+export function restrictedPage({ user, theme }) {
+  const home = user && user.role === "freelancer" ? "/log" : "/dashboard";
+  return layout({
+    user,
+    title: "Not available",
+    theme,
+    body: `
+    <div class="page-head">
+      <div class="page-title">That page isn't part of your access</div>
+      <div class="page-sub">You're signed in as ${esc(user.name)}${user.title ? ` &middot; ${esc(user.title)}` : ""}.</div>
+    </div>
+    <div class="panel"><div class="security-body">
+      <div class="security-status">${pill(user.role === "freelancer" ? "freelancer access" : "founder access", "")}</div>
+      <div class="security-copy">
+        ${
+          user.role === "freelancer"
+            ? "Your account covers your own weekly log and history. Dashboard, revenue, clients, leads and team management are founder-only — that's by design, not a fault."
+            : "This page either doesn't exist or isn't available to your account."
+        }
+      </div>
+      <a href="${home}" class="btn btn-primary">${user.role === "freelancer" ? "Go to this week's log" : "Back to the dashboard"}</a>
+    </div></div>
+    <div class="hint" style="margin-top:14px">If you think you should have access to this, ask a founder — they can change it on the Team page.</div>
   `,
   });
 }

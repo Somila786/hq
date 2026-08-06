@@ -1,0 +1,64 @@
+#!/bin/sh
+# Pre-commit secret scan + test gate.
+#
+# Enable once per clone:
+#     git config core.hooksPath .githooks
+#
+# Deliberately dependency-free -- no husky, no npm install required, works the
+# same on Windows (Git Bash), macOS and Linux. This repo previously carried a
+# live founder setup token in README.md; this hook is what would have caught it.
+
+set -e
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$staged" ] && exit 0
+
+fail=0
+
+# Patterns are read line-by-line, NOT word-split: several contain spaces, and
+# some begin with '-' which grep would otherwise read as options. Hence
+# `while read` plus `grep -E -- "$p"`.
+scan_file() {
+  file="$1"
+  while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    if git show ":$file" 2>/dev/null | grep -Eq -- "$p"; then
+      echo "BLOCKED: $file matches a secret pattern -> $p"
+      fail=1
+    fi
+  done <<'PATTERNS'
+GOCSPX-[A-Za-z0-9_-]{20,}
+-----BEGIN [A-Z ]*PRIVATE KEY-----
+xox[baprs]-[A-Za-z0-9-]{10,}
+AKIA[0-9A-Z]{16}
+/setup/[a-f0-9]{32,}
+PATTERNS
+}
+
+for f in $staged; do
+  [ -f "$f" ] || continue
+  case "$f" in
+    package-lock.json|dist/*|.githooks/pre-commit) continue ;;
+  esac
+  scan_file "$f"
+done
+
+# A real Google client secret must go in via `wrangler secret put`, never here.
+if git show ":wrangler.toml" 2>/dev/null | grep -Eq 'GOOGLE_CLIENT_SECRET[[:space:]]*=[[:space:]]*"[^"]+"'; then
+  echo "BLOCKED: GOOGLE_CLIENT_SECRET belongs in 'wrangler secret put', not wrangler.toml"
+  fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo ""
+  echo "Commit aborted. Remove the secret, or --no-verify if it is genuinely a false positive."
+  exit 1
+fi
+
+# Tests gate any change to application code or schema.
+if echo "$staged" | grep -Eq '^(src/|tests/|schema\.sql)'; then
+  echo "Running tests..."
+  npm test --silent >/dev/null 2>&1 || { echo "Commit aborted: tests failed. Run 'npm test' to see why."; exit 1; }
+  echo "Tests passed."
+fi
+
+exit 0
