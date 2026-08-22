@@ -559,6 +559,103 @@ export async function purgeExpiredOAuth(env) {
   await env.DB.prepare("DELETE FROM mcp_tokens WHERE expires_at <= datetime('now')").run();
 }
 
+// ---- Outreach ledger (events posted in by Make) ----
+
+// INSERT OR IGNORE on the UNIQUE event_id is the idempotency mechanism: a Make
+// retry lands once. Returns false when the event was already recorded, so the
+// caller can answer 200 without double-counting.
+export async function recordOutreachEvent(env, e) {
+  const res = await env.DB.prepare(
+    `INSERT OR IGNORE INTO outreach_events
+       (event_id, lead_id, lead_email, kind, sequence, step, subject, detail, occurred_at, source)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      e.event_id,
+      e.lead_id || null,
+      e.lead_email || null,
+      e.kind,
+      e.sequence || null,
+      e.step || null,
+      e.subject || null,
+      e.detail || null,
+      e.occurred_at,
+      e.source || null
+    )
+    .run();
+  return res.meta.changes === 1;
+}
+
+// Matching is by email, lowercased. A send to an address that isn't in the
+// pipeline still gets recorded with lead_id NULL rather than dropped.
+export async function findLeadByEmail(env, email) {
+  if (!email) return null;
+  return env.DB.prepare(
+    "SELECT id, name, company, stage FROM leads WHERE lower(contact_email) = lower(?) LIMIT 1"
+  )
+    .bind(email)
+    .first();
+}
+
+export async function getLeadById(env, id) {
+  return env.DB.prepare(
+    `SELECT id, name, company, contact_email, stage, value_estimate, source, owner, notes,
+            created_at, updated_at
+     FROM leads WHERE id = ?`
+  )
+    .bind(id)
+    .first();
+}
+
+export async function getOutreachForLead(env, leadId, limit = 50) {
+  const { results } = await env.DB.prepare(
+    `SELECT kind, sequence, step, subject, detail, occurred_at, source
+     FROM outreach_events WHERE lead_id = ? ORDER BY occurred_at DESC LIMIT ?`
+  )
+    .bind(leadId, limit)
+    .all();
+  return results;
+}
+
+// Recent activity across every lead, for the CRM overview.
+export async function getRecentOutreach(env, limit = 50) {
+  const { results } = await env.DB.prepare(
+    `SELECT o.kind, o.sequence, o.step, o.subject, o.detail, o.occurred_at, o.lead_email,
+            o.lead_id, l.name AS lead_name, l.company AS lead_company
+     FROM outreach_events o LEFT JOIN leads l ON l.id = o.lead_id
+     ORDER BY o.occurred_at DESC LIMIT ?`
+  )
+    .bind(limit)
+    .all();
+  return results;
+}
+
+// Per-lead counts, so the leads table can show outreach at a glance without
+// N queries.
+export async function getOutreachSummary(env) {
+  const { results } = await env.DB.prepare(
+    `SELECT lead_id,
+            SUM(kind = 'sent') AS sent,
+            SUM(kind = 'reply') AS replies,
+            SUM(kind IN ('bounce','failed')) AS problems,
+            MAX(occurred_at) AS last_at
+     FROM outreach_events WHERE lead_id IS NOT NULL GROUP BY lead_id`
+  ).all();
+  return Object.fromEntries(results.map((r) => [r.lead_id, r]));
+}
+
+// Events whose address matched no lead -- worth surfacing rather than hiding,
+// since it usually means a typo or a lead deleted mid-sequence.
+export async function getUnmatchedOutreach(env, limit = 20) {
+  const { results } = await env.DB.prepare(
+    `SELECT kind, lead_email, subject, occurred_at FROM outreach_events
+     WHERE lead_id IS NULL ORDER BY occurred_at DESC LIMIT ?`
+  )
+    .bind(limit)
+    .all();
+  return results;
+}
+
 // ---- Audit log ----
 // `ip` and `status` are required by the C7 standard: who/what/when alone
 // doesn't support an incident investigation without where and whether-it-worked.

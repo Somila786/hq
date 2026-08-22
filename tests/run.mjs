@@ -2198,6 +2198,177 @@ await test("the MCP endpoint rejects what it should", async () => {
   eq(unknown.body.error.code, -32601, "with the JSON-RPC method-not-found code");
 });
 
+console.log("\nOutreach webhook from Make (CRM step 1)");
+
+const MAKE_SECRET = "shared-secret-for-tests";
+
+function makeEnvWithWebhook() {
+  const env = makeEnv();
+  env.MAKE_WEBHOOK_SECRET = MAKE_SECRET;
+  return env;
+}
+
+async function signBody(secret, raw) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(raw));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Posts a C7-envelope event the way Make would.
+async function postEvent(env, data, { secret = MAKE_SECRET, eventId, timestamp, sign = true } = {}) {
+  const payload = {
+    event_id: eventId || `evt_${crypto.randomUUID()}`,
+    timestamp: timestamp || new Date().toISOString(),
+    source: "make_outreach",
+    form_name: "outreach_event_v1",
+    data,
+  };
+  const raw = JSON.stringify(payload);
+  const headers = { "Content-Type": "application/json" };
+  if (sign) headers["X-Signature-256"] = "sha256=" + (await signBody(secret, raw));
+  const res = await worker.fetch(new Request(ORIGIN + "/webhooks/make", { method: "POST", headers, body: raw }), env);
+  return { res, body: await res.json().catch(() => null), payload };
+}
+
+await test("the webhook stays dormant until a secret is configured", async () => {
+  const env = makeEnv(); // no MAKE_WEBHOOK_SECRET
+  const { res } = await postEvent(env, { kind: "sent", email: "x@y.co" });
+  eq(res.status, 404, "endpoint not exposed without a secret");
+});
+
+await test("an unsigned or wrongly signed event is refused", async () => {
+  const env = makeEnvWithWebhook();
+  const unsigned = await postEvent(env, { kind: "sent", email: "x@y.co" }, { sign: false });
+  eq(unsigned.res.status, 401, "unsigned refused");
+
+  const wrong = await postEvent(env, { kind: "sent", email: "x@y.co" }, { secret: "not-the-secret" });
+  eq(wrong.res.status, 401, "wrong secret refused");
+
+  const { results } = await env.DB.prepare("SELECT * FROM outreach_events").all();
+  eq(results.length, 0, "nothing recorded from an unauthenticated caller");
+  assert((await auditActions(env)).includes("webhook_rejected"), "rejection is audited");
+});
+
+await test("a signed event is recorded and matched to its lead", async () => {
+  const env = makeEnvWithWebhook();
+  await db.createLead(env, { name: "Thandi Mokoena", company: "Braamfontein Bakery", contact_email: "Thandi@Bakery.co.za" });
+  const lead = (await db.getLeads(env))[0];
+
+  const { res, body } = await postEvent(env, {
+    kind: "sent",
+    email: "thandi@bakery.co.za", // different case from the lead record
+    sequence: "cold_outreach_v2",
+    step: 1,
+    subject: "Quick question about Braamfontein Bakery",
+  });
+  eq(res.status, 200, "accepted");
+  eq(body.success, true, "C7 standard response shape");
+  eq(body.matched_lead, lead.id, "matched to the lead despite differing case");
+
+  const events = await db.getOutreachForLead(env, lead.id);
+  eq(events.length, 1, "one event on the timeline");
+  eq(events[0].kind, "sent", "kind recorded");
+  eq(events[0].sequence, "cold_outreach_v2", "sequence recorded");
+  eq(events[0].subject, "Quick question about Braamfontein Bakery", "subject recorded");
+});
+
+await test("a retried event lands once, not twice", async () => {
+  const env = makeEnvWithWebhook();
+  await db.createLead(env, { name: "Thandi", contact_email: "t@b.co.za" });
+  const id = "evt_fixed_for_retry";
+
+  const first = await postEvent(env, { kind: "sent", email: "t@b.co.za", subject: "Hello" }, { eventId: id });
+  const second = await postEvent(env, { kind: "sent", email: "t@b.co.za", subject: "Hello" }, { eventId: id });
+
+  eq(first.res.status, 200, "first accepted");
+  // A duplicate must still be a success, or Make retries forever.
+  eq(second.res.status, 200, "retry also answers 200");
+  has(second.body.message, "already recorded", "but says it was a duplicate");
+
+  const { results } = await env.DB.prepare("SELECT * FROM outreach_events").all();
+  eq(results.length, 1, "recorded exactly once");
+});
+
+await test("replies and bounces are recorded, and unknown kinds refused", async () => {
+  const env = makeEnvWithWebhook();
+  await db.createLead(env, { name: "Thandi", contact_email: "t@b.co.za" });
+  const lead = (await db.getLeads(env))[0];
+
+  await postEvent(env, { kind: "reply", email: "t@b.co.za", detail: "Sounds interesting, call me Thursday" });
+  await postEvent(env, { kind: "bounce", email: "t@b.co.za", detail: "550 mailbox unavailable" });
+  const bad = await postEvent(env, { kind: "opened", email: "t@b.co.za" });
+  eq(bad.res.status, 400, "an unsupported kind is refused rather than stored as junk");
+
+  const events = await db.getOutreachForLead(env, lead.id);
+  eq(events.length, 2, "reply and bounce stored");
+  assert(events.some((e) => e.kind === "reply"), "reply");
+  assert(events.some((e) => e.kind === "bounce"), "bounce");
+});
+
+await test("a send to an address with no matching lead is kept, not dropped", async () => {
+  const env = makeEnvWithWebhook();
+  const { res, body } = await postEvent(env, { kind: "sent", email: "nobody@example.com", subject: "Hi" });
+  eq(res.status, 200, "accepted");
+  eq(body.matched_lead, null, "no lead matched");
+  const orphans = await db.getUnmatchedOutreach(env);
+  eq(orphans.length, 1, "still visible rather than silently discarded");
+  eq(orphans[0].lead_email, "nobody@example.com", "with the address it went to");
+});
+
+await test("stale and malformed timestamps are refused", async () => {
+  const env = makeEnvWithWebhook();
+  const old = await postEvent(env, { kind: "sent", email: "a@b.co" }, { timestamp: new Date(Date.now() - 30 * 86400000).toISOString() });
+  eq(old.res.status, 400, "a month-old capture is refused");
+  const junk = await postEvent(env, { kind: "sent", email: "a@b.co" }, { timestamp: "not-a-date" });
+  eq(junk.res.status, 400, "malformed timestamp refused");
+  const future = await postEvent(env, { kind: "sent", email: "a@b.co" }, { timestamp: new Date(Date.now() + 3600000).toISOString() });
+  eq(future.res.status, 400, "a timestamp an hour in the future is refused");
+});
+
+await test("the lead page shows its outreach timeline", async () => {
+  const env = makeEnvWithWebhook();
+  const { session } = await founderSession(env);
+  await db.createLead(env, { name: "Thandi Mokoena", company: "Braamfontein Bakery", contact_email: "t@b.co.za" });
+  const lead = (await db.getLeads(env))[0];
+  await postEvent(env, { kind: "sent", email: "t@b.co.za", sequence: "cold_v2", step: 1, subject: "Quick question" });
+  await postEvent(env, { kind: "reply", email: "t@b.co.za", detail: "Interested" });
+
+  const page = await worker.fetch(req(`/leads/${lead.id}`, { cookies: { c7_session: session } }), env);
+  eq(page.status, 200, "lead page renders");
+  const body = await page.text();
+  has(body, "Quick question", "the sent email");
+  has(body, "cold_v2", "the sequence name");
+  has(body, "Interested", "the reply");
+  has(body, "Outreach activity", "timeline panel");
+
+  // And the list view summarises it.
+  const list = await (await worker.fetch(req("/leads", { cookies: { c7_session: session } }), env)).text();
+  has(list, `href="/leads/${lead.id}"`, "list links through to the lead");
+  has(list, "1 sent, 1 replied", "outreach summarised in the table");
+});
+
+await test("lead pages are founder-only and reject unknown ids", async () => {
+  const env = makeEnvWithWebhook();
+  await db.createLead(env, { name: "Thandi", contact_email: "t@b.co.za" });
+  const lead = (await db.getLeads(env))[0];
+  const fl = await seedFreelancer(env);
+  const { session } = await login(env, fl.email, FREELANCER_PW);
+  eq((await worker.fetch(req(`/leads/${lead.id}`, { cookies: { c7_session: session } }), env)).status, 404, "freelancer blocked");
+
+  const founder = await founderSession(env);
+  eq(
+    (await worker.fetch(req("/leads/99999", { cookies: { c7_session: founder.session } }), env)).status,
+    404,
+    "unknown lead id"
+  );
+});
+
 console.log("\nSecurity headers");
 
 await test("every response carries the security header set", async () => {

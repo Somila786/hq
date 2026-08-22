@@ -346,6 +346,61 @@ export async function hashInviteCode(code) {
   return bytesToHex(new Uint8Array(digest));
 }
 
+// ---- Inbound webhooks from Make (C7 webhook standard) ----
+//
+// The endpoint is public -- Make posts from its own infrastructure, with no
+// session and no fixed IP we can rely on. Authenticity comes entirely from an
+// HMAC SHA-256 over the raw body, per the C7 standard's `X-Signature-256`.
+//
+// Verify against the RAW body text, never a re-serialised object: JSON.parse
+// followed by JSON.stringify reorders keys and drops whitespace, which changes
+// the bytes and breaks every signature.
+
+export function makeWebhookConfigured(env) {
+  return !!env.MAKE_WEBHOOK_SECRET;
+}
+
+export async function hmacSha256Hex(secret, message) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
+  return bytesToHex(new Uint8Array(sig));
+}
+
+// Constant-time comparison. A plain === leaks how many leading characters
+// matched via timing, which is enough to forge a signature byte by byte.
+export function timingSafeEqual(a, b) {
+  const x = String(a || "");
+  const y = String(b || "");
+  if (x.length !== y.length) return false;
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x.charCodeAt(i) ^ y.charCodeAt(i);
+  return diff === 0;
+}
+
+// Accepts "sha256=<hex>" or a bare hex digest -- Make's HMAC module and hand
+// rolled scenarios differ on the prefix.
+export async function verifyWebhookSignature(secret, rawBody, header) {
+  if (!secret || !header) return false;
+  const provided = String(header).trim().replace(/^sha256=/i, "");
+  return timingSafeEqual(await hmacSha256Hex(secret, rawBody), provided);
+}
+
+// A signature proves authenticity but not freshness: a captured request could
+// be replayed forever. event_id uniqueness stops duplicates landing twice, and
+// this window stops very old captures being accepted at all.
+export function timestampWithinWindow(iso, maxAgeMs = 7 * 24 * 3600 * 1000) {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return false;
+  const drift = Date.now() - t;
+  return drift <= maxAgeMs && drift >= -5 * 60 * 1000; // 5 min tolerance for clock skew
+}
+
 // ---- MCP connector: HQ as an OAuth 2.1 authorisation server ----
 //
 // Everything above lets HQ act as an OAuth *client* (to Google). This section

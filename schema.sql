@@ -221,3 +221,25 @@ CREATE TABLE IF NOT EXISTS mcp_tokens (
 CREATE INDEX IF NOT EXISTS idx_mcp_tokens_user ON mcp_tokens (user_id, kind);
 CREATE INDEX IF NOT EXISTS idx_oauth_codes_expiry ON oauth_codes (expires_at);
 
+-- ---- Outreach ledger (see migrations/006_outreach_events.sql) ----
+-- What Make actually sent, what came back, what failed. event_id is UNIQUE so
+-- a webhook retry lands once.
+CREATE TABLE IF NOT EXISTS outreach_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id TEXT UNIQUE NOT NULL,
+  lead_id INTEGER REFERENCES leads(id),
+  lead_email TEXT,
+  kind TEXT NOT NULL CHECK(kind IN ('sent','reply','bounce','failed')),
+  sequence TEXT,
+  step TEXT,
+  subject TEXT,
+  detail TEXT,
+  occurred_at TEXT NOT NULL,
+  received_at TEXT DEFAULT (datetime('now')),
+  source TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_outreach_lead ON outreach_events (lead_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_outreach_email ON outreach_events (lead_email);
+CREATE INDEX IF NOT EXISTS idx_outreach_recent ON outreach_events (occurred_at DESC);
+

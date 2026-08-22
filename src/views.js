@@ -305,6 +305,16 @@ h3.sub-label{font-size:13px;font-weight:600;margin:0 0 8px}
 .code-chip{font-family:var(--font-mono);font-size:13.5px;letter-spacing:.04em;background:var(--input-bg);border:1px solid var(--border);border-radius:var(--radius);padding:9px 12px;text-align:center}
 .code-chip.spent{opacity:.45;text-decoration:line-through}
 .codes-warn{font-size:13px;line-height:1.6;max-width:520px}
+
+/* outreach timeline */
+.timeline{list-style:none;margin:0;padding:0}
+.timeline li{display:flex;gap:14px;padding:14px 16px;border-bottom:1px solid var(--border)}
+.timeline li:last-child{border-bottom:none}
+.tl-when{font-family:var(--font-mono);font-size:12px;color:var(--text-muted);white-space:nowrap;min-width:132px}
+.tl-body{flex:1;min-width:0}
+.tl-subject{font-size:13.5px;font-weight:600;word-break:break-word}
+.tl-meta{font-size:12px;color:var(--text-muted);margin-top:3px}
+.lead-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-bottom:var(--sp-5)}
 .link-inline{color:var(--red-text);text-decoration:underline;font-weight:600}
 .title-label{font-size:12px;color:var(--red-text);font-weight:600}
 .title-edit{display:flex;gap:6px;margin-top:7px;max-width:290px}
@@ -770,13 +780,24 @@ export function clientsPage({ user, clients, csrf, theme }) {
 
 // ---------- Founder: Leads ----------
 const STAGES = ["new", "contacted", "qualified", "proposal", "won", "lost"];
-export function leadsPage({ user, leads, csrf, theme }) {
+export function leadsPage({ user, leads, csrf, theme, outreach = {} }) {
   const rows = leads
     .map((l) => {
       const opts = STAGES.map((s) => `<option value="${s}" ${s === l.stage ? "selected" : ""}>${s}</option>`).join("");
       const selCls = l.stage === "won" ? "stage-won" : l.stage === "lost" ? "stage-lost" : "";
       return `<tr>
-      <td class="strong">${esc(l.name)}${l.company ? `<br/><span class="hint">${esc(l.company)}</span>` : ""}</td>
+      <td class="strong"><a href="/leads/${l.id}" class="link-inline" style="text-decoration:none">${esc(l.name)}</a>${
+        l.company ? `<br/><span class="hint">${esc(l.company)}</span>` : ""
+      }</td>
+      <td class="muted">${(() => {
+        const o = outreach[l.id];
+        if (!o) return "—";
+        const bits = [];
+        if (o.sent) bits.push(`${o.sent} sent`);
+        if (o.replies) bits.push(`${o.replies} replied`);
+        if (o.problems) bits.push(`${o.problems} failed`);
+        return bits.length ? esc(bits.join(", ")) : "—";
+      })()}</td>
       <td class="muted">${esc(l.owner || "—")}</td>
       <td class="mono">${l.value_estimate ? money(l.value_estimate) : "—"}</td>
       <td class="right">
@@ -826,11 +847,79 @@ export function leadsPage({ user, leads, csrf, theme }) {
       <div class="table-wrap">
         ${
           rows
-            ? `<table><thead><tr><th>Lead</th><th>Owner</th><th>Value</th><th class="right">Stage</th></tr></thead><tbody>${rows}</tbody></table>`
+            ? `<table><thead><tr><th>Lead</th><th>Outreach</th><th>Owner</th><th>Value</th><th class="right">Stage</th></tr></thead><tbody>${rows}</tbody></table>`
             : `<div class="empty">No leads yet.<br/><label for="add-toggle" class="btn btn-primary" style="margin-top:12px">Add your first lead</label></div>`
         }
       </div>
     </div>
+  `,
+  });
+}
+
+// ---------- Founder: single lead + outreach timeline ----------
+// Step 1 of the CRM work: HQ shows what Make actually did, per lead.
+export function leadDetailPage({ user, lead, events, theme, webhookReady }) {
+  const kindPill = (k) =>
+    k === "reply" ? pill("reply", "green") : k === "sent" ? pill("sent") : pill(k, "red");
+
+  const rows = events.length
+    ? `<ul class="timeline">${events
+        .map(
+          (e) => `<li>
+            <span class="tl-when">${esc(String(e.occurred_at).replace("T", " ").slice(0, 16))}</span>
+            <span class="tl-body">
+              <span class="tl-subject">${esc(e.subject || (e.kind === "reply" ? "Replied" : e.kind === "sent" ? "Email sent" : "Delivery problem"))}</span>
+              <div class="tl-meta">
+                ${kindPill(e.kind)}
+                ${e.sequence ? ` &middot; ${esc(e.sequence)}` : ""}${e.step ? ` step ${esc(e.step)}` : ""}
+                ${e.detail ? `<br/>${esc(e.detail)}` : ""}
+              </div>
+            </span>
+          </li>`
+        )
+        .join("")}</ul>`
+    : `<div class="empty">${
+        webhookReady
+          ? "No outreach recorded for this lead yet. Events appear here as your Make scenario reports them."
+          : "Outreach tracking isn't switched on yet &mdash; see Settings for the webhook setup."
+      }</div>`;
+
+  const sent = events.filter((e) => e.kind === "sent").length;
+  const replies = events.filter((e) => e.kind === "reply").length;
+  const problems = events.filter((e) => e.kind === "bounce" || e.kind === "failed").length;
+
+  return layout({
+    user,
+    active: "leads",
+    title: esc(lead.name),
+    theme,
+    body: `
+    <div class="page-head">
+      <div class="page-title">${esc(lead.name)}</div>
+      <div class="page-sub">
+        ${lead.company ? esc(lead.company) + " &middot; " : ""}${esc(lead.stage)}
+        ${lead.owner ? ` &middot; owner ${esc(lead.owner)}` : ""}
+        ${lead.contact_email ? ` &middot; ${esc(lead.contact_email)}` : " &middot; no email on file"}
+      </div>
+    </div>
+
+    <div class="lead-grid">
+      <div class="metric-card"><div class="metric-label">Emails sent</div><div class="metric-value">${sent}</div></div>
+      <div class="metric-card"><div class="metric-label">Replies</div><div class="metric-value">${replies}</div></div>
+      <div class="metric-card"><div class="metric-label">Delivery problems</div><div class="metric-value">${problems}</div></div>
+      <div class="metric-card"><div class="metric-label">Value estimate</div><div class="metric-value">${
+        lead.value_estimate ? money(lead.value_estimate) : "&mdash;"
+      }</div></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">Outreach activity</div>
+      ${rows}
+    </div>
+
+    ${lead.notes ? `<div class="panel"><div class="panel-head">Notes</div><div class="security-body"><div class="security-copy">${esc(lead.notes)}</div></div></div>` : ""}
+
+    <p><a href="/leads" class="btn btn-sm">Back to leads</a></p>
   `,
   });
 }

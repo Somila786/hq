@@ -37,6 +37,9 @@ import {
   protectedResourceMetadata,
   wwwAuthenticateHeader,
   redirectUriAllowed,
+  makeWebhookConfigured,
+  verifyWebhookSignature,
+  timestampWithinWindow,
   googleConfigured,
   googleAuthUrl,
   exchangeGoogleCode,
@@ -401,6 +404,78 @@ export default {
     const reqIp = clientIp(request);
 
     try {
+      // ---------- Inbound webhook from Make (C7 webhook standard) ----------
+      // Public by necessity -- Make posts from its own infrastructure. All
+      // authenticity comes from the HMAC over the raw body. Dormant until
+      // MAKE_WEBHOOK_SECRET is set, exactly like Google sign-in.
+      if (path === "/webhooks/make" && method === "POST") {
+        if (!makeWebhookConfigured(env)) {
+          return json({ success: false, message: "Webhook not configured." }, 404);
+        }
+
+        // Read the body ONCE as text and verify against those exact bytes.
+        // Re-serialising parsed JSON reorders keys and breaks every signature.
+        const raw = await request.text();
+        const signature = request.headers.get("X-Signature-256") || request.headers.get("x-signature-256");
+        if (!(await verifyWebhookSignature(env.MAKE_WEBHOOK_SECRET, raw, signature))) {
+          await db.logAudit(env, null, "webhook_rejected", "outreach", null, "bad or missing signature", reqIp, "failure");
+          return json({ success: false, message: "Invalid signature." }, 401);
+        }
+
+        let payload;
+        try {
+          payload = JSON.parse(raw);
+        } catch {
+          return json({ success: false, message: "Body must be JSON." }, 400);
+        }
+
+        // C7 envelope: { event_id, timestamp, source, form_name, data }
+        const eventId = payload.event_id;
+        const timestamp = payload.timestamp;
+        const data = payload.data || {};
+        if (!eventId || typeof eventId !== "string") {
+          return json({ success: false, message: "event_id is required." }, 400);
+        }
+        // A valid signature proves authenticity, not freshness. event_id
+        // uniqueness stops duplicates; this stops an old capture being replayed.
+        if (!timestampWithinWindow(timestamp)) {
+          return json({ success: false, message: "timestamp missing, malformed, or outside the accepted window." }, 400);
+        }
+
+        const kindRaw = String(data.kind || payload.form_name || "").toLowerCase();
+        const kind = ["sent", "reply", "bounce", "failed"].includes(kindRaw) ? kindRaw : null;
+        if (!kind) {
+          return json(
+            { success: false, message: "data.kind must be one of: sent, reply, bounce, failed." },
+            400
+          );
+        }
+
+        const email = typeof data.email === "string" ? data.email.trim().toLowerCase() : null;
+        const lead = await db.findLeadByEmail(env, email);
+
+        const stored = await db.recordOutreachEvent(env, {
+          event_id: eventId,
+          lead_id: lead ? lead.id : null,
+          lead_email: email,
+          kind,
+          sequence: typeof data.sequence === "string" ? data.sequence.slice(0, 120) : null,
+          step: data.step === undefined || data.step === null ? null : String(data.step).slice(0, 60),
+          subject: typeof data.subject === "string" ? data.subject.slice(0, 300) : null,
+          detail: typeof data.detail === "string" ? data.detail.slice(0, 1000) : null,
+          occurred_at: new Date(timestamp).toISOString(),
+          source: typeof payload.source === "string" ? payload.source.slice(0, 80) : null,
+        });
+
+        // A duplicate is a success from Make's point of view -- returning an
+        // error would make it retry forever.
+        return json({
+          success: true,
+          message: stored ? "Payload received" : "Payload received (already recorded)",
+          matched_lead: lead ? lead.id : null,
+        });
+      }
+
       // ================= MCP CONNECTOR =================
       // Everything Claude touches lives here: discovery, the OAuth endpoints,
       // and the JSON-RPC endpoint itself. Placed above the browser routes
@@ -1314,8 +1389,25 @@ export default {
 
         // ---- Leads ----
         if (path === "/leads" && method === "GET") {
-          const leads = await db.getLeads(env);
-          return html(views.leadsPage({ user, leads, csrf, theme }));
+          const [leads, outreach] = await Promise.all([db.getLeads(env), db.getOutreachSummary(env)]);
+          return html(views.leadsPage({ user, leads, csrf, theme, outreach }));
+        }
+
+        // Single lead + its outreach timeline. Placed before the /leads/:id/stage
+        // matcher so the bare id doesn't fall through to it.
+        const leadDetail = path.match(/^\/leads\/(\d+)$/);
+        if (leadDetail && method === "GET") {
+          const lead = await db.getLeadById(env, leadDetail[1]);
+          if (!lead) return html(views.errorPage("That lead no longer exists.", 404, theme), 404);
+          return html(
+            views.leadDetailPage({
+              user,
+              lead,
+              events: await db.getOutreachForLead(env, lead.id),
+              theme,
+              webhookReady: makeWebhookConfigured(env),
+            })
+          );
         }
         if (path === "/leads" && method === "POST") {
           const l = await readForm(request);
