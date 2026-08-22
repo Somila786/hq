@@ -2369,6 +2369,240 @@ await test("lead pages are founder-only and reject unknown ids", async () => {
   );
 });
 
+console.log("\nOutreach approval + send trigger (CRM step 2)");
+
+// Stubs the Make endpoint so no real scenario fires during tests.
+function stubMakeEndpoint({ status = 200, body = "Accepted", hang = false } = {}) {
+  const original = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (input, init) => {
+    if (String(input).includes("hook.eu2.make.com")) {
+      calls.push({ url: String(input), headers: init?.headers || {}, body: init?.body });
+      if (hang) await new Promise((r) => setTimeout(r, 50_000));
+      return new Response(body, { status });
+    }
+    return original(input, init);
+  };
+  return {
+    calls,
+    restore: () => {
+      globalThis.fetch = original;
+    },
+  };
+}
+
+function sendingEnv() {
+  const env = makeEnv();
+  env.MAKE_WEBHOOK_SECRET = "shared-secret-for-tests";
+  env.MAKE_OUTREACH_URL = "https://hook.eu2.make.com/abc123";
+  return env;
+}
+
+async function seedLead(env, over = {}) {
+  await db.createLead(env, {
+    name: "Thandi Mokoena",
+    company: "Braamfontein Bakery",
+    contact_email: "thandi@bakery.co.za",
+    stage: "qualified",
+    ...over,
+  });
+  return (await db.getLeads(env))[0];
+}
+
+await test("a new lead starts unapproved and appears in the queue", async () => {
+  const env = sendingEnv();
+  const { session } = await founderSession(env);
+  const lead = await seedLead(env);
+  eq(lead.outreach_status, "pending", "pending by default — nothing is pre-authorised");
+
+  const page = await (await worker.fetch(req("/outreach", { cookies: { c7_session: session } }), env)).text();
+  has(page, "Thandi Mokoena", "shows in the approval queue");
+  has(page, "Awaiting approval", "queue panel");
+});
+
+await test("approving records who decided, and rejecting removes it from the queue", async () => {
+  const env = sendingEnv();
+  const { session, csrf } = await founderSession(env);
+  const lead = await seedLead(env);
+
+  await worker.fetch(
+    req(`/leads/${lead.id}/outreach/approve`, { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf } }),
+    env
+  );
+  let after = await db.getLeadById(env, lead.id);
+  eq(after.outreach_status, "approved", "approved");
+  assert(after.outreach_approved_by, "records who approved it, not just that it happened");
+  assert(after.outreach_approved_at, "and when");
+  assert((await auditActions(env)).includes("outreach_approved"), "audited");
+
+  await worker.fetch(
+    req(`/leads/${lead.id}/outreach/reject`, { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf } }),
+    env
+  );
+  after = await db.getLeadById(env, lead.id);
+  eq(after.outreach_status, "rejected", "rejected");
+  eq(after.outreach_approved_by, null, "approval attribution cleared on reject");
+  eq((await db.getLeadsAwaitingApproval(env)).length, 0, "gone from the queue");
+});
+
+await test("a lead with no email cannot be approved", async () => {
+  const env = sendingEnv();
+  const { session, csrf } = await founderSession(env);
+  const lead = await seedLead(env, { contact_email: null });
+  const res = await worker.fetch(
+    req(`/leads/${lead.id}/outreach/approve`, { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf } }),
+    env
+  );
+  eq(res.status, 400, "refused");
+  eq((await db.getLeadById(env, lead.id)).outreach_status, "pending", "still pending");
+});
+
+await test("an approved lead triggers Make with a signed C7 envelope", async () => {
+  const env = sendingEnv();
+  const { session, csrf } = await founderSession(env);
+  const lead = await seedLead(env);
+  await db.setOutreachStatus(env, lead.id, "approved", "Somila");
+
+  const stub = stubMakeEndpoint({ status: 200, body: "Accepted" });
+  try {
+    const res = await worker.fetch(
+      req(`/leads/${lead.id}/outreach/send`, { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf } }),
+      env
+    );
+    eq(res.status, 302, "redirects back to the lead");
+    eq(stub.calls.length, 1, "Make was called exactly once");
+
+    const call = stub.calls[0];
+    const sig = call.headers["X-Signature-256"] || call.headers["x-signature-256"];
+    assert(sig && sig.startsWith("sha256="), "signed with the shared secret");
+
+    const sent = JSON.parse(call.body);
+    eq(sent.source, "catalyst7_hq", "identifies HQ as the caller");
+    eq(sent.form_name, "outreach_send_v1", "C7 envelope");
+    assert(sent.event_id && sent.timestamp, "envelope fields present");
+    eq(sent.data.email, "thandi@bakery.co.za", "the lead's address");
+    eq(sent.data.first_name, "Thandi", "first name split out for the email template");
+    eq(sent.data.company, "Braamfontein Bakery", "company for merge fields");
+
+    // The send is recorded against the lead using the same event_id Make saw.
+    const events = await db.getOutreachForLead(env, lead.id);
+    eq(events.length, 1, "one event recorded");
+    eq(events[0].kind, "sent", "recorded as sent");
+    eq(events[0].sequence, "hq_manual", "marked as an HQ-triggered send");
+    assert((await db.getLeadById(env, lead.id)).outreach_last_sent_at, "last-sent stamped on the lead");
+    assert((await auditActions(env)).includes("outreach_sent"), "audited");
+  } finally {
+    stub.restore();
+  }
+});
+
+await test("an unapproved lead cannot be sent to, even by forging the request", async () => {
+  const env = sendingEnv();
+  const { session, csrf } = await founderSession(env);
+  const lead = await seedLead(env); // still pending
+
+  const stub = stubMakeEndpoint();
+  try {
+    const res = await worker.fetch(
+      req(`/leads/${lead.id}/outreach/send`, { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf } }),
+      env
+    );
+    eq(res.status, 400, "refused");
+    eq(stub.calls.length, 0, "Make was never called");
+    eq((await db.getOutreachForLead(env, lead.id)).length, 0, "nothing recorded");
+  } finally {
+    stub.restore();
+  }
+});
+
+await test("a failing Make is recorded on the lead, not swallowed", async () => {
+  const env = sendingEnv();
+  const { session, csrf } = await founderSession(env);
+  const lead = await seedLead(env);
+  await db.setOutreachStatus(env, lead.id, "approved", "Somila");
+
+  const stub = stubMakeEndpoint({ status: 500, body: "Scenario failed" });
+  try {
+    await worker.fetch(
+      req(`/leads/${lead.id}/outreach/send`, { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf } }),
+      env
+    );
+    const events = await db.getOutreachForLead(env, lead.id);
+    eq(events.length, 1, "the attempt is still recorded");
+    eq(events[0].kind, "failed", "as a failure, so it's visible on the lead");
+    has(events[0].detail, "500", "with what Make actually returned");
+    eq((await db.getLeadById(env, lead.id)).outreach_last_sent_at, null, "not marked as sent");
+    assert((await auditActions(env)).includes("outreach_send_failed"), "audited as a failure");
+  } finally {
+    stub.restore();
+  }
+});
+
+await test("double-clicking Send only sends once", async () => {
+  const env = sendingEnv();
+  const { session, csrf } = await founderSession(env);
+  const lead = await seedLead(env);
+  await db.setOutreachStatus(env, lead.id, "approved", "Somila");
+
+  const stub = stubMakeEndpoint();
+  try {
+    const nonce = crypto.randomUUID();
+    const send = () =>
+      worker.fetch(
+        req(`/leads/${lead.id}/outreach/send`, {
+          method: "POST",
+          cookies: { c7_session: session },
+          form: { _csrf: csrf, _nonce: nonce },
+        }),
+        env
+      );
+    await send();
+    await send();
+    eq(stub.calls.length, 1, "Make called once, not twice — an email can't be unsent");
+    eq((await db.getOutreachForLead(env, lead.id)).length, 1, "one event");
+  } finally {
+    stub.restore();
+  }
+});
+
+await test("sending is refused entirely when it isn't configured", async () => {
+  const env = makeEnv(); // no MAKE_OUTREACH_URL
+  const { session, csrf } = await founderSession(env);
+  const lead = await seedLead(env);
+  await db.setOutreachStatus(env, lead.id, "approved", "Somila");
+
+  const res = await worker.fetch(
+    req(`/leads/${lead.id}/outreach/send`, { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf } }),
+    env
+  );
+  eq(res.status, 400, "refused rather than half-attempted");
+  eq((await db.getOutreachForLead(env, lead.id)).length, 0, "nothing recorded");
+});
+
+await test("the outreach page and its actions are founder-only and CSRF-guarded", async () => {
+  const env = sendingEnv();
+  const { session } = await founderSession(env);
+  const lead = await seedLead(env);
+
+  const noCsrf = await worker.fetch(
+    req(`/leads/${lead.id}/outreach/approve`, { method: "POST", cookies: { c7_session: session } }),
+    env
+  );
+  eq(noCsrf.status, 403, "approval needs a CSRF token");
+  eq((await db.getLeadById(env, lead.id)).outreach_status, "pending", "unchanged");
+
+  const fl = await seedFreelancer(env);
+  const { session: theirs } = await login(env, fl.email, FREELANCER_PW);
+  eq((await worker.fetch(req("/outreach", { cookies: { c7_session: theirs } }), env)).status, 404, "queue is founder-only");
+  const theirCsrf = await csrfFor(env, theirs);
+  const attempt = await worker.fetch(
+    req(`/leads/${lead.id}/outreach/approve`, { method: "POST", cookies: { c7_session: theirs }, form: { _csrf: theirCsrf } }),
+    env
+  );
+  eq(attempt.status, 404, "a freelancer cannot approve outreach");
+  eq((await db.getLeadById(env, lead.id)).outreach_status, "pending", "still unchanged");
+});
+
 console.log("\nSecurity headers");
 
 await test("every response carries the security header set", async () => {
@@ -2411,7 +2645,7 @@ await test("Referrer-Policy stays permissive enough for /theme/toggle to work", 
 await test("the CSP script hashes match the inline handlers actually emitted", async () => {
   const env = makeEnv();
   const { session, csrf } = await founderSession(env);
-  await db.createLead(env, { name: "Zanele", stage: "new" });
+  await db.createLead(env, { name: "Zanele", stage: "new", contact_email: "zanele@example.com" });
   const lead = (await db.getLeads(env))[0];
   await db.flagForRetentionReview(env, "lead", lead.id, "stale");
   // A second account, so /team renders its revoke button -- that row is hidden
@@ -2431,8 +2665,18 @@ await test("the CSP script hashes match the inline handlers actually emitted", a
 
   // Must cover every page that carries an inline handler, or the
   // no-stale-digests check below fires a false positive.
+  // A lead approved for outreach, with sending configured, so the lead-detail
+  // page renders its confirm() handler. Without this the digest for it would
+  // be missing from the CSP and nothing would notice until it broke live.
+  env.MAKE_OUTREACH_URL = "https://hook.eu2.make.com/test";
+  env.MAKE_WEBHOOK_SECRET = "s";
+  const approved = (await db.getLeads(env))[0];
+  await db.setOutreachStatus(env, approved.id, "approved", "Tester");
+
   const pages = await Promise.all(
-    ["/leads", "/retention", "/team"].map(async (p) => (await worker.fetch(req(p, { cookies: { c7_session: session } }), env)).text())
+    ["/leads", "/retention", "/team", `/leads/${approved.id}`].map(async (p) =>
+      (await worker.fetch(req(p, { cookies: { c7_session: session } }), env)).text()
+    )
   );
 
   // Two kinds of inline script need covering: event-handler attributes (which

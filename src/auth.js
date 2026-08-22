@@ -401,6 +401,74 @@ export function timestampWithinWindow(iso, maxAgeMs = 7 * 24 * 3600 * 1000) {
   return drift <= maxAgeMs && drift >= -5 * 60 * 1000; // 5 min tolerance for clock skew
 }
 
+// ---- Outbound trigger: HQ asks Make to send ----
+//
+// The pipeline is Apify scrapes -> a founder qualifies and approves in HQ ->
+// HQ posts here. Make owns Gmail, the Sheet and the Calendar event; HQ owns
+// the decision and the record.
+//
+// Dormant unless MAKE_OUTREACH_URL is set, so nothing can fire by accident on
+// a deployment that hasn't been configured.
+
+export function outreachSendingConfigured(env) {
+  return !!(env.MAKE_OUTREACH_URL && env.MAKE_WEBHOOK_SECRET);
+}
+
+// The C7 webhook envelope, signed the same way Make signs its posts to us.
+// `data` carries the lead fields Make's Gmail module needs to map.
+export function buildOutreachPayload(lead, actor) {
+  return {
+    event_id: `evt_${crypto.randomUUID()}`,
+    timestamp: new Date().toISOString(),
+    source: "catalyst7_hq",
+    form_name: "outreach_send_v1",
+    data: {
+      lead_id: lead.id,
+      name: lead.name,
+      first_name: String(lead.name || "").trim().split(/\s+/)[0] || "",
+      company: lead.company || "",
+      email: lead.contact_email,
+      stage: lead.stage,
+      owner: lead.owner || "",
+      source: lead.source || "",
+      value_estimate: lead.value_estimate || null,
+      notes: lead.notes || "",
+      approved_by: actor,
+    },
+  };
+}
+
+// Posts to Make and waits for its response. Their scenario ends in a "Webhook
+// response" module, so the answer is synchronous -- HQ learns whether the send
+// worked without needing a callback.
+//
+// The timeout matters: Gmail + Sheets + Calendar in series can take seconds,
+// and a Worker request that hangs on a stalled subrequest is worse than a
+// clean failure the founder can retry.
+export async function triggerOutreach(env, payload, { timeoutMs = 20000 } = {}) {
+  const raw = JSON.stringify(payload);
+  const signature = await hmacSha256Hex(env.MAKE_WEBHOOK_SECRET, raw);
+  try {
+    const res = await fetch(env.MAKE_OUTREACH_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Signature-256": `sha256=${signature}`,
+      },
+      body: raw,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const text = (await res.text().catch(() => "")).slice(0, 500);
+    return { ok: res.ok, status: res.status, body: text };
+  } catch (err) {
+    // A timeout or network failure is reported, never thrown: the caller
+    // records it as a failed send so it is visible on the lead rather than
+    // surfacing as a 500 the founder can't interpret.
+    const timedOut = err && (err.name === "TimeoutError" || err.name === "AbortError");
+    return { ok: false, status: 0, body: timedOut ? `No response within ${timeoutMs / 1000}s` : String(err.message || err) };
+  }
+}
+
 // ---- MCP connector: HQ as an OAuth 2.1 authorisation server ----
 //
 // Everything above lets HQ act as an OAuth *client* (to Google). This section

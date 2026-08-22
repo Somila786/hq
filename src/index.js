@@ -40,6 +40,9 @@ import {
   makeWebhookConfigured,
   verifyWebhookSignature,
   timestampWithinWindow,
+  outreachSendingConfigured,
+  buildOutreachPayload,
+  triggerOutreach,
   googleConfigured,
   googleAuthUrl,
   exchangeGoogleCode,
@@ -73,6 +76,7 @@ const INLINE_SCRIPT_HASHES = [
   "'sha256-osjxnKEPL/pQJbFk1dKsF7PYFmTyMWGmVSiL9inhxJY='", // this.form.submit()
   "'sha256-h8g6LCqXGbG2tO/pvAHBjSIDgOVHHT7/zXTJSzndxl0='", // retention erase confirm()
   "'sha256-sBUkWCcHNuXUK0ODUDXA2EfK7BwSPxu7JXNkACjavvM='", // team revoke-access confirm()
+  "'sha256-VPh6EmarFUR3eK8XxEE0qg1TypUlc8+8kzWciOQ26M0='", // outreach send confirm()
   // THEME_SCRIPT in views.js -- a real <script> block, so this hash alone
   // authorises it; it does not depend on 'unsafe-hashes'.
   "'sha256-HL1QaYdiRLv5+16Djw9KPpJ60rNx9rKFZ0S5NRqVCA0='",
@@ -1405,7 +1409,9 @@ export default {
               lead,
               events: await db.getOutreachForLead(env, lead.id),
               theme,
+              csrf,
               webhookReady: makeWebhookConfigured(env),
+              sendingReady: outreachSendingConfigured(env),
             })
           );
         }
@@ -1426,6 +1432,108 @@ export default {
           await db.updateLeadStage(env, stageMatch[1], f.stage);
           await db.logAudit(env, user, "lead_stage_changed", "lead", stageMatch[1], f.stage, reqIp);
           return redirect("/leads");
+        }
+
+        // ---- Outreach approval gate ----
+        // Nothing is emailed without a founder explicitly approving it. The
+        // decision is recorded against them, not against "the system".
+        const leadDecision = path.match(/^\/leads\/(\d+)\/outreach\/(approve|reject)$/);
+        if (leadDecision && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          const lead = await db.getLeadById(env, leadDecision[1]);
+          if (!lead) return html(views.errorPage("That lead no longer exists.", 404, theme), 404);
+
+          const decision = leadDecision[2] === "approve" ? "approved" : "rejected";
+          if (decision === "approved" && !lead.contact_email) {
+            return html(
+              views.errorPage("That lead has no email address, so it can't be approved for outreach. Add one first.", 400, theme),
+              400
+            );
+          }
+          await db.setOutreachStatus(env, lead.id, decision, user.name);
+          await db.logAudit(env, user, `outreach_${decision}`, "lead", lead.id, `${lead.name}${lead.company ? " (" + lead.company + ")" : ""}`, reqIp);
+          return redirect(f.back === "queue" ? "/outreach" : `/leads/${lead.id}`);
+        }
+
+        // ---- Trigger the send ----
+        const leadSend = path.match(/^\/leads\/(\d+)\/outreach\/send$/);
+        if (leadSend && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          // Double-clicking "Send" must not send twice.
+          if (!(await claimOnce(env, f))) return redirect(`/leads/${leadSend[1]}`);
+
+          const lead = await db.getLeadById(env, leadSend[1]);
+          if (!lead) return html(views.errorPage("That lead no longer exists.", 404, theme), 404);
+
+          if (!outreachSendingConfigured(env)) {
+            return html(
+              views.errorPage("Outreach sending isn't configured yet — MAKE_OUTREACH_URL and MAKE_WEBHOOK_SECRET both need setting.", 400, theme),
+              400
+            );
+          }
+          // Two independent guards, because an accidental send can't be undone.
+          if (lead.outreach_status !== "approved") {
+            return html(views.errorPage("That lead hasn't been approved for outreach yet.", 400, theme), 400);
+          }
+          if (!lead.contact_email) {
+            return html(views.errorPage("That lead has no email address.", 400, theme), 400);
+          }
+
+          const payload = buildOutreachPayload(lead, user.name);
+          const result = await triggerOutreach(env, payload);
+
+          // Record the outcome either way, using the payload's own event_id so
+          // the ledger and what Make received refer to the same thing.
+          await db.recordOutreachEvent(env, {
+            event_id: payload.event_id,
+            lead_id: lead.id,
+            lead_email: lead.contact_email,
+            kind: result.ok ? "sent" : "failed",
+            sequence: "hq_manual",
+            step: null,
+            subject: result.ok ? "Outreach email triggered" : "Send failed",
+            detail: result.ok ? null : `Make returned ${result.status || "no response"}: ${result.body}`.slice(0, 1000),
+            occurred_at: payload.timestamp,
+            source: "catalyst7_hq",
+          });
+
+          if (result.ok) {
+            await db.markOutreachSent(env, lead.id);
+            await db.logAudit(env, user, "outreach_sent", "lead", lead.id, `${lead.name} <${lead.contact_email}>`, reqIp);
+          } else {
+            await db.logAudit(
+              env,
+              user,
+              "outreach_send_failed",
+              "lead",
+              lead.id,
+              `${lead.name}: ${result.status || "no response"}`,
+              reqIp,
+              "failure"
+            );
+          }
+          return redirect(`/leads/${lead.id}`);
+        }
+
+        // ---- The approval queue ----
+        if (path === "/outreach" && method === "GET") {
+          return html(
+            views.outreachQueuePage({
+              user,
+              csrf,
+              theme,
+              queue: await db.getLeadsAwaitingApproval(env),
+              counts: await db.countOutreachQueue(env),
+              recent: await db.getRecentOutreach(env, 25),
+              unmatched: await db.getUnmatchedOutreach(env, 10),
+              sendingReady: outreachSendingConfigured(env),
+              webhookReady: makeWebhookConfigured(env),
+            })
+          );
         }
 
         // ---- Revenue ----

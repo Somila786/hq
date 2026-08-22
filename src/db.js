@@ -43,7 +43,11 @@ export async function setClientStatus(env, id, status) {
 
 export async function getLeads(env) {
   const { results } = await env.DB.prepare(
-    "SELECT * FROM leads ORDER BY CASE stage WHEN 'won' THEN 1 WHEN 'lost' THEN 1 ELSE 0 END, updated_at DESC"
+    `SELECT id, name, company, contact_email, stage, value_estimate, source, owner, notes,
+            created_at, updated_at,
+            COALESCE(outreach_status,'pending') AS outreach_status,
+            outreach_approved_by, outreach_approved_at, outreach_last_sent_at
+     FROM leads ORDER BY CASE stage WHEN 'won' THEN 1 WHEN 'lost' THEN 1 ELSE 0 END, updated_at DESC`
   ).all();
   return results;
 }
@@ -600,7 +604,9 @@ export async function findLeadByEmail(env, email) {
 export async function getLeadById(env, id) {
   return env.DB.prepare(
     `SELECT id, name, company, contact_email, stage, value_estimate, source, owner, notes,
-            created_at, updated_at
+            created_at, updated_at,
+            COALESCE(outreach_status,'pending') AS outreach_status,
+            outreach_approved_by, outreach_approved_at, outreach_last_sent_at
      FROM leads WHERE id = ?`
   )
     .bind(id)
@@ -654,6 +660,48 @@ export async function getUnmatchedOutreach(env, limit = 20) {
     .bind(limit)
     .all();
   return results;
+}
+
+// ---- Outreach approval gate ----
+// Approval is a separate axis from `stage`; only an explicitly approved lead
+// with an email address can be sent to.
+export async function setOutreachStatus(env, id, status, actor) {
+  return env.DB.prepare(
+    `UPDATE leads SET outreach_status = ?,
+            outreach_approved_by = CASE WHEN ? = 'approved' THEN ? ELSE NULL END,
+            outreach_approved_at = CASE WHEN ? = 'approved' THEN datetime('now') ELSE NULL END
+     WHERE id = ?`
+  )
+    .bind(status, status, actor || null, status, id)
+    .run();
+}
+
+export async function markOutreachSent(env, id) {
+  return env.DB.prepare("UPDATE leads SET outreach_last_sent_at = datetime('now') WHERE id = ?").bind(id).run();
+}
+
+// The review queue: everything still awaiting a decision, newest first.
+export async function getLeadsAwaitingApproval(env, limit = 100) {
+  const { results } = await env.DB.prepare(
+    `SELECT id, name, company, contact_email, stage, source, value_estimate, created_at
+     FROM leads
+     WHERE COALESCE(outreach_status,'pending') = 'pending'
+     ORDER BY created_at DESC LIMIT ?`
+  )
+    .bind(limit)
+    .all();
+  return results;
+}
+
+export async function countOutreachQueue(env) {
+  const row = await env.DB.prepare(
+    `SELECT
+       SUM(COALESCE(outreach_status,'pending') = 'pending') AS pending,
+       SUM(outreach_status = 'approved') AS approved,
+       SUM(outreach_status = 'rejected') AS rejected
+     FROM leads`
+  ).first();
+  return { pending: row.pending || 0, approved: row.approved || 0, rejected: row.rejected || 0 };
 }
 
 // ---- Audit log ----

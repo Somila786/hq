@@ -110,14 +110,95 @@ misconfigured scenario is visible rather than silent.
 - **Leads** — an Outreach column summarising sends, replies and failures
 - **Any lead** — click through for the full timeline, newest first, with counts
 
-## Not built yet
+---
 
-Deliberately out of scope for step 1, in the order planned:
+# Step 2 — approving and triggering sends from HQ
 
-2. **Outbound trigger** — a "Start sequence" button that posts to Make
-3. **Sequence definitions** — naming steps and delays inside HQ
-4. **The CRM tab proper** — leads, sequences and activity in one view
-5. **Stop conditions** — a reply drops the lead out of its sequence
+The pipeline: **Apify scrapes → you qualify in HQ → you approve → HQ triggers Make.**
+
+## Set the outbound URL
+
+Add a second Worker variable alongside the secret:
+
+| Name | Type | Value |
+|---|---|---|
+| `MAKE_OUTREACH_URL` | Secret | your scenario's custom-webhook URL |
+
+Until both this and `MAKE_WEBHOOK_SECRET` are set, the Send button stays hidden
+and the send route refuses outright.
+
+## What HQ posts to your scenario
+
+Same C7 envelope, signed the same way, with the lead in `data`:
+
+```json
+{
+  "event_id": "evt_…",
+  "timestamp": "2026-08-06T09:15:00.000Z",
+  "source": "catalyst7_hq",
+  "form_name": "outreach_send_v1",
+  "data": {
+    "lead_id": 3,
+    "name": "Thandi Mokoena",
+    "first_name": "Thandi",
+    "company": "Braamfontein Bakery",
+    "email": "thandi@bakery.co.za",
+    "stage": "qualified",
+    "owner": "Somila",
+    "source": "apify",
+    "value_estimate": 25000,
+    "notes": "",
+    "approved_by": "Somila Tenza Sogaxa"
+  }
+}
+```
+
+`first_name` is split out because Gmail merge fields usually want it.
+
+## ⚠️ Your scenario currently expects Apify's payload
+
+This is the thing most likely to break. Your Gmail module's field mappings are
+bound to whatever Apify sends. When HQ posts the shape above, those mappings
+won't resolve and the email will send blank or fail.
+
+Two ways to handle it:
+
+- **Clone the scenario** (recommended) — one copy triggered by Apify for
+  scraping, one triggered by HQ for sending, each with its own mappings.
+  Nothing that currently works gets touched.
+- **Re-map in place** — point the existing Gmail module at
+  `data.email`, `data.first_name`, `data.company`. Simpler, but you lose the
+  Apify path unless it also sends the same shape.
+
+## What HQ does with the response
+
+Your scenario ends in a **Webhook response** module, so HQ gets the answer
+synchronously:
+
+- **2xx** → recorded as `sent` on the lead, and `outreach_last_sent_at` stamped
+- **Anything else, or no reply within 20 seconds** → recorded as `failed`, with
+  the status and body, and audited as a failure
+
+Either way it lands on the lead's timeline. A send that fails is visible rather
+than silent.
+
+## Guards worth knowing about
+
+- **Nothing sends without an explicit approval.** Approval is separate from
+  `stage` on purpose — moving a deal along the pipeline must never quietly
+  authorise an email.
+- A lead with **no email address** can't be approved at all.
+- **Double-clicking Send sends once.** An email can't be unsent, so the send
+  route uses the same one-time nonce as the other create forms.
+- Approve, reject and send are **founder-only** and CSRF-guarded.
+
+## Still not built
+
+3. **Multi-step sequences** — HQ currently triggers one send per press. Your
+   scenario sends one email, so there is no drip yet on either side.
+4. **Apify → HQ** — scraped leads still have to be added by hand.
+5. **Stop conditions** — a reply doesn't yet halt anything, because nothing in
+   the scenario reports replies.
 
 Opens and clicks were deliberately excluded. Apple Mail Privacy Protection
 pre-fetches images, so open rates are badly inflated and act on nobody's

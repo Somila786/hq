@@ -55,8 +55,17 @@ CREATE TABLE IF NOT EXISTS leads (
   owner TEXT,
   notes TEXT,
   created_at TEXT DEFAULT (datetime('now')),
-  updated_at TEXT DEFAULT (datetime('now'))
+  updated_at TEXT DEFAULT (datetime('now')),
+  -- Approval to be emailed. Deliberately separate from `stage`: stage is where
+  -- the deal is, this is whether a human cleared them for outreach. Conflating
+  -- them would let a pipeline move silently authorise an email.
+  outreach_status TEXT DEFAULT 'pending',
+  outreach_approved_by TEXT,
+  outreach_approved_at TEXT,
+  outreach_last_sent_at TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_leads_outreach ON leads (outreach_status);
 
 CREATE TABLE IF NOT EXISTS weekly_entries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -411,6 +411,74 @@ function timestampWithinWindow(iso, maxAgeMs = 7 * 24 * 3600 * 1000) {
   return drift <= maxAgeMs && drift >= -5 * 60 * 1000; // 5 min tolerance for clock skew
 }
 
+// ---- Outbound trigger: HQ asks Make to send ----
+//
+// The pipeline is Apify scrapes -> a founder qualifies and approves in HQ ->
+// HQ posts here. Make owns Gmail, the Sheet and the Calendar event; HQ owns
+// the decision and the record.
+//
+// Dormant unless MAKE_OUTREACH_URL is set, so nothing can fire by accident on
+// a deployment that hasn't been configured.
+
+function outreachSendingConfigured(env) {
+  return !!(env.MAKE_OUTREACH_URL && env.MAKE_WEBHOOK_SECRET);
+}
+
+// The C7 webhook envelope, signed the same way Make signs its posts to us.
+// `data` carries the lead fields Make's Gmail module needs to map.
+function buildOutreachPayload(lead, actor) {
+  return {
+    event_id: `evt_${crypto.randomUUID()}`,
+    timestamp: new Date().toISOString(),
+    source: "catalyst7_hq",
+    form_name: "outreach_send_v1",
+    data: {
+      lead_id: lead.id,
+      name: lead.name,
+      first_name: String(lead.name || "").trim().split(/\s+/)[0] || "",
+      company: lead.company || "",
+      email: lead.contact_email,
+      stage: lead.stage,
+      owner: lead.owner || "",
+      source: lead.source || "",
+      value_estimate: lead.value_estimate || null,
+      notes: lead.notes || "",
+      approved_by: actor,
+    },
+  };
+}
+
+// Posts to Make and waits for its response. Their scenario ends in a "Webhook
+// response" module, so the answer is synchronous -- HQ learns whether the send
+// worked without needing a callback.
+//
+// The timeout matters: Gmail + Sheets + Calendar in series can take seconds,
+// and a Worker request that hangs on a stalled subrequest is worse than a
+// clean failure the founder can retry.
+async function triggerOutreach(env, payload, { timeoutMs = 20000 } = {}) {
+  const raw = JSON.stringify(payload);
+  const signature = await hmacSha256Hex(env.MAKE_WEBHOOK_SECRET, raw);
+  try {
+    const res = await fetch(env.MAKE_OUTREACH_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Signature-256": `sha256=${signature}`,
+      },
+      body: raw,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const text = (await res.text().catch(() => "")).slice(0, 500);
+    return { ok: res.ok, status: res.status, body: text };
+  } catch (err) {
+    // A timeout or network failure is reported, never thrown: the caller
+    // records it as a failed send so it is visible on the lead rather than
+    // surfacing as a 500 the founder can't interpret.
+    const timedOut = err && (err.name === "TimeoutError" || err.name === "AbortError");
+    return { ok: false, status: 0, body: timedOut ? `No response within ${timeoutMs / 1000}s` : String(err.message || err) };
+  }
+}
+
 // ---- MCP connector: HQ as an OAuth 2.1 authorisation server ----
 //
 // Everything above lets HQ act as an OAuth *client* (to Google). This section
@@ -690,7 +758,11 @@ async function setClientStatus(env, id, status) {
 
 async function getLeads(env) {
   const { results } = await env.DB.prepare(
-    "SELECT * FROM leads ORDER BY CASE stage WHEN 'won' THEN 1 WHEN 'lost' THEN 1 ELSE 0 END, updated_at DESC"
+    `SELECT id, name, company, contact_email, stage, value_estimate, source, owner, notes,
+            created_at, updated_at,
+            COALESCE(outreach_status,'pending') AS outreach_status,
+            outreach_approved_by, outreach_approved_at, outreach_last_sent_at
+     FROM leads ORDER BY CASE stage WHEN 'won' THEN 1 WHEN 'lost' THEN 1 ELSE 0 END, updated_at DESC`
   ).all();
   return results;
 }
@@ -1247,7 +1319,9 @@ async function findLeadByEmail(env, email) {
 async function getLeadById(env, id) {
   return env.DB.prepare(
     `SELECT id, name, company, contact_email, stage, value_estimate, source, owner, notes,
-            created_at, updated_at
+            created_at, updated_at,
+            COALESCE(outreach_status,'pending') AS outreach_status,
+            outreach_approved_by, outreach_approved_at, outreach_last_sent_at
      FROM leads WHERE id = ?`
   )
     .bind(id)
@@ -1301,6 +1375,48 @@ async function getUnmatchedOutreach(env, limit = 20) {
     .bind(limit)
     .all();
   return results;
+}
+
+// ---- Outreach approval gate ----
+// Approval is a separate axis from `stage`; only an explicitly approved lead
+// with an email address can be sent to.
+async function setOutreachStatus(env, id, status, actor) {
+  return env.DB.prepare(
+    `UPDATE leads SET outreach_status = ?,
+            outreach_approved_by = CASE WHEN ? = 'approved' THEN ? ELSE NULL END,
+            outreach_approved_at = CASE WHEN ? = 'approved' THEN datetime('now') ELSE NULL END
+     WHERE id = ?`
+  )
+    .bind(status, status, actor || null, status, id)
+    .run();
+}
+
+async function markOutreachSent(env, id) {
+  return env.DB.prepare("UPDATE leads SET outreach_last_sent_at = datetime('now') WHERE id = ?").bind(id).run();
+}
+
+// The review queue: everything still awaiting a decision, newest first.
+async function getLeadsAwaitingApproval(env, limit = 100) {
+  const { results } = await env.DB.prepare(
+    `SELECT id, name, company, contact_email, stage, source, value_estimate, created_at
+     FROM leads
+     WHERE COALESCE(outreach_status,'pending') = 'pending'
+     ORDER BY created_at DESC LIMIT ?`
+  )
+    .bind(limit)
+    .all();
+  return results;
+}
+
+async function countOutreachQueue(env) {
+  const row = await env.DB.prepare(
+    `SELECT
+       SUM(COALESCE(outreach_status,'pending') = 'pending') AS pending,
+       SUM(outreach_status = 'approved') AS approved,
+       SUM(outreach_status = 'rejected') AS rejected
+     FROM leads`
+  ).first();
+  return { pending: row.pending || 0, approved: row.approved || 0, rejected: row.rejected || 0 };
 }
 
 // ---- Audit log ----
@@ -1421,7 +1537,7 @@ async function runRetentionScan(env) {
   return { leadsFlagged: staleLeads.length, freelancersFlagged: staleFreelancers.length };
 }
 
-return { getFreelancers, getFreelancerById, createFreelancer, setFreelancerActive, getClients, createClient, setClientStatus, getLeads, createLead, updateLeadStage, getRevenueEntries, createRevenueEntry, getWeeklyEntry, upsertWeeklyEntry, getFreelancerHistory, getDashboard, replaceBackupCodes, countUnusedBackupCodes, redeemBackupCode, clearBackupCodes, listUsers, getUserById, getFreelancersWithoutUser, createUser, setUserTitle, reissueSetupToken, revokeUserAccess, countActiveFounders, createInviteCode, findOpenInviteCode, consumeInviteCode, listInviteCodes, revokeInviteCode, countOpenInviteCodes, getUserByEmail, getUserCredentials, claimSubmission, purgeOldSubmissions, bindGoogleSub, registerOAuthClient, getOAuthClient, createAuthCode, consumeAuthCode, storeMcpToken, getMcpTokenUser, consumeRefreshToken, listMcpGrants, revokeMcpGrant, revokeAllMcpTokensForUser, purgeExpiredOAuth, recordOutreachEvent, findLeadByEmail, getLeadById, getOutreachForLead, getRecentOutreach, getOutreachSummary, getUnmatchedOutreach, logAudit, getAuditLog, logError, getErrorLog, flagForRetentionReview, getOpenRetentionFlags, resolveRetentionFlag, eraseLeadPII, eraseFreelancerPII, runRetentionScan };
+return { getFreelancers, getFreelancerById, createFreelancer, setFreelancerActive, getClients, createClient, setClientStatus, getLeads, createLead, updateLeadStage, getRevenueEntries, createRevenueEntry, getWeeklyEntry, upsertWeeklyEntry, getFreelancerHistory, getDashboard, replaceBackupCodes, countUnusedBackupCodes, redeemBackupCode, clearBackupCodes, listUsers, getUserById, getFreelancersWithoutUser, createUser, setUserTitle, reissueSetupToken, revokeUserAccess, countActiveFounders, createInviteCode, findOpenInviteCode, consumeInviteCode, listInviteCodes, revokeInviteCode, countOpenInviteCodes, getUserByEmail, getUserCredentials, claimSubmission, purgeOldSubmissions, bindGoogleSub, registerOAuthClient, getOAuthClient, createAuthCode, consumeAuthCode, storeMcpToken, getMcpTokenUser, consumeRefreshToken, listMcpGrants, revokeMcpGrant, revokeAllMcpTokensForUser, purgeExpiredOAuth, recordOutreachEvent, findLeadByEmail, getLeadById, getOutreachForLead, getRecentOutreach, getOutreachSummary, getUnmatchedOutreach, setOutreachStatus, markOutreachSent, getLeadsAwaitingApproval, countOutreachQueue, logAudit, getAuditLog, logError, getErrorLog, flagForRetentionReview, getOpenRetentionFlags, resolveRetentionFlag, eraseLeadPII, eraseFreelancerPII, runRetentionScan };
 })();
 
 // ===================== src/views.js ====================
@@ -1478,6 +1594,7 @@ const FOUNDER_NAV = [
   ["freelancers", "/freelancers", "Freelancers"],
   ["clients", "/clients", "Clients"],
   ["leads", "/leads", "Leads"],
+  ["outreach", "/outreach", "Outreach"],
   ["revenue", "/revenue", "Revenue"],
   ["team", "/team", "Team"],
   ["audit", "/audit", "Audit"],
@@ -2285,9 +2402,121 @@ function leadsPage({ user, leads, csrf, theme, outreach = {} }) {
   });
 }
 
+// ---------- Founder: outreach approval queue ----------
+// The decision point in the pipeline: Apify scrapes, a founder qualifies and
+// approves here, then HQ triggers Make to send.
+function outreachQueuePage({ user, csrf, theme, queue, counts, recent, unmatched, sendingReady, webhookReady }) {
+  const queueRows = queue
+    .map(
+      (l) => `<tr>
+      <td class="strong"><a href="/leads/${l.id}" class="link-inline" style="text-decoration:none">${esc(l.name)}</a>${
+        l.company ? `<br/><span class="hint">${esc(l.company)}</span>` : ""
+      }</td>
+      <td class="muted">${l.contact_email ? esc(l.contact_email) : `<span class="hint">no email &mdash; can't be approved</span>`}</td>
+      <td class="muted">${esc(l.source || "—")}</td>
+      <td class="mono">${l.value_estimate ? money(l.value_estimate) : "—"}</td>
+      <td class="right">
+        <div class="row-actions">
+          ${
+            l.contact_email
+              ? `<form method="post" action="/leads/${l.id}/outreach/approve">${csrfField(
+                  csrf
+                )}<input type="hidden" name="back" value="queue" /><button type="submit" class="btn btn-sm btn-primary">Approve</button></form>`
+              : ""
+          }
+          <form method="post" action="/leads/${l.id}/outreach/reject">${csrfField(
+            csrf
+          )}<input type="hidden" name="back" value="queue" /><button type="submit" class="btn btn-sm">Reject</button></form>
+        </div>
+      </td>
+    </tr>`
+    )
+    .join("");
+
+  const activityRows = recent
+    .map(
+      (e) => `<tr>
+      <td class="mono muted nowrap">${esc(String(e.occurred_at).replace("T", " ").slice(0, 16))}</td>
+      <td class="strong">${
+        e.lead_id ? `<a href="/leads/${e.lead_id}" class="link-inline" style="text-decoration:none">${esc(e.lead_name || e.lead_email)}</a>` : esc(e.lead_email || "—")
+      }</td>
+      <td>${
+        e.kind === "reply" ? pill("reply", "green") : e.kind === "sent" ? pill("sent") : pill(e.kind, "red")
+      }</td>
+      <td class="detail">${esc(e.subject || e.detail || "—")}</td>
+    </tr>`
+    )
+    .join("");
+
+  return layout({
+    user,
+    active: "outreach",
+    title: "Outreach",
+    theme,
+    body: `
+    <div class="page-head">
+      <div class="page-title">Outreach</div>
+      <div class="page-sub">Qualify and approve who gets emailed, then trigger the send. Nothing leaves HQ without an explicit approval.</div>
+    </div>
+
+    ${
+      !sendingReady
+        ? `<div class="msg msg-error">Sending isn't switched on yet. Set <strong>MAKE_OUTREACH_URL</strong> and <strong>MAKE_WEBHOOK_SECRET</strong> in the Worker's settings, then the Send button becomes active. You can still qualify and approve in the meantime.</div>`
+        : ""
+    }
+    ${
+      !webhookReady
+        ? `<div class="msg msg-error">Inbound tracking isn't switched on &mdash; set <strong>MAKE_WEBHOOK_SECRET</strong> so Make can report what it sent.</div>`
+        : ""
+    }
+
+    <div class="metrics-grid">
+      <div class="metric-card"><div class="metric-label">Awaiting your decision</div><div class="metric-value">${counts.pending}</div></div>
+      <div class="metric-card"><div class="metric-label">Approved to email</div><div class="metric-value">${counts.approved}</div></div>
+      <div class="metric-card"><div class="metric-label">Rejected</div><div class="metric-value">${counts.rejected}</div></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">Awaiting approval</div>
+      <div class="table-wrap">
+        ${
+          queueRows
+            ? `<table><thead><tr><th>Lead</th><th>Email</th><th>Source</th><th>Value</th><th class="right">Decision</th></tr></thead><tbody>${queueRows}</tbody></table>`
+            : `<div class="empty">Nothing waiting. Scraped leads land here for you to qualify before anyone is emailed.</div>`
+        }
+      </div>
+    </div>
+
+    <h2 class="section-label" style="margin-top:32px">Recent email activity</h2>
+    <div class="panel">
+      <div class="table-wrap">
+        ${
+          activityRows
+            ? `<table><thead><tr><th>When</th><th>Lead</th><th>What</th><th>Detail</th></tr></thead><tbody>${activityRows}</tbody></table>`
+            : `<div class="empty">No outreach activity recorded yet.</div>`
+        }
+      </div>
+    </div>
+
+    ${
+      unmatched.length
+        ? `<h2 class="section-label" style="margin-top:32px">Sent to addresses not in the pipeline</h2>
+           <div class="panel"><div class="table-wrap"><table><thead><tr><th>When</th><th>Address</th><th>What</th></tr></thead><tbody>${unmatched
+             .map(
+               (u) => `<tr><td class="mono muted nowrap">${esc(String(u.occurred_at).replace("T", " ").slice(0, 16))}</td>
+               <td class="strong">${esc(u.lead_email || "—")}</td><td class="muted">${esc(u.kind)}</td></tr>`
+             )
+             .join("")}</tbody></table></div></div>
+           <div class="hint" style="margin-top:8px">Usually a typo in the address, or a lead removed while a sequence was running.</div>`
+        : ""
+    }
+  `,
+  });
+}
+
 // ---------- Founder: single lead + outreach timeline ----------
 // Step 1 of the CRM work: HQ shows what Make actually did, per lead.
-function leadDetailPage({ user, lead, events, theme, webhookReady }) {
+function leadDetailPage({ user, lead, events, theme, webhookReady, csrf, sendingReady = false }) {
   const kindPill = (k) =>
     k === "reply" ? pill("reply", "green") : k === "sent" ? pill("sent") : pill(k, "red");
 
@@ -2339,6 +2568,50 @@ function leadDetailPage({ user, lead, events, theme, webhookReady }) {
       <div class="metric-card"><div class="metric-label">Value estimate</div><div class="metric-value">${
         lead.value_estimate ? money(lead.value_estimate) : "&mdash;"
       }</div></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">Outreach</div>
+      <div class="security-body">
+        <div class="security-status">${
+          lead.outreach_status === "approved"
+            ? pill("approved to email", "green")
+            : lead.outreach_status === "rejected"
+              ? pill("rejected", "red")
+              : pill("awaiting your decision")
+        }${lead.outreach_approved_by ? ` <span class="hint">by ${esc(lead.outreach_approved_by)}</span>` : ""}</div>
+        <div class="row-actions" style="justify-content:flex-start;gap:10px;margin-top:12px">
+          ${
+            lead.outreach_status !== "approved" && lead.contact_email
+              ? `<form method="post" action="/leads/${lead.id}/outreach/approve">${csrfField(csrf)}<button type="submit" class="btn btn-primary">Approve for outreach</button></form>`
+              : ""
+          }
+          ${
+            lead.outreach_status !== "rejected"
+              ? `<form method="post" action="/leads/${lead.id}/outreach/reject">${csrfField(csrf)}<button type="submit" class="btn">Reject</button></form>`
+              : ""
+          }
+          ${
+            lead.outreach_status === "approved" && lead.contact_email && sendingReady
+              ? `<form method="post" action="/leads/${lead.id}/outreach/send" onsubmit="return confirm('Send the outreach email to this lead now?');">${csrfField(
+                  csrf
+                )}<button type="submit" class="btn btn-primary">Send outreach email</button></form>`
+              : ""
+          }
+        </div>
+        ${
+          !lead.contact_email
+            ? `<div class="hint" style="margin-top:10px">No email address on this lead, so it can't be approved or sent to.</div>`
+            : lead.outreach_status === "approved" && !sendingReady
+              ? `<div class="hint" style="margin-top:10px">Approved, but sending isn't configured yet &mdash; see the Outreach page.</div>`
+              : ""
+        }
+        ${
+          lead.outreach_last_sent_at
+            ? `<div class="hint" style="margin-top:10px">Last sent ${esc(String(lead.outreach_last_sent_at).replace("T", " ").slice(0, 16))}.</div>`
+            : ""
+        }
+      </div>
     </div>
 
     <div class="panel">
@@ -2935,7 +3208,7 @@ function errorPage(message, status = 400, theme = "dark") {
   });
 }
 
-return { loginPage, registerPage, totpVerifyPage, setupPage, securityPage, dashboardPage, freelancersPage, clientsPage, leadsPage, leadDetailPage, revenuePage, logPage, historyPage, consentPage, mcpAboutPage, teamPage, auditPage, errorsPage, retentionPage, restrictedPage, errorPage };
+return { loginPage, registerPage, totpVerifyPage, setupPage, securityPage, dashboardPage, freelancersPage, clientsPage, leadsPage, outreachQueuePage, leadDetailPage, revenuePage, logPage, historyPage, consentPage, mcpAboutPage, teamPage, auditPage, errorsPage, retentionPage, restrictedPage, errorPage };
 })();
 
 // ===================== src/index.js ====================
@@ -2959,6 +3232,7 @@ const INLINE_SCRIPT_HASHES = [
   "'sha256-osjxnKEPL/pQJbFk1dKsF7PYFmTyMWGmVSiL9inhxJY='", // this.form.submit()
   "'sha256-h8g6LCqXGbG2tO/pvAHBjSIDgOVHHT7/zXTJSzndxl0='", // retention erase confirm()
   "'sha256-sBUkWCcHNuXUK0ODUDXA2EfK7BwSPxu7JXNkACjavvM='", // team revoke-access confirm()
+  "'sha256-VPh6EmarFUR3eK8XxEE0qg1TypUlc8+8kzWciOQ26M0='", // outreach send confirm()
   // THEME_SCRIPT in views.js -- a real <script> block, so this hash alone
   // authorises it; it does not depend on 'unsafe-hashes'.
   "'sha256-HL1QaYdiRLv5+16Djw9KPpJ60rNx9rKFZ0S5NRqVCA0='",
@@ -4291,7 +4565,9 @@ export default {
               lead,
               events: await db.getOutreachForLead(env, lead.id),
               theme,
+              csrf,
               webhookReady: makeWebhookConfigured(env),
+              sendingReady: outreachSendingConfigured(env),
             })
           );
         }
@@ -4312,6 +4588,108 @@ export default {
           await db.updateLeadStage(env, stageMatch[1], f.stage);
           await db.logAudit(env, user, "lead_stage_changed", "lead", stageMatch[1], f.stage, reqIp);
           return redirect("/leads");
+        }
+
+        // ---- Outreach approval gate ----
+        // Nothing is emailed without a founder explicitly approving it. The
+        // decision is recorded against them, not against "the system".
+        const leadDecision = path.match(/^\/leads\/(\d+)\/outreach\/(approve|reject)$/);
+        if (leadDecision && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          const lead = await db.getLeadById(env, leadDecision[1]);
+          if (!lead) return html(views.errorPage("That lead no longer exists.", 404, theme), 404);
+
+          const decision = leadDecision[2] === "approve" ? "approved" : "rejected";
+          if (decision === "approved" && !lead.contact_email) {
+            return html(
+              views.errorPage("That lead has no email address, so it can't be approved for outreach. Add one first.", 400, theme),
+              400
+            );
+          }
+          await db.setOutreachStatus(env, lead.id, decision, user.name);
+          await db.logAudit(env, user, `outreach_${decision}`, "lead", lead.id, `${lead.name}${lead.company ? " (" + lead.company + ")" : ""}`, reqIp);
+          return redirect(f.back === "queue" ? "/outreach" : `/leads/${lead.id}`);
+        }
+
+        // ---- Trigger the send ----
+        const leadSend = path.match(/^\/leads\/(\d+)\/outreach\/send$/);
+        if (leadSend && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          // Double-clicking "Send" must not send twice.
+          if (!(await claimOnce(env, f))) return redirect(`/leads/${leadSend[1]}`);
+
+          const lead = await db.getLeadById(env, leadSend[1]);
+          if (!lead) return html(views.errorPage("That lead no longer exists.", 404, theme), 404);
+
+          if (!outreachSendingConfigured(env)) {
+            return html(
+              views.errorPage("Outreach sending isn't configured yet — MAKE_OUTREACH_URL and MAKE_WEBHOOK_SECRET both need setting.", 400, theme),
+              400
+            );
+          }
+          // Two independent guards, because an accidental send can't be undone.
+          if (lead.outreach_status !== "approved") {
+            return html(views.errorPage("That lead hasn't been approved for outreach yet.", 400, theme), 400);
+          }
+          if (!lead.contact_email) {
+            return html(views.errorPage("That lead has no email address.", 400, theme), 400);
+          }
+
+          const payload = buildOutreachPayload(lead, user.name);
+          const result = await triggerOutreach(env, payload);
+
+          // Record the outcome either way, using the payload's own event_id so
+          // the ledger and what Make received refer to the same thing.
+          await db.recordOutreachEvent(env, {
+            event_id: payload.event_id,
+            lead_id: lead.id,
+            lead_email: lead.contact_email,
+            kind: result.ok ? "sent" : "failed",
+            sequence: "hq_manual",
+            step: null,
+            subject: result.ok ? "Outreach email triggered" : "Send failed",
+            detail: result.ok ? null : `Make returned ${result.status || "no response"}: ${result.body}`.slice(0, 1000),
+            occurred_at: payload.timestamp,
+            source: "catalyst7_hq",
+          });
+
+          if (result.ok) {
+            await db.markOutreachSent(env, lead.id);
+            await db.logAudit(env, user, "outreach_sent", "lead", lead.id, `${lead.name} <${lead.contact_email}>`, reqIp);
+          } else {
+            await db.logAudit(
+              env,
+              user,
+              "outreach_send_failed",
+              "lead",
+              lead.id,
+              `${lead.name}: ${result.status || "no response"}`,
+              reqIp,
+              "failure"
+            );
+          }
+          return redirect(`/leads/${lead.id}`);
+        }
+
+        // ---- The approval queue ----
+        if (path === "/outreach" && method === "GET") {
+          return html(
+            views.outreachQueuePage({
+              user,
+              csrf,
+              theme,
+              queue: await db.getLeadsAwaitingApproval(env),
+              counts: await db.countOutreachQueue(env),
+              recent: await db.getRecentOutreach(env, 25),
+              unmatched: await db.getUnmatchedOutreach(env, 10),
+              sendingReady: outreachSendingConfigured(env),
+              webhookReady: makeWebhookConfigured(env),
+            })
+          );
         }
 
         // ---- Revenue ----

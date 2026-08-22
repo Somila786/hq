@@ -49,6 +49,7 @@ const FOUNDER_NAV = [
   ["freelancers", "/freelancers", "Freelancers"],
   ["clients", "/clients", "Clients"],
   ["leads", "/leads", "Leads"],
+  ["outreach", "/outreach", "Outreach"],
   ["revenue", "/revenue", "Revenue"],
   ["team", "/team", "Team"],
   ["audit", "/audit", "Audit"],
@@ -856,9 +857,121 @@ export function leadsPage({ user, leads, csrf, theme, outreach = {} }) {
   });
 }
 
+// ---------- Founder: outreach approval queue ----------
+// The decision point in the pipeline: Apify scrapes, a founder qualifies and
+// approves here, then HQ triggers Make to send.
+export function outreachQueuePage({ user, csrf, theme, queue, counts, recent, unmatched, sendingReady, webhookReady }) {
+  const queueRows = queue
+    .map(
+      (l) => `<tr>
+      <td class="strong"><a href="/leads/${l.id}" class="link-inline" style="text-decoration:none">${esc(l.name)}</a>${
+        l.company ? `<br/><span class="hint">${esc(l.company)}</span>` : ""
+      }</td>
+      <td class="muted">${l.contact_email ? esc(l.contact_email) : `<span class="hint">no email &mdash; can't be approved</span>`}</td>
+      <td class="muted">${esc(l.source || "—")}</td>
+      <td class="mono">${l.value_estimate ? money(l.value_estimate) : "—"}</td>
+      <td class="right">
+        <div class="row-actions">
+          ${
+            l.contact_email
+              ? `<form method="post" action="/leads/${l.id}/outreach/approve">${csrfField(
+                  csrf
+                )}<input type="hidden" name="back" value="queue" /><button type="submit" class="btn btn-sm btn-primary">Approve</button></form>`
+              : ""
+          }
+          <form method="post" action="/leads/${l.id}/outreach/reject">${csrfField(
+            csrf
+          )}<input type="hidden" name="back" value="queue" /><button type="submit" class="btn btn-sm">Reject</button></form>
+        </div>
+      </td>
+    </tr>`
+    )
+    .join("");
+
+  const activityRows = recent
+    .map(
+      (e) => `<tr>
+      <td class="mono muted nowrap">${esc(String(e.occurred_at).replace("T", " ").slice(0, 16))}</td>
+      <td class="strong">${
+        e.lead_id ? `<a href="/leads/${e.lead_id}" class="link-inline" style="text-decoration:none">${esc(e.lead_name || e.lead_email)}</a>` : esc(e.lead_email || "—")
+      }</td>
+      <td>${
+        e.kind === "reply" ? pill("reply", "green") : e.kind === "sent" ? pill("sent") : pill(e.kind, "red")
+      }</td>
+      <td class="detail">${esc(e.subject || e.detail || "—")}</td>
+    </tr>`
+    )
+    .join("");
+
+  return layout({
+    user,
+    active: "outreach",
+    title: "Outreach",
+    theme,
+    body: `
+    <div class="page-head">
+      <div class="page-title">Outreach</div>
+      <div class="page-sub">Qualify and approve who gets emailed, then trigger the send. Nothing leaves HQ without an explicit approval.</div>
+    </div>
+
+    ${
+      !sendingReady
+        ? `<div class="msg msg-error">Sending isn't switched on yet. Set <strong>MAKE_OUTREACH_URL</strong> and <strong>MAKE_WEBHOOK_SECRET</strong> in the Worker's settings, then the Send button becomes active. You can still qualify and approve in the meantime.</div>`
+        : ""
+    }
+    ${
+      !webhookReady
+        ? `<div class="msg msg-error">Inbound tracking isn't switched on &mdash; set <strong>MAKE_WEBHOOK_SECRET</strong> so Make can report what it sent.</div>`
+        : ""
+    }
+
+    <div class="metrics-grid">
+      <div class="metric-card"><div class="metric-label">Awaiting your decision</div><div class="metric-value">${counts.pending}</div></div>
+      <div class="metric-card"><div class="metric-label">Approved to email</div><div class="metric-value">${counts.approved}</div></div>
+      <div class="metric-card"><div class="metric-label">Rejected</div><div class="metric-value">${counts.rejected}</div></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">Awaiting approval</div>
+      <div class="table-wrap">
+        ${
+          queueRows
+            ? `<table><thead><tr><th>Lead</th><th>Email</th><th>Source</th><th>Value</th><th class="right">Decision</th></tr></thead><tbody>${queueRows}</tbody></table>`
+            : `<div class="empty">Nothing waiting. Scraped leads land here for you to qualify before anyone is emailed.</div>`
+        }
+      </div>
+    </div>
+
+    <h2 class="section-label" style="margin-top:32px">Recent email activity</h2>
+    <div class="panel">
+      <div class="table-wrap">
+        ${
+          activityRows
+            ? `<table><thead><tr><th>When</th><th>Lead</th><th>What</th><th>Detail</th></tr></thead><tbody>${activityRows}</tbody></table>`
+            : `<div class="empty">No outreach activity recorded yet.</div>`
+        }
+      </div>
+    </div>
+
+    ${
+      unmatched.length
+        ? `<h2 class="section-label" style="margin-top:32px">Sent to addresses not in the pipeline</h2>
+           <div class="panel"><div class="table-wrap"><table><thead><tr><th>When</th><th>Address</th><th>What</th></tr></thead><tbody>${unmatched
+             .map(
+               (u) => `<tr><td class="mono muted nowrap">${esc(String(u.occurred_at).replace("T", " ").slice(0, 16))}</td>
+               <td class="strong">${esc(u.lead_email || "—")}</td><td class="muted">${esc(u.kind)}</td></tr>`
+             )
+             .join("")}</tbody></table></div></div>
+           <div class="hint" style="margin-top:8px">Usually a typo in the address, or a lead removed while a sequence was running.</div>`
+        : ""
+    }
+  `,
+  });
+}
+
 // ---------- Founder: single lead + outreach timeline ----------
 // Step 1 of the CRM work: HQ shows what Make actually did, per lead.
-export function leadDetailPage({ user, lead, events, theme, webhookReady }) {
+export function leadDetailPage({ user, lead, events, theme, webhookReady, csrf, sendingReady = false }) {
   const kindPill = (k) =>
     k === "reply" ? pill("reply", "green") : k === "sent" ? pill("sent") : pill(k, "red");
 
@@ -910,6 +1023,50 @@ export function leadDetailPage({ user, lead, events, theme, webhookReady }) {
       <div class="metric-card"><div class="metric-label">Value estimate</div><div class="metric-value">${
         lead.value_estimate ? money(lead.value_estimate) : "&mdash;"
       }</div></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">Outreach</div>
+      <div class="security-body">
+        <div class="security-status">${
+          lead.outreach_status === "approved"
+            ? pill("approved to email", "green")
+            : lead.outreach_status === "rejected"
+              ? pill("rejected", "red")
+              : pill("awaiting your decision")
+        }${lead.outreach_approved_by ? ` <span class="hint">by ${esc(lead.outreach_approved_by)}</span>` : ""}</div>
+        <div class="row-actions" style="justify-content:flex-start;gap:10px;margin-top:12px">
+          ${
+            lead.outreach_status !== "approved" && lead.contact_email
+              ? `<form method="post" action="/leads/${lead.id}/outreach/approve">${csrfField(csrf)}<button type="submit" class="btn btn-primary">Approve for outreach</button></form>`
+              : ""
+          }
+          ${
+            lead.outreach_status !== "rejected"
+              ? `<form method="post" action="/leads/${lead.id}/outreach/reject">${csrfField(csrf)}<button type="submit" class="btn">Reject</button></form>`
+              : ""
+          }
+          ${
+            lead.outreach_status === "approved" && lead.contact_email && sendingReady
+              ? `<form method="post" action="/leads/${lead.id}/outreach/send" onsubmit="return confirm('Send the outreach email to this lead now?');">${csrfField(
+                  csrf
+                )}<button type="submit" class="btn btn-primary">Send outreach email</button></form>`
+              : ""
+          }
+        </div>
+        ${
+          !lead.contact_email
+            ? `<div class="hint" style="margin-top:10px">No email address on this lead, so it can't be approved or sent to.</div>`
+            : lead.outreach_status === "approved" && !sendingReady
+              ? `<div class="hint" style="margin-top:10px">Approved, but sending isn't configured yet &mdash; see the Outreach page.</div>`
+              : ""
+        }
+        ${
+          lead.outreach_last_sent_at
+            ? `<div class="hint" style="margin-top:10px">Last sent ${esc(String(lead.outreach_last_sent_at).replace("T", " ").slice(0, 16))}.</div>`
+            : ""
+        }
+      </div>
     </div>
 
     <div class="panel">
