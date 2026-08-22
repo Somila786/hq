@@ -59,7 +59,7 @@ Your domain is already on Cloudflare (same account as this Worker), so:
 
 ## Day-to-day use
 
-- **Founders** (`/dashboard`, `/freelancers`, `/clients`, `/leads`, `/revenue`): log revenue and lead/client changes as they happen; check the dashboard weekly for the freelancer-hours vs last week, revenue vs last week, pipeline value, and who hasn't logged their week yet.
+- **Founders** (`/dashboard`, `/freelancers`, `/clients`, `/leads`, `/outreach`, `/calls`, `/revenue`): log revenue and lead/client changes as they happen; check the dashboard weekly for the freelancer-hours vs last week, revenue vs last week, pipeline value, and who hasn't logged their week yet.
 - **Freelancers** (`/log`): after you generate their invite link from the Freelancers page and send it to them, they set their own password and log hours/deliverables/status each week from `/log`. They only ever see and edit their own row.
 - **Team** (`/team`, founders only): add founders and freelancers, hand out one-time invite links, and revoke access when someone leaves. Revoking signs them out everywhere immediately and keeps their history intact — nothing is deleted.
 - **Weeks** run Monday–Sunday (UTC). Revenue entries are tagged to a "week starting" date you pick when logging them, so you can backfill if needed.
@@ -110,7 +110,7 @@ If a user has 2FA switched on, Google sign-in **still** asks for their second fa
 
 - **Login rate limiting** — 5 failed attempts on one account, or 20 failed attempts from one network, locks logins for 15 minutes. Same limiter also protects the 2FA code step.
 - **CSRF protection** — every form on every page carries a token bound to your session; the server rejects any POST where it doesn't match. Tested: a POST without the token gets a 403, not a silent failure.
-- **Audit log** (`/audit`, founders only) — every create/update action records who did it, when, and what changed: freelancers added/invited/toggled, clients/leads/revenue created, lead stage changes, 2FA enabled/disabled, retention decisions.
+- **Audit log** (`/audit`, founders only) — every create/update action records who did it, when, and what changed: freelancers added/invited/toggled, clients/leads/revenue created, lead stage changes, outreach approved/rejected/sent, calls logged and reopened, 2FA enabled/disabled, retention decisions.
 - **Optional 2FA** (`/security`, any account) — standard TOTP, works with Google Authenticator, Authy, 1Password, etc. No external library — implemented directly against Workers' Web Crypto API and cross-checked against an independent Python HMAC-SHA1 implementation to confirm it's RFC 6238-correct. Recommended for founder accounts.
 - **Error log** (`/errors`, founders only) — unhandled application errors land here with path and message. Cloudflare's own Workers Analytics (dashboard → catalyst7-kpi → Metrics) covers request volume/latency/uptime on top of this for free, zero setup.
 - **Retention review** (`/retention`, founders only) — a Cron Trigger runs monthly (1st, 03:00 UTC) and flags lost leads and inactive freelancers with 365+ days of no activity. It never deletes anything itself — a founder reviews each flag and chooses "Keep" or "Erase personal info" (name/email/contact cleared, financial history like past revenue/hours stays intact for accurate historical reporting).

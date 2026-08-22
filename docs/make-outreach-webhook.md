@@ -192,14 +192,80 @@ than silent.
   route uses the same one-time nonce as the other create forms.
 - Approve, reject and send are **founder-only** and CSRF-guarded.
 
-## Still not built
-
-3. **Multi-step sequences** — HQ currently triggers one send per press. Your
-   scenario sends one email, so there is no drip yet on either side.
-4. **Apify → HQ** — scraped leads still have to be added by hand.
-5. **Stop conditions** — a reply doesn't yet halt anything, because nothing in
-   the scenario reports replies.
-
 Opens and clicks were deliberately excluded. Apple Mail Privacy Protection
 pre-fetches images, so open rates are badly inflated and act on nobody's
 behalf; replies and bounces are the signals worth acting on.
+
+---
+
+# Step 3 — the call window and outcome log
+
+**This is Sequence B's step 9**, the one the Call-Timing Decision Log lists as
+having *"no tool — human, off the tracker"*, and whose only stated drawback is
+*"needs a tracked window per lead — a scheduling/reminder mechanism not yet
+built."* This is that mechanism.
+
+Nothing to configure. It switches itself on the first time a send succeeds.
+
+## How it works
+
+1. A send succeeds → HQ stamps a **call window** on the lead, closing 18 hours
+   later. The window and the send are written in one statement, so there is no
+   path that records a send without also putting the call on the tracker.
+2. The lead appears on **`/calls`**, sorted by how overdue it is.
+3. You call, pick an outcome, and hit **Log call**.
+
+A failed send opens **no** window. If the email never left, calling would be a
+cold call, not Sequence B.
+
+## Changing the window
+
+| Name | Type | Value |
+|---|---|---|
+| `CALL_WINDOW_HOURS` | Variable | hours from send to call, default `18` |
+
+18 hours is the default because the decision log says "same day or next
+morning", and 18 hours lands there from either a morning or an afternoon send.
+Values are clamped to 1–168: a window of 0 would make every lead due instantly
+and the queue meaningless, and 100000 would hide the queue forever. Both fail
+quietly, which is worse than failing loudly.
+
+## The outcomes
+
+| Outcome | Means |
+|---|---|
+| `picked_up_cold` | Answered the call, had not replied to the email first |
+| `replied_first` | Had already replied before the call landed |
+| `no_response` | No reply, and the call went unanswered |
+| `skipped` | Deliberately not called |
+
+The first three are the comparable data the sequence exists to produce. The
+page counts `skipped` but keeps it out of that comparison — a call that never
+happened says nothing about whether calling works.
+
+## Two things it deliberately does not do
+
+- **It does not hide leads who replied.** Sequence B calls everyone, and that
+  is what makes the three buckets comparable. Filtering repliers out would bias
+  the data toward the least engaged half of every batch. The queue flags them
+  as *replied — call anyway* instead.
+- **It does not refuse an early call.** A window still open shows as waiting,
+  but the log form is live the whole time. A tool that blocked a same-day call
+  would be fighting the operator.
+
+## Corrections
+
+**Logged by mistake — reopen** on the lead clears the outcome and puts it back
+in the queue. It keeps the original window, because a correction is not a new
+send, and it leaves the logged call on the timeline. A correction doesn't get
+to rewrite what was done. Both the log and the reopen are audited.
+
+## Still not built
+
+- **Multi-step sequences** — HQ triggers one send per press. Your scenario
+  sends one email, so there is no drip yet on either side.
+- **Apify → HQ** — scraped leads still have to be added by hand.
+- **Stop conditions** — a reply doesn't halt anything. Under Sequence B that is
+  correct for the call, which happens regardless; it would matter for a drip.
+- **Reminders that reach you** — `/calls` has to be opened. There is no push,
+  no email, no calendar entry.

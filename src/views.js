@@ -38,9 +38,41 @@ function delta(curr, prev) {
   return { text: "flat vs last wk", cls: "flat" };
 }
 
+// D1 stores datetimes as UTC "YYYY-MM-DD HH:MM:SS". The rest of the app prints
+// them raw, which is fine for a log. It is not fine for a call queue: a founder
+// in SAST reading "due 04:00" has to do timezone arithmetic before knowing
+// whether to pick up the phone.
+//
+// So the queue leads with a relative duration instead. Relative durations are
+// timezone-free, and "overdue by 2 days" is the thing being asked anyway. The
+// absolute stamp stays available, explicitly labelled UTC, as the secondary.
+function sqlUtcToMs(v) {
+  if (!v) return NaN;
+  const t = String(v).trim().replace(" ", "T");
+  return Date.parse(/[Zz]|[+-]\d\d:?\d\d$/.test(t) ? t : t + "Z");
+}
+
+function humanGap(ms) {
+  const mins = Math.round(Math.abs(ms) / 60000);
+  if (mins < 60) return `${mins} min`;
+  const hours = Math.round(mins / 60);
+  if (hours < 48) return `${hours} hour${hours === 1 ? "" : "s"}`;
+  return `${Math.round(hours / 24)} days`;
+}
+
+// Returns null when there is no window, so callers can distinguish "not due for
+// a while" from "never scheduled".
+function callDue(dueAt, now = Date.now()) {
+  const due = sqlUtcToMs(dueAt);
+  if (!Number.isFinite(due)) return null;
+  const diff = due - now;
+  if (diff <= 0) return { due: true, text: diff > -60000 ? "Due now" : `Overdue by ${humanGap(diff)}`, cls: "red" };
+  return { due: false, text: `Due in ${humanGap(diff)}`, cls: "" };
+}
+
 // pill kind: "green" | "red" | "" (muted/default)
-function pill(label, kind = "") {
-  const cls = kind ? `pill pill-${kind}` : "pill";
+function pill(label, kind = "", plain = false) {
+  const cls = ["pill", kind ? `pill-${kind}` : "", plain ? "pill-plain" : ""].filter(Boolean).join(" ");
   return `<span class="${cls}">${esc(label)}</span>`;
 }
 
@@ -50,6 +82,7 @@ const FOUNDER_NAV = [
   ["clients", "/clients", "Clients"],
   ["leads", "/leads", "Leads"],
   ["outreach", "/outreach", "Outreach"],
+  ["calls", "/calls", "Calls"],
   ["revenue", "/revenue", "Revenue"],
   ["team", "/team", "Team"],
   ["audit", "/audit", "Audit"],
@@ -235,6 +268,9 @@ td.nowrap{white-space:nowrap}
 .pill{display:inline-block;padding:4px 10px;border-radius:var(--radius-pill);font-size:12px;font-weight:600;border:1px solid var(--border);background:var(--panel-2);color:var(--text-muted);text-transform:capitalize}
 .pill-green{border-color:var(--green-text);background:var(--green-tint-bg);color:var(--green-text)}
 .pill-red{border-color:var(--red-text);background:var(--red-tint-bg);color:var(--red-text)}
+/* Pills capitalize by default, which suits one-word statuses like "sent" but
+   mangles a phrase into "Overdue By 30 Hours". */
+.pill-plain{text-transform:none}
 
 /* buttons */
 .btn{font-size:13px;font-weight:600;padding:10px 16px;border-radius:var(--radius);border:1px solid var(--border);background:transparent;color:var(--text);cursor:pointer;text-decoration:none;display:inline-block;font-family:inherit;line-height:1.2}
@@ -244,6 +280,15 @@ td.nowrap{white-space:nowrap}
 .btn[disabled]{opacity:.5;cursor:default}
 .row-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 .row-actions form{display:inline}
+/* Visually hidden but still read out. The call-log selects sit in a dense table
+   where a visible label per field would double the row height, but "Log the
+   outcome..." as a placeholder is not a label a screen reader can rely on. */
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.call-log{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.call-log select,.call-log input[type=text]{margin:0}
+.call-log-compact select{min-width:150px}
+.call-log-compact input[type=text]{min-width:150px;flex:1 1 150px}
+@media(max-width:860px){.call-log{flex-direction:column;align-items:stretch}}
 
 /* forms */
 form.plain{margin:0}
@@ -971,9 +1016,64 @@ export function outreachQueuePage({ user, csrf, theme, queue, counts, recent, un
 
 // ---------- Founder: single lead + outreach timeline ----------
 // Step 1 of the CRM work: HQ shows what Make actually did, per lead.
+// The Sequence B window on a single lead. Rendered only once a send has opened
+// a window: before that there is nothing to say, and an empty "no call yet"
+// block on every lead would be noise.
+function callPanel(lead, csrf) {
+  if (!lead.call_due_at) return "";
+
+  if (lead.call_outcome) {
+    const choice = CALL_OUTCOME_CHOICES.find(([v]) => v === lead.call_outcome);
+    const label = choice ? choice[1] : lead.call_outcome;
+    return `<div class="panel">
+      <div class="panel-head">Call</div>
+      <div class="security-body">
+        <div class="security-status">${pill(label, lead.call_outcome === "skipped" ? "" : "green", true)}${
+          lead.call_logged_by ? ` <span class="hint">logged by ${esc(lead.call_logged_by)}</span>` : ""
+        }</div>
+        ${
+          lead.call_logged_at
+            ? `<div class="hint" style="margin-top:10px">Logged ${esc(
+                String(lead.call_logged_at).replace("T", " ").slice(0, 16)
+              )} UTC. The call itself is on the timeline below.</div>`
+            : ""
+        }
+        <div class="row-actions" style="justify-content:flex-start;margin-top:12px">
+          <form method="post" action="/leads/${lead.id}/call/reopen">${csrfField(
+            csrf
+          )}<button type="submit" class="btn btn-sm">Logged by mistake &mdash; reopen</button></form>
+        </div>
+      </div>
+    </div>`;
+  }
+
+  const state = callDue(lead.call_due_at);
+  return `<div class="panel">
+    <div class="panel-head">Call</div>
+    <div class="security-body">
+      <div class="security-status">${state ? pill(state.text, state.cls, true) : ""}${
+        lead.call_due_at
+          ? ` <span class="hint mono">${esc(String(lead.call_due_at).replace("T", " ").slice(0, 16))} UTC</span>`
+          : ""
+      }</div>
+      <div class="security-copy" style="margin-top:10px">
+        Sequence B calls this lead once the window closes, whether or not they replied.
+        ${state && !state.due ? "You can still call early &mdash; logging is open now." : ""}
+      </div>
+      <div style="margin-top:14px">${callLogForm(lead, csrf)}</div>
+    </div>
+  </div>`;
+}
+
 export function leadDetailPage({ user, lead, events, theme, webhookReady, csrf, sendingReady = false }) {
   const kindPill = (k) =>
-    k === "reply" ? pill("reply", "green") : k === "sent" ? pill("sent") : pill(k, "red");
+    k === "reply"
+      ? pill("reply", "green")
+      : k === "sent"
+        ? pill("sent")
+        : k === "call"
+          ? pill("call", "green")
+          : pill(k, "red");
 
   const rows = events.length
     ? `<ul class="timeline">${events
@@ -1030,10 +1130,10 @@ export function leadDetailPage({ user, lead, events, theme, webhookReady, csrf, 
       <div class="security-body">
         <div class="security-status">${
           lead.outreach_status === "approved"
-            ? pill("approved to email", "green")
+            ? pill("approved to email", "green", true)
             : lead.outreach_status === "rejected"
               ? pill("rejected", "red")
-              : pill("awaiting your decision")
+              : pill("awaiting your decision", "", true)
         }${lead.outreach_approved_by ? ` <span class="hint">by ${esc(lead.outreach_approved_by)}</span>` : ""}</div>
         <div class="row-actions" style="justify-content:flex-start;gap:10px;margin-top:12px">
           ${
@@ -1068,6 +1168,8 @@ export function leadDetailPage({ user, lead, events, theme, webhookReady, csrf, 
         }
       </div>
     </div>
+
+    ${callPanel(lead, csrf)}
 
     <div class="panel">
       <div class="panel-head">Outreach activity</div>
@@ -1660,5 +1762,120 @@ export function errorPage(message, status = 400, theme = "dark") {
     title: "Error",
     theme,
     body: `<div class="msg msg-error">${esc(message)}</div><p><a href="/" class="btn btn-sm" style="margin-top:8px">Back</a></p>`,
+  });
+}
+
+// ---------- Founder: the Sequence B call queue (CRM step 3) ----------
+//
+// Sequence B sends, waits a short window, then calls REGARDLESS of whether the
+// lead replied. This page is that window made visible. It is the step the
+// Call-Timing Decision Log records as having "no tool, human, off the tracker".
+//
+// Two things it deliberately does NOT do:
+//   - It does not hide leads that already replied. Calling everyone is what
+//     makes the three outcomes comparable; filtering repliers out would bias
+//     the data toward the least engaged half of the batch.
+//   - It does not refuse an early call. A window that is still open shows as
+//     waiting, but the log form is live the whole time.
+const CALL_OUTCOME_CHOICES = [
+  ["picked_up_cold", "Picked up cold", "Answered the call, no email reply beforehand"],
+  ["replied_first", "Replied first", "Had already replied to the email"],
+  ["no_response", "No response", "No reply, and the call went unanswered"],
+  ["skipped", "Skipped", "Deliberately not called (kept out of the comparison)"],
+];
+
+function callLogForm(lead, csrf, { compact = false, back = "" } = {}) {
+  const options = CALL_OUTCOME_CHOICES.map(
+    ([value, label]) => `<option value="${value}">${esc(label)}</option>`
+  ).join("");
+  return `<form method="post" action="/leads/${lead.id}/call/log" class="call-log${compact ? " call-log-compact" : ""}">
+    ${csrfField(csrf)}
+    ${back ? `<input type="hidden" name="back" value="${esc(back)}" />` : ""}
+    <label class="sr-only" for="outcome-${lead.id}">Call outcome</label>
+    <select id="outcome-${lead.id}" name="outcome" required>
+      <option value="">Log the outcome&hellip;</option>
+      ${options}
+    </select>
+    <label class="sr-only" for="notes-${lead.id}">Call notes</label>
+    <input id="notes-${lead.id}" type="text" name="notes" maxlength="1000" placeholder="What was said (optional)" />
+    <button type="submit" class="btn btn-sm btn-primary">Log call</button>
+  </form>`;
+}
+
+export function callQueuePage({ user, csrf, theme, queue, counts, stats, windowHours }) {
+  const rows = queue
+    .map((l) => {
+      const state = callDue(l.call_due_at);
+      return `<tr>
+      <td class="strong"><a href="/leads/${l.id}" class="link-inline" style="text-decoration:none">${esc(l.name)}</a>${
+        l.company ? `<br/><span class="hint">${esc(l.company)}</span>` : ""
+      }</td>
+      <td>${state ? pill(state.text, state.cls, true) : pill("no window")}${
+        l.call_due_at
+          ? `<br/><span class="hint mono">${esc(String(l.call_due_at).replace("T", " ").slice(0, 16))} UTC</span>`
+          : ""
+      }</td>
+      <td>${
+        l.replied_since_send
+          ? `${pill("replied", "green")}<br/><span class="hint">call anyway</span>`
+          : `<span class="hint">no reply yet</span>`
+      }</td>
+      <td class="muted">${l.contact_email ? esc(l.contact_email) : "&mdash;"}</td>
+      <td>${callLogForm(l, csrf, { compact: true, back: "calls" })}</td>
+    </tr>`;
+    })
+    .join("");
+
+  const statRow = [
+    ["picked_up_cold", "Picked up cold"],
+    ["replied_first", "Replied first"],
+    ["no_response", "No response"],
+  ]
+    .map(
+      ([k, label]) =>
+        `<div class="metric-card"><div class="metric-label">${label}</div><div class="metric-value">${stats[k]}</div></div>`
+    )
+    .join("");
+
+  return layout({
+    user,
+    active: "calls",
+    title: "Calls",
+    theme,
+    body: `
+    <div class="page-head">
+      <div class="page-title">Calls</div>
+      <div class="page-sub">
+        Sequence B: send, wait ${windowHours} hours, then call &mdash; whether or not they replied. Log every outcome.
+      </div>
+    </div>
+
+    <div class="metrics-grid">
+      <div class="metric-card"><div class="metric-label">Due now</div><div class="metric-value">${counts.due}</div></div>
+      <div class="metric-card"><div class="metric-label">Window still open</div><div class="metric-value">${counts.waiting}</div></div>
+      <div class="metric-card"><div class="metric-label">Calls logged</div><div class="metric-value">${stats.comparable + stats.skipped}</div></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">The queue</div>
+      <div class="table-wrap">
+        ${
+          rows
+            ? `<table><thead><tr><th>Lead</th><th>Window</th><th>Replied?</th><th>Email</th><th>Outcome</th></tr></thead><tbody>${rows}</tbody></table>`
+            : `<div class="empty">Nothing waiting on a call. A lead joins this queue the moment an outreach email sends successfully.</div>`
+        }
+      </div>
+    </div>
+
+    <h2 class="section-label" style="margin-top:32px">Outcomes so far</h2>
+    <div class="metrics-grid">${statRow}</div>
+    <div class="hint" style="margin-top:8px">
+      ${stats.comparable} comparable ${stats.comparable === 1 ? "call" : "calls"}${
+        stats.skipped ? `, plus ${stats.skipped} skipped and excluded` : ""
+      }. Because every lead is called regardless of response, these three buckets are directly comparable across a batch.
+    </div>
+
+    <p style="margin-top:24px"><a href="/outreach" class="btn btn-sm">Back to outreach</a></p>
+  `,
   });
 }

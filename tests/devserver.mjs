@@ -59,14 +59,74 @@ for (const c of [
 }
 
 for (const l of [
-  { name: "Thandi Mokoena", company: "Braamfontein Bakery", stage: "qualified", value_estimate: 25000, owner: "Somila" },
-  { name: "Johan Pretorius", company: "Centurion Motors", stage: "proposal", value_estimate: 84000, owner: "Lethu" },
-  { name: "Fatima Patel", company: "Laudium Textiles", stage: "new", value_estimate: 12000, owner: "Thembalethu" },
+  { name: "Thandi Mokoena", company: "Braamfontein Bakery", stage: "qualified", value_estimate: 25000, owner: "Somila", contact_email: "thandi@bakery.test" },
+  { name: "Johan Pretorius", company: "Centurion Motors", stage: "proposal", value_estimate: 84000, owner: "Lethu", contact_email: "johan@motors.test" },
+  { name: "Fatima Patel", company: "Laudium Textiles", stage: "new", value_estimate: 12000, owner: "Thembalethu", contact_email: "fatima@textiles.test" },
   { name: "Bongani Zulu", company: "Soweto Sound", stage: "won", value_estimate: 46000, owner: "Somila" },
   { name: "Old Prospect", company: "Dormant Co", stage: "lost", value_estimate: 9000, owner: "Lethu" },
 ]) {
   await db.createLead(env, l);
 }
+
+// Sequence B call windows, so /calls has all three of its states to look at:
+// one overdue, one still open, and one where the lead replied but is called
+// anyway. Timestamps are written directly because the real path (a successful
+// send) would need a live Make endpoint.
+const previewLeads = await db.getLeads(env);
+const byName = (n) => previewLeads.find((l) => l.name === n);
+
+await env.DB.prepare(
+  "UPDATE leads SET outreach_status='approved', outreach_last_sent_at=datetime('now','-2 days'), call_due_at=datetime('now','-30 hours') WHERE id = ?"
+)
+  .bind(byName("Thandi Mokoena").id)
+  .run();
+
+await env.DB.prepare(
+  "UPDATE leads SET outreach_status='approved', outreach_last_sent_at=datetime('now','-2 hours'), call_due_at=datetime('now','+16 hours') WHERE id = ?"
+)
+  .bind(byName("Johan Pretorius").id)
+  .run();
+
+await env.DB.prepare(
+  "UPDATE leads SET outreach_status='approved', outreach_last_sent_at=datetime('now','-20 hours'), call_due_at=datetime('now','-2 hours') WHERE id = ?"
+)
+  .bind(byName("Fatima Patel").id)
+  .run();
+
+await db.recordOutreachEvent(env, {
+  event_id: "evt_preview_sent",
+  lead_id: byName("Fatima Patel").id,
+  lead_email: "fatima@textiles.test",
+  kind: "sent",
+  sequence: "cold_outreach_v2",
+  subject: "Quick question about Laudium Textiles",
+  occurred_at: new Date(Date.now() - 20 * 3600_000).toISOString(),
+  source: "make_outreach",
+});
+await db.recordOutreachEvent(env, {
+  event_id: "evt_preview_reply",
+  lead_id: byName("Fatima Patel").id,
+  lead_email: "fatima@textiles.test",
+  kind: "reply",
+  subject: "Re: Quick question about Laudium Textiles",
+  detail: "Interested, send more detail.",
+  occurred_at: new Date(Date.now() - 3 * 3600_000).toISOString(),
+  source: "make_outreach",
+});
+
+// One already-logged call, so the outcome stats aren't all zero.
+await env.DB.prepare(
+  "UPDATE leads SET outreach_status='approved', outreach_last_sent_at=datetime('now','-3 days'), call_due_at=datetime('now','-2 days') WHERE id = ?"
+)
+  .bind(byName("Bongani Zulu").id)
+  .run();
+await db.logCallOutcome(env, {
+  leadId: byName("Bongani Zulu").id,
+  leadEmail: null,
+  outcome: "picked_up_cold",
+  notes: "Answered, booked a follow-up for Thursday.",
+  actor: "Thembalethu",
+});
 
 const monday = new Date();
 monday.setUTCDate(monday.getUTCDate() - ((monday.getUTCDay() || 7) - 1));

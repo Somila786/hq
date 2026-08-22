@@ -41,6 +41,7 @@ import {
   verifyWebhookSignature,
   timestampWithinWindow,
   outreachSendingConfigured,
+  callWindowHours,
   buildOutreachPayload,
   triggerOutreach,
   googleConfigured,
@@ -1502,7 +1503,8 @@ export default {
           });
 
           if (result.ok) {
-            await db.markOutreachSent(env, lead.id);
+            // Opens the Sequence B call window in the same statement.
+            await db.markOutreachSent(env, lead.id, callWindowHours(env));
             await db.logAudit(env, user, "outreach_sent", "lead", lead.id, `${lead.name} <${lead.contact_email}>`, reqIp);
           } else {
             await db.logAudit(
@@ -1534,6 +1536,75 @@ export default {
               webhookReady: makeWebhookConfigured(env),
             })
           );
+        }
+
+        // ---- The call window (CRM step 3) ----
+        //
+        // Sequence B's step 9 -- wait a short window, then call regardless of
+        // whether they replied, then log the outcome. Before this existed the
+        // step happened, but nothing recorded that it had.
+        if (path === "/calls" && method === "GET") {
+          return html(
+            views.callQueuePage({
+              user,
+              csrf,
+              theme,
+              queue: await db.getCallQueue(env),
+              counts: await db.countCallQueue(env),
+              stats: await db.getCallOutcomeStats(env),
+              windowHours: callWindowHours(env),
+            })
+          );
+        }
+
+        const callLog = path.match(/^\/leads\/(\d+)\/call\/log$/);
+        if (callLog && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          // A double submit would put two calls on the timeline for one call.
+          if (!(await claimOnce(env, f))) return redirect(f.back === "calls" ? "/calls" : `/leads/${callLog[1]}`);
+
+          const lead = await db.getLeadById(env, callLog[1]);
+          if (!lead) return html(views.errorPage("That lead no longer exists.", 404, theme), 404);
+
+          if (!db.CALL_OUTCOMES.includes(f.outcome)) {
+            return html(views.errorPage("Pick one of the listed call outcomes.", 400, theme), 400);
+          }
+          // Logging a call for a lead that was never sent to would create a
+          // window that no send opened, and the outcome stats are only
+          // meaningful across leads that actually went through the sequence.
+          if (!lead.call_due_at) {
+            return html(
+              views.errorPage("No outreach has been sent to that lead yet, so there is no call window to close.", 400, theme),
+              400
+            );
+          }
+
+          await db.logCallOutcome(env, {
+            leadId: lead.id,
+            leadEmail: lead.contact_email,
+            outcome: f.outcome,
+            notes: f.notes,
+            actor: user.name,
+          });
+          await db.logAudit(env, user, "call_logged", "lead", lead.id, `${lead.name}: ${f.outcome}`, reqIp);
+          return redirect(f.back === "calls" ? "/calls" : `/leads/${lead.id}`);
+        }
+
+        const callReopen = path.match(/^\/leads\/(\d+)\/call\/reopen$/);
+        if (callReopen && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          const lead = await db.getLeadById(env, callReopen[1]);
+          if (!lead) return html(views.errorPage("That lead no longer exists.", 404, theme), 404);
+
+          await db.reopenCallWindow(env, lead.id);
+          // Audited because it changes what the outcome stats say. The logged
+          // call stays on the timeline either way.
+          await db.logAudit(env, user, "call_reopened", "lead", lead.id, `${lead.name}`, reqIp);
+          return redirect(`/leads/${lead.id}`);
         }
 
         // ---- Revenue ----

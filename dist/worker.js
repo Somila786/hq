@@ -424,6 +424,23 @@ function outreachSendingConfigured(env) {
   return !!(env.MAKE_OUTREACH_URL && env.MAKE_WEBHOOK_SECRET);
 }
 
+// How long Sequence B's "short window" runs before the call is due, in hours
+// from the send. The decision log says "same day or next morning"; 18 hours
+// delivers that from either a morning or an afternoon send, which is why it is
+// the default. Override with a CALL_WINDOW_HOURS variable on the Worker.
+//
+// Clamped rather than trusted: a misconfigured value that parsed as 0 would
+// make every lead due instantly and the queue meaningless, and one that parsed
+// as 100000 would hide the queue forever. Both fail quietly, which is worse
+// than being wrong loudly, so neither is reachable.
+const CALL_WINDOW_DEFAULT_HOURS = 18;
+
+function callWindowHours(env) {
+  const raw = Number(env?.CALL_WINDOW_HOURS);
+  if (!Number.isFinite(raw)) return CALL_WINDOW_DEFAULT_HOURS;
+  return Math.min(168, Math.max(1, Math.round(raw)));
+}
+
 // The C7 webhook envelope, signed the same way Make signs its posts to us.
 // `data` carries the lead fields Make's Gmail module needs to map.
 function buildOutreachPayload(lead, actor) {
@@ -761,7 +778,8 @@ async function getLeads(env) {
     `SELECT id, name, company, contact_email, stage, value_estimate, source, owner, notes,
             created_at, updated_at,
             COALESCE(outreach_status,'pending') AS outreach_status,
-            outreach_approved_by, outreach_approved_at, outreach_last_sent_at
+            outreach_approved_by, outreach_approved_at, outreach_last_sent_at,
+            call_due_at, call_outcome, call_logged_at, call_logged_by
      FROM leads ORDER BY CASE stage WHEN 'won' THEN 1 WHEN 'lost' THEN 1 ELSE 0 END, updated_at DESC`
   ).all();
   return results;
@@ -1321,7 +1339,8 @@ async function getLeadById(env, id) {
     `SELECT id, name, company, contact_email, stage, value_estimate, source, owner, notes,
             created_at, updated_at,
             COALESCE(outreach_status,'pending') AS outreach_status,
-            outreach_approved_by, outreach_approved_at, outreach_last_sent_at
+            outreach_approved_by, outreach_approved_at, outreach_last_sent_at,
+            call_due_at, call_outcome, call_logged_at, call_logged_by
      FROM leads WHERE id = ?`
   )
     .bind(id)
@@ -1391,8 +1410,124 @@ async function setOutreachStatus(env, id, status, actor) {
     .run();
 }
 
-async function markOutreachSent(env, id) {
-  return env.DB.prepare("UPDATE leads SET outreach_last_sent_at = datetime('now') WHERE id = ?").bind(id).run();
+// A successful send is what opens the Sequence B call window, so the two are
+// stamped together. Doing it here rather than in the route means there is no
+// path that records a send without also putting the call on the tracker --
+// which was the exact failure the decision log describes as "off the tracker".
+//
+// Any prior outcome is cleared: a re-send starts a fresh window, and leaving the
+// old outcome would attribute a previous call to the new one.
+async function markOutreachSent(env, id, windowHours = 18) {
+  const hours = Math.min(168, Math.max(1, Math.round(Number(windowHours) || 18)));
+  return env.DB.prepare(
+    `UPDATE leads
+        SET outreach_last_sent_at = datetime('now'),
+            call_due_at = datetime('now', ?),
+            call_outcome = NULL,
+            call_logged_at = NULL,
+            call_logged_by = NULL
+      WHERE id = ?`
+  )
+    .bind(`+${hours} hours`, id)
+    .run();
+}
+
+// ---- The call window (CRM step 3) ----
+//
+// Sequence B calls REGARDLESS of whether the lead replied, so this queue is
+// deliberately not filtered by reply state. `replied_since_send` is carried
+// along as context for the person making the call, not as a reason to skip it.
+const CALL_OUTCOMES = ["picked_up_cold", "replied_first", "no_response", "skipped"];
+
+const CALL_OUTCOME_LABELS = {
+  picked_up_cold: "Picked up cold",
+  replied_first: "Replied first",
+  no_response: "No response",
+  skipped: "Skipped",
+};
+
+async function getCallQueue(env, limit = 200) {
+  const { results } = await env.DB.prepare(
+    `SELECT l.id, l.name, l.company, l.contact_email, l.stage, l.owner, l.source,
+            l.value_estimate, l.outreach_last_sent_at, l.call_due_at,
+            l.call_due_at <= datetime('now') AS due_now,
+            EXISTS (
+              SELECT 1 FROM outreach_events o
+               WHERE o.lead_id = l.id AND o.kind = 'reply'
+                 AND o.occurred_at >= COALESCE(l.outreach_last_sent_at, '0000')
+            ) AS replied_since_send
+       FROM leads l
+      WHERE l.call_due_at IS NOT NULL AND l.call_outcome IS NULL
+      ORDER BY l.call_due_at ASC
+      LIMIT ?`
+  )
+    .bind(limit)
+    .all();
+  return results;
+}
+
+async function countCallQueue(env) {
+  const row = await env.DB.prepare(
+    `SELECT
+       SUM(call_due_at <= datetime('now')) AS due,
+       SUM(call_due_at >  datetime('now')) AS waiting
+     FROM leads WHERE call_due_at IS NOT NULL AND call_outcome IS NULL`
+  ).first();
+  return { due: row?.due || 0, waiting: row?.waiting || 0 };
+}
+
+// The comparable data the sequence exists to produce. `skipped` is counted but
+// kept out of `comparable`, because a call that never happened says nothing
+// about whether calling works.
+async function getCallOutcomeStats(env) {
+  const { results } = await env.DB.prepare(
+    `SELECT call_outcome AS outcome, COUNT(*) AS n
+       FROM leads WHERE call_outcome IS NOT NULL GROUP BY call_outcome`
+  ).all();
+  const by = Object.fromEntries(results.map((r) => [r.outcome, r.n]));
+  const counts = Object.fromEntries(CALL_OUTCOMES.map((o) => [o, by[o] || 0]));
+  counts.comparable = counts.picked_up_cold + counts.replied_first + counts.no_response;
+  return counts;
+}
+
+// Closes the window and writes the call into the ledger in one go. The event
+// carries the same wording the queue showed, so the timeline and the queue can
+// never disagree about what was recorded.
+async function logCallOutcome(env, { leadId, leadEmail, outcome, notes, actor }) {
+  if (!CALL_OUTCOMES.includes(outcome)) throw new Error(`unknown call outcome: ${outcome}`);
+  const occurredAt = new Date().toISOString();
+  await recordOutreachEvent(env, {
+    event_id: `evt_call_${crypto.randomUUID()}`,
+    lead_id: leadId,
+    lead_email: leadEmail || null,
+    kind: "call",
+    sequence: "sequence_b",
+    step: "call",
+    subject: CALL_OUTCOME_LABELS[outcome],
+    detail: notes ? String(notes).slice(0, 1000) : null,
+    occurred_at: occurredAt,
+    source: "catalyst7_hq",
+  });
+  await env.DB.prepare(
+    `UPDATE leads SET call_outcome = ?, call_logged_at = datetime('now'), call_logged_by = ?
+      WHERE id = ?`
+  )
+    .bind(outcome, actor || null, leadId)
+    .run();
+  return occurredAt;
+}
+
+// Reopening is a correction, not a new window: it clears the outcome and puts
+// the lead back where it was, rather than pretending a fresh send happened.
+// The logged call stays in the ledger -- the record of what was done is not
+// something a correction gets to erase.
+async function reopenCallWindow(env, id) {
+  return env.DB.prepare(
+    `UPDATE leads SET call_outcome = NULL, call_logged_at = NULL, call_logged_by = NULL
+      WHERE id = ?`
+  )
+    .bind(id)
+    .run();
 }
 
 // The review queue: everything still awaiting a decision, newest first.
@@ -1537,7 +1672,7 @@ async function runRetentionScan(env) {
   return { leadsFlagged: staleLeads.length, freelancersFlagged: staleFreelancers.length };
 }
 
-return { getFreelancers, getFreelancerById, createFreelancer, setFreelancerActive, getClients, createClient, setClientStatus, getLeads, createLead, updateLeadStage, getRevenueEntries, createRevenueEntry, getWeeklyEntry, upsertWeeklyEntry, getFreelancerHistory, getDashboard, replaceBackupCodes, countUnusedBackupCodes, redeemBackupCode, clearBackupCodes, listUsers, getUserById, getFreelancersWithoutUser, createUser, setUserTitle, reissueSetupToken, revokeUserAccess, countActiveFounders, createInviteCode, findOpenInviteCode, consumeInviteCode, listInviteCodes, revokeInviteCode, countOpenInviteCodes, getUserByEmail, getUserCredentials, claimSubmission, purgeOldSubmissions, bindGoogleSub, registerOAuthClient, getOAuthClient, createAuthCode, consumeAuthCode, storeMcpToken, getMcpTokenUser, consumeRefreshToken, listMcpGrants, revokeMcpGrant, revokeAllMcpTokensForUser, purgeExpiredOAuth, recordOutreachEvent, findLeadByEmail, getLeadById, getOutreachForLead, getRecentOutreach, getOutreachSummary, getUnmatchedOutreach, setOutreachStatus, markOutreachSent, getLeadsAwaitingApproval, countOutreachQueue, logAudit, getAuditLog, logError, getErrorLog, flagForRetentionReview, getOpenRetentionFlags, resolveRetentionFlag, eraseLeadPII, eraseFreelancerPII, runRetentionScan };
+return { getFreelancers, getFreelancerById, createFreelancer, setFreelancerActive, getClients, createClient, setClientStatus, getLeads, createLead, updateLeadStage, getRevenueEntries, createRevenueEntry, getWeeklyEntry, upsertWeeklyEntry, getFreelancerHistory, getDashboard, replaceBackupCodes, countUnusedBackupCodes, redeemBackupCode, clearBackupCodes, listUsers, getUserById, getFreelancersWithoutUser, createUser, setUserTitle, reissueSetupToken, revokeUserAccess, countActiveFounders, createInviteCode, findOpenInviteCode, consumeInviteCode, listInviteCodes, revokeInviteCode, countOpenInviteCodes, getUserByEmail, getUserCredentials, claimSubmission, purgeOldSubmissions, bindGoogleSub, registerOAuthClient, getOAuthClient, createAuthCode, consumeAuthCode, storeMcpToken, getMcpTokenUser, consumeRefreshToken, listMcpGrants, revokeMcpGrant, revokeAllMcpTokensForUser, purgeExpiredOAuth, recordOutreachEvent, findLeadByEmail, getLeadById, getOutreachForLead, getRecentOutreach, getOutreachSummary, getUnmatchedOutreach, setOutreachStatus, markOutreachSent, getCallQueue, countCallQueue, getCallOutcomeStats, logCallOutcome, reopenCallWindow, getLeadsAwaitingApproval, countOutreachQueue, logAudit, getAuditLog, logError, getErrorLog, flagForRetentionReview, getOpenRetentionFlags, resolveRetentionFlag, eraseLeadPII, eraseFreelancerPII, runRetentionScan, CALL_OUTCOMES, CALL_OUTCOME_LABELS };
 })();
 
 // ===================== src/views.js ====================
@@ -1583,9 +1718,41 @@ function delta(curr, prev) {
   return { text: "flat vs last wk", cls: "flat" };
 }
 
+// D1 stores datetimes as UTC "YYYY-MM-DD HH:MM:SS". The rest of the app prints
+// them raw, which is fine for a log. It is not fine for a call queue: a founder
+// in SAST reading "due 04:00" has to do timezone arithmetic before knowing
+// whether to pick up the phone.
+//
+// So the queue leads with a relative duration instead. Relative durations are
+// timezone-free, and "overdue by 2 days" is the thing being asked anyway. The
+// absolute stamp stays available, explicitly labelled UTC, as the secondary.
+function sqlUtcToMs(v) {
+  if (!v) return NaN;
+  const t = String(v).trim().replace(" ", "T");
+  return Date.parse(/[Zz]|[+-]\d\d:?\d\d$/.test(t) ? t : t + "Z");
+}
+
+function humanGap(ms) {
+  const mins = Math.round(Math.abs(ms) / 60000);
+  if (mins < 60) return `${mins} min`;
+  const hours = Math.round(mins / 60);
+  if (hours < 48) return `${hours} hour${hours === 1 ? "" : "s"}`;
+  return `${Math.round(hours / 24)} days`;
+}
+
+// Returns null when there is no window, so callers can distinguish "not due for
+// a while" from "never scheduled".
+function callDue(dueAt, now = Date.now()) {
+  const due = sqlUtcToMs(dueAt);
+  if (!Number.isFinite(due)) return null;
+  const diff = due - now;
+  if (diff <= 0) return { due: true, text: diff > -60000 ? "Due now" : `Overdue by ${humanGap(diff)}`, cls: "red" };
+  return { due: false, text: `Due in ${humanGap(diff)}`, cls: "" };
+}
+
 // pill kind: "green" | "red" | "" (muted/default)
-function pill(label, kind = "") {
-  const cls = kind ? `pill pill-${kind}` : "pill";
+function pill(label, kind = "", plain = false) {
+  const cls = ["pill", kind ? `pill-${kind}` : "", plain ? "pill-plain" : ""].filter(Boolean).join(" ");
   return `<span class="${cls}">${esc(label)}</span>`;
 }
 
@@ -1595,6 +1762,7 @@ const FOUNDER_NAV = [
   ["clients", "/clients", "Clients"],
   ["leads", "/leads", "Leads"],
   ["outreach", "/outreach", "Outreach"],
+  ["calls", "/calls", "Calls"],
   ["revenue", "/revenue", "Revenue"],
   ["team", "/team", "Team"],
   ["audit", "/audit", "Audit"],
@@ -1780,6 +1948,9 @@ td.nowrap{white-space:nowrap}
 .pill{display:inline-block;padding:4px 10px;border-radius:var(--radius-pill);font-size:12px;font-weight:600;border:1px solid var(--border);background:var(--panel-2);color:var(--text-muted);text-transform:capitalize}
 .pill-green{border-color:var(--green-text);background:var(--green-tint-bg);color:var(--green-text)}
 .pill-red{border-color:var(--red-text);background:var(--red-tint-bg);color:var(--red-text)}
+/* Pills capitalize by default, which suits one-word statuses like "sent" but
+   mangles a phrase into "Overdue By 30 Hours". */
+.pill-plain{text-transform:none}
 
 /* buttons */
 .btn{font-size:13px;font-weight:600;padding:10px 16px;border-radius:var(--radius);border:1px solid var(--border);background:transparent;color:var(--text);cursor:pointer;text-decoration:none;display:inline-block;font-family:inherit;line-height:1.2}
@@ -1789,6 +1960,15 @@ td.nowrap{white-space:nowrap}
 .btn[disabled]{opacity:.5;cursor:default}
 .row-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 .row-actions form{display:inline}
+/* Visually hidden but still read out. The call-log selects sit in a dense table
+   where a visible label per field would double the row height, but "Log the
+   outcome..." as a placeholder is not a label a screen reader can rely on. */
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.call-log{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.call-log select,.call-log input[type=text]{margin:0}
+.call-log-compact select{min-width:150px}
+.call-log-compact input[type=text]{min-width:150px;flex:1 1 150px}
+@media(max-width:860px){.call-log{flex-direction:column;align-items:stretch}}
 
 /* forms */
 form.plain{margin:0}
@@ -2516,9 +2696,64 @@ function outreachQueuePage({ user, csrf, theme, queue, counts, recent, unmatched
 
 // ---------- Founder: single lead + outreach timeline ----------
 // Step 1 of the CRM work: HQ shows what Make actually did, per lead.
+// The Sequence B window on a single lead. Rendered only once a send has opened
+// a window: before that there is nothing to say, and an empty "no call yet"
+// block on every lead would be noise.
+function callPanel(lead, csrf) {
+  if (!lead.call_due_at) return "";
+
+  if (lead.call_outcome) {
+    const choice = CALL_OUTCOME_CHOICES.find(([v]) => v === lead.call_outcome);
+    const label = choice ? choice[1] : lead.call_outcome;
+    return `<div class="panel">
+      <div class="panel-head">Call</div>
+      <div class="security-body">
+        <div class="security-status">${pill(label, lead.call_outcome === "skipped" ? "" : "green", true)}${
+          lead.call_logged_by ? ` <span class="hint">logged by ${esc(lead.call_logged_by)}</span>` : ""
+        }</div>
+        ${
+          lead.call_logged_at
+            ? `<div class="hint" style="margin-top:10px">Logged ${esc(
+                String(lead.call_logged_at).replace("T", " ").slice(0, 16)
+              )} UTC. The call itself is on the timeline below.</div>`
+            : ""
+        }
+        <div class="row-actions" style="justify-content:flex-start;margin-top:12px">
+          <form method="post" action="/leads/${lead.id}/call/reopen">${csrfField(
+            csrf
+          )}<button type="submit" class="btn btn-sm">Logged by mistake &mdash; reopen</button></form>
+        </div>
+      </div>
+    </div>`;
+  }
+
+  const state = callDue(lead.call_due_at);
+  return `<div class="panel">
+    <div class="panel-head">Call</div>
+    <div class="security-body">
+      <div class="security-status">${state ? pill(state.text, state.cls, true) : ""}${
+        lead.call_due_at
+          ? ` <span class="hint mono">${esc(String(lead.call_due_at).replace("T", " ").slice(0, 16))} UTC</span>`
+          : ""
+      }</div>
+      <div class="security-copy" style="margin-top:10px">
+        Sequence B calls this lead once the window closes, whether or not they replied.
+        ${state && !state.due ? "You can still call early &mdash; logging is open now." : ""}
+      </div>
+      <div style="margin-top:14px">${callLogForm(lead, csrf)}</div>
+    </div>
+  </div>`;
+}
+
 function leadDetailPage({ user, lead, events, theme, webhookReady, csrf, sendingReady = false }) {
   const kindPill = (k) =>
-    k === "reply" ? pill("reply", "green") : k === "sent" ? pill("sent") : pill(k, "red");
+    k === "reply"
+      ? pill("reply", "green")
+      : k === "sent"
+        ? pill("sent")
+        : k === "call"
+          ? pill("call", "green")
+          : pill(k, "red");
 
   const rows = events.length
     ? `<ul class="timeline">${events
@@ -2575,10 +2810,10 @@ function leadDetailPage({ user, lead, events, theme, webhookReady, csrf, sending
       <div class="security-body">
         <div class="security-status">${
           lead.outreach_status === "approved"
-            ? pill("approved to email", "green")
+            ? pill("approved to email", "green", true)
             : lead.outreach_status === "rejected"
               ? pill("rejected", "red")
-              : pill("awaiting your decision")
+              : pill("awaiting your decision", "", true)
         }${lead.outreach_approved_by ? ` <span class="hint">by ${esc(lead.outreach_approved_by)}</span>` : ""}</div>
         <div class="row-actions" style="justify-content:flex-start;gap:10px;margin-top:12px">
           ${
@@ -2613,6 +2848,8 @@ function leadDetailPage({ user, lead, events, theme, webhookReady, csrf, sending
         }
       </div>
     </div>
+
+    ${callPanel(lead, csrf)}
 
     <div class="panel">
       <div class="panel-head">Outreach activity</div>
@@ -3208,7 +3445,122 @@ function errorPage(message, status = 400, theme = "dark") {
   });
 }
 
-return { loginPage, registerPage, totpVerifyPage, setupPage, securityPage, dashboardPage, freelancersPage, clientsPage, leadsPage, outreachQueuePage, leadDetailPage, revenuePage, logPage, historyPage, consentPage, mcpAboutPage, teamPage, auditPage, errorsPage, retentionPage, restrictedPage, errorPage };
+// ---------- Founder: the Sequence B call queue (CRM step 3) ----------
+//
+// Sequence B sends, waits a short window, then calls REGARDLESS of whether the
+// lead replied. This page is that window made visible. It is the step the
+// Call-Timing Decision Log records as having "no tool, human, off the tracker".
+//
+// Two things it deliberately does NOT do:
+//   - It does not hide leads that already replied. Calling everyone is what
+//     makes the three outcomes comparable; filtering repliers out would bias
+//     the data toward the least engaged half of the batch.
+//   - It does not refuse an early call. A window that is still open shows as
+//     waiting, but the log form is live the whole time.
+const CALL_OUTCOME_CHOICES = [
+  ["picked_up_cold", "Picked up cold", "Answered the call, no email reply beforehand"],
+  ["replied_first", "Replied first", "Had already replied to the email"],
+  ["no_response", "No response", "No reply, and the call went unanswered"],
+  ["skipped", "Skipped", "Deliberately not called (kept out of the comparison)"],
+];
+
+function callLogForm(lead, csrf, { compact = false, back = "" } = {}) {
+  const options = CALL_OUTCOME_CHOICES.map(
+    ([value, label]) => `<option value="${value}">${esc(label)}</option>`
+  ).join("");
+  return `<form method="post" action="/leads/${lead.id}/call/log" class="call-log${compact ? " call-log-compact" : ""}">
+    ${csrfField(csrf)}
+    ${back ? `<input type="hidden" name="back" value="${esc(back)}" />` : ""}
+    <label class="sr-only" for="outcome-${lead.id}">Call outcome</label>
+    <select id="outcome-${lead.id}" name="outcome" required>
+      <option value="">Log the outcome&hellip;</option>
+      ${options}
+    </select>
+    <label class="sr-only" for="notes-${lead.id}">Call notes</label>
+    <input id="notes-${lead.id}" type="text" name="notes" maxlength="1000" placeholder="What was said (optional)" />
+    <button type="submit" class="btn btn-sm btn-primary">Log call</button>
+  </form>`;
+}
+
+function callQueuePage({ user, csrf, theme, queue, counts, stats, windowHours }) {
+  const rows = queue
+    .map((l) => {
+      const state = callDue(l.call_due_at);
+      return `<tr>
+      <td class="strong"><a href="/leads/${l.id}" class="link-inline" style="text-decoration:none">${esc(l.name)}</a>${
+        l.company ? `<br/><span class="hint">${esc(l.company)}</span>` : ""
+      }</td>
+      <td>${state ? pill(state.text, state.cls, true) : pill("no window")}${
+        l.call_due_at
+          ? `<br/><span class="hint mono">${esc(String(l.call_due_at).replace("T", " ").slice(0, 16))} UTC</span>`
+          : ""
+      }</td>
+      <td>${
+        l.replied_since_send
+          ? `${pill("replied", "green")}<br/><span class="hint">call anyway</span>`
+          : `<span class="hint">no reply yet</span>`
+      }</td>
+      <td class="muted">${l.contact_email ? esc(l.contact_email) : "&mdash;"}</td>
+      <td>${callLogForm(l, csrf, { compact: true, back: "calls" })}</td>
+    </tr>`;
+    })
+    .join("");
+
+  const statRow = [
+    ["picked_up_cold", "Picked up cold"],
+    ["replied_first", "Replied first"],
+    ["no_response", "No response"],
+  ]
+    .map(
+      ([k, label]) =>
+        `<div class="metric-card"><div class="metric-label">${label}</div><div class="metric-value">${stats[k]}</div></div>`
+    )
+    .join("");
+
+  return layout({
+    user,
+    active: "calls",
+    title: "Calls",
+    theme,
+    body: `
+    <div class="page-head">
+      <div class="page-title">Calls</div>
+      <div class="page-sub">
+        Sequence B: send, wait ${windowHours} hours, then call &mdash; whether or not they replied. Log every outcome.
+      </div>
+    </div>
+
+    <div class="metrics-grid">
+      <div class="metric-card"><div class="metric-label">Due now</div><div class="metric-value">${counts.due}</div></div>
+      <div class="metric-card"><div class="metric-label">Window still open</div><div class="metric-value">${counts.waiting}</div></div>
+      <div class="metric-card"><div class="metric-label">Calls logged</div><div class="metric-value">${stats.comparable + stats.skipped}</div></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">The queue</div>
+      <div class="table-wrap">
+        ${
+          rows
+            ? `<table><thead><tr><th>Lead</th><th>Window</th><th>Replied?</th><th>Email</th><th>Outcome</th></tr></thead><tbody>${rows}</tbody></table>`
+            : `<div class="empty">Nothing waiting on a call. A lead joins this queue the moment an outreach email sends successfully.</div>`
+        }
+      </div>
+    </div>
+
+    <h2 class="section-label" style="margin-top:32px">Outcomes so far</h2>
+    <div class="metrics-grid">${statRow}</div>
+    <div class="hint" style="margin-top:8px">
+      ${stats.comparable} comparable ${stats.comparable === 1 ? "call" : "calls"}${
+        stats.skipped ? `, plus ${stats.skipped} skipped and excluded` : ""
+      }. Because every lead is called regardless of response, these three buckets are directly comparable across a batch.
+    </div>
+
+    <p style="margin-top:24px"><a href="/outreach" class="btn btn-sm">Back to outreach</a></p>
+  `,
+  });
+}
+
+return { loginPage, registerPage, totpVerifyPage, setupPage, securityPage, dashboardPage, freelancersPage, clientsPage, leadsPage, outreachQueuePage, leadDetailPage, revenuePage, logPage, historyPage, consentPage, mcpAboutPage, teamPage, auditPage, errorsPage, retentionPage, restrictedPage, errorPage, callQueuePage };
 })();
 
 // ===================== src/index.js ====================
@@ -4658,7 +5010,8 @@ export default {
           });
 
           if (result.ok) {
-            await db.markOutreachSent(env, lead.id);
+            // Opens the Sequence B call window in the same statement.
+            await db.markOutreachSent(env, lead.id, callWindowHours(env));
             await db.logAudit(env, user, "outreach_sent", "lead", lead.id, `${lead.name} <${lead.contact_email}>`, reqIp);
           } else {
             await db.logAudit(
@@ -4690,6 +5043,75 @@ export default {
               webhookReady: makeWebhookConfigured(env),
             })
           );
+        }
+
+        // ---- The call window (CRM step 3) ----
+        //
+        // Sequence B's step 9 -- wait a short window, then call regardless of
+        // whether they replied, then log the outcome. Before this existed the
+        // step happened, but nothing recorded that it had.
+        if (path === "/calls" && method === "GET") {
+          return html(
+            views.callQueuePage({
+              user,
+              csrf,
+              theme,
+              queue: await db.getCallQueue(env),
+              counts: await db.countCallQueue(env),
+              stats: await db.getCallOutcomeStats(env),
+              windowHours: callWindowHours(env),
+            })
+          );
+        }
+
+        const callLog = path.match(/^\/leads\/(\d+)\/call\/log$/);
+        if (callLog && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          // A double submit would put two calls on the timeline for one call.
+          if (!(await claimOnce(env, f))) return redirect(f.back === "calls" ? "/calls" : `/leads/${callLog[1]}`);
+
+          const lead = await db.getLeadById(env, callLog[1]);
+          if (!lead) return html(views.errorPage("That lead no longer exists.", 404, theme), 404);
+
+          if (!db.CALL_OUTCOMES.includes(f.outcome)) {
+            return html(views.errorPage("Pick one of the listed call outcomes.", 400, theme), 400);
+          }
+          // Logging a call for a lead that was never sent to would create a
+          // window that no send opened, and the outcome stats are only
+          // meaningful across leads that actually went through the sequence.
+          if (!lead.call_due_at) {
+            return html(
+              views.errorPage("No outreach has been sent to that lead yet, so there is no call window to close.", 400, theme),
+              400
+            );
+          }
+
+          await db.logCallOutcome(env, {
+            leadId: lead.id,
+            leadEmail: lead.contact_email,
+            outcome: f.outcome,
+            notes: f.notes,
+            actor: user.name,
+          });
+          await db.logAudit(env, user, "call_logged", "lead", lead.id, `${lead.name}: ${f.outcome}`, reqIp);
+          return redirect(f.back === "calls" ? "/calls" : `/leads/${lead.id}`);
+        }
+
+        const callReopen = path.match(/^\/leads\/(\d+)\/call\/reopen$/);
+        if (callReopen && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          const lead = await db.getLeadById(env, callReopen[1]);
+          if (!lead) return html(views.errorPage("That lead no longer exists.", 404, theme), 404);
+
+          await db.reopenCallWindow(env, lead.id);
+          // Audited because it changes what the outcome stats say. The logged
+          // call stays on the timeline either way.
+          await db.logAudit(env, user, "call_reopened", "lead", lead.id, `${lead.name}`, reqIp);
+          return redirect(`/leads/${lead.id}`);
         }
 
         // ---- Revenue ----

@@ -14,7 +14,14 @@
 const TARGET = process.env.TEST_TARGET || "../src/index.js";
 const worker = (await import(TARGET)).default;
 
-import { setPassword, totpCodeNow, generateTotpSecret, hashBackupCode, normalizeBackupCode } from "../src/auth.js";
+import {
+  setPassword,
+  totpCodeNow,
+  generateTotpSecret,
+  hashBackupCode,
+  normalizeBackupCode,
+  callWindowHours,
+} from "../src/auth.js";
 import * as db from "../src/db.js";
 import { makeEnv } from "./d1.mjs";
 
@@ -2406,7 +2413,12 @@ async function seedLead(env, over = {}) {
     stage: "qualified",
     ...over,
   });
-  return (await db.getLeads(env))[0];
+  // Highest id, not getLeads()[0]: getLeads orders by updated_at, which has
+  // second resolution, so with several leads seeded in one test the "first" row
+  // is whichever the tie broke toward -- and every later assertion would be
+  // pointed at the wrong lead.
+  const all = await db.getLeads(env);
+  return all.reduce((newest, l) => (l.id > newest.id ? l : newest), all[0]);
 }
 
 await test("a new lead starts unapproved and appears in the queue", async () => {
@@ -2602,6 +2614,299 @@ await test("the outreach page and its actions are founder-only and CSRF-guarded"
   eq(attempt.status, 404, "a freelancer cannot approve outreach");
   eq((await db.getLeadById(env, lead.id)).outreach_status, "pending", "still unchanged");
 });
+
+console.log("\nCall window & outcome log (CRM step 3)");
+
+// Sequence B: send, wait a short window, then call REGARDLESS of whether they
+// replied, then log the outcome. The decision log calls this the sequence's one
+// unbuilt dependency, so these tests care most about two things: that a window
+// only ever opens off a real send, and that the queue never quietly drops the
+// leads who replied.
+
+// Takes the caller's session rather than minting its own: founderSession seeds
+// a user, and a second one would collide on the unique email.
+async function sentLead(env, auth, over = {}) {
+  const seeded = await seedLead(env, over);
+  await db.setOutreachStatus(env, seeded.id, "approved", "Somila");
+  const stub = stubMakeEndpoint();
+  try {
+    await worker.fetch(
+      req(`/leads/${seeded.id}/outreach/send`, {
+        method: "POST",
+        cookies: { c7_session: auth.session },
+        form: { _csrf: auth.csrf },
+      }),
+      env
+    );
+  } finally {
+    stub.restore();
+  }
+  return db.getLeadById(env, seeded.id);
+}
+
+function hoursUntil(sqlUtc) {
+  return (Date.parse(String(sqlUtc).replace(" ", "T") + "Z") - Date.now()) / 3_600_000;
+}
+
+await test("a successful send opens the call window", async () => {
+  const env = sendingEnv();
+  const lead = await sentLead(env, await founderSession(env));
+  assert(lead.call_due_at, "the window is stamped on the lead, not left to a human to remember");
+  eq(lead.call_outcome, null, "no outcome yet");
+
+  const gap = hoursUntil(lead.call_due_at);
+  assert(gap > 17 && gap < 19, `default window is ~18h, got ${gap.toFixed(1)}h`);
+});
+
+await test("CALL_WINDOW_HOURS moves the window, and nonsense values cannot break it", async () => {
+  const env = sendingEnv();
+  env.CALL_WINDOW_HOURS = "4";
+  const lead = await sentLead(env, await founderSession(env));
+  const gap = hoursUntil(lead.call_due_at);
+  assert(gap > 3 && gap < 5, `respects the override, got ${gap.toFixed(1)}h`);
+
+  eq(callWindowHours({ CALL_WINDOW_HOURS: "0" }), 1, "zero would make every lead due instantly - clamped");
+  eq(callWindowHours({ CALL_WINDOW_HOURS: "-5" }), 1, "negative clamped");
+  eq(callWindowHours({ CALL_WINDOW_HOURS: "99999" }), 168, "absurd values would hide the queue forever - clamped");
+  eq(callWindowHours({ CALL_WINDOW_HOURS: "banana" }), 18, "unparseable falls back to the default");
+  eq(callWindowHours({}), 18, "unset falls back to the default");
+});
+
+await test("a FAILED send opens no window", async () => {
+  const env = sendingEnv();
+  const { session, csrf } = await founderSession(env);
+  const seeded = await seedLead(env);
+  await db.setOutreachStatus(env, seeded.id, "approved", "Somila");
+
+  const stub = stubMakeEndpoint({ status: 500, body: "Scenario failed" });
+  try {
+    await worker.fetch(
+      req(`/leads/${seeded.id}/outreach/send`, { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf } }),
+      env
+    );
+  } finally {
+    stub.restore();
+  }
+  const after = await db.getLeadById(env, seeded.id);
+  eq(after.call_due_at, null, "no email arrived, so calling would be a cold call, not sequence B");
+  const counts = await db.countCallQueue(env);
+  eq(counts.due + counts.waiting, 0, "and it stays out of the queue");
+});
+
+await test("the queue keeps leads who already replied - that is the point of sequence B", async () => {
+  const env = sendingEnv();
+  env.CALL_WINDOW_HOURS = "1";
+  const auth = await founderSession(env);
+  const { session } = auth;
+  const lead = await sentLead(env, auth);
+
+  await db.recordOutreachEvent(env, {
+    event_id: "evt_reply_1",
+    lead_id: lead.id,
+    lead_email: lead.contact_email,
+    kind: "reply",
+    occurred_at: new Date().toISOString(),
+    source: "make_outreach",
+  });
+
+  const queue = await db.getCallQueue(env);
+  eq(queue.length, 1, "still queued after replying - filtering repliers out would bias the outcome data");
+  assert(queue[0].replied_since_send, "but the caller is told they replied");
+
+  const page = await (await worker.fetch(req("/calls", { cookies: { c7_session: session } }), env)).text();
+  has(page, "Thandi Mokoena", "shown on the calls page");
+  has(page, "call anyway", "and the page says so out loud");
+});
+
+await test("logging an outcome closes the window and lands on the timeline", async () => {
+  const env = sendingEnv();
+  const { session, csrf } = await founderSession(env);
+  const lead = await sentLead(env, { session, csrf });
+
+  const res = await worker.fetch(
+    req(`/leads/${lead.id}/call/log`, {
+      method: "POST",
+      cookies: { c7_session: session },
+      form: { _csrf: csrf, outcome: "picked_up_cold", notes: "Wants the audit emailed over." },
+    }),
+    env
+  );
+  eq(res.status, 302, "redirects back");
+
+  const after = await db.getLeadById(env, lead.id);
+  eq(after.call_outcome, "picked_up_cold", "outcome recorded");
+  assert(after.call_logged_at, "and when");
+  assert(after.call_logged_by, "and by whom, not by 'the system'");
+
+  const events = await db.getOutreachForLead(env, lead.id);
+  const call = events.find((e) => e.kind === "call");
+  assert(call, "the call is on the ledger, not only in a lead column");
+  eq(call.subject, "Picked up cold", "with the same wording the queue showed");
+  has(call.detail, "audit emailed over", "notes kept");
+  eq(call.sequence, "sequence_b", "attributed to the sequence it belongs to");
+
+  eq((await db.getCallQueue(env)).length, 0, "gone from the queue");
+  assert((await auditActions(env)).includes("call_logged"), "audited");
+});
+
+await test("an outcome outside the agreed set is refused", async () => {
+  const env = sendingEnv();
+  const { session, csrf } = await founderSession(env);
+  const lead = await sentLead(env, { session, csrf });
+
+  for (const outcome of ["", "maybe", "DROP TABLE leads", "picked_up"]) {
+    const res = await worker.fetch(
+      req(`/leads/${lead.id}/call/log`, { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf, outcome } }),
+      env
+    );
+    eq(res.status, 400, `refused: ${outcome || "(empty)"}`);
+  }
+  eq((await db.getLeadById(env, lead.id)).call_outcome, null, "nothing written");
+  eq((await db.getOutreachForLead(env, lead.id)).filter((e) => e.kind === "call").length, 0, "no phantom call events");
+});
+
+await test("a call cannot be logged against a lead nothing was sent to", async () => {
+  const env = sendingEnv();
+  const { session, csrf } = await founderSession(env);
+  const seeded = await seedLead(env); // never sent to
+
+  const res = await worker.fetch(
+    req(`/leads/${seeded.id}/call/log`, {
+      method: "POST",
+      cookies: { c7_session: session },
+      form: { _csrf: csrf, outcome: "no_response" },
+    }),
+    env
+  );
+  eq(res.status, 400, "refused - the stats only mean something across leads that went through the sequence");
+  eq((await db.getLeadById(env, seeded.id)).call_outcome, null, "unchanged");
+});
+
+await test("double-submitting the log form records one call", async () => {
+  const env = sendingEnv();
+  const { session, csrf } = await founderSession(env);
+  const lead = await sentLead(env, { session, csrf });
+
+  const nonce = crypto.randomUUID();
+  const submit = () =>
+    worker.fetch(
+      req(`/leads/${lead.id}/call/log`, {
+        method: "POST",
+        cookies: { c7_session: session },
+        form: { _csrf: csrf, _nonce: nonce, outcome: "no_response" },
+      }),
+      env
+    );
+  await submit();
+  await submit();
+  eq(
+    (await db.getOutreachForLead(env, lead.id)).filter((e) => e.kind === "call").length,
+    1,
+    "one call on the timeline, not two"
+  );
+});
+
+await test("reopening clears the outcome but never erases the logged call", async () => {
+  const env = sendingEnv();
+  const { session, csrf } = await founderSession(env);
+  const lead = await sentLead(env, { session, csrf });
+
+  await worker.fetch(
+    req(`/leads/${lead.id}/call/log`, { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf, outcome: "skipped" } }),
+    env
+  );
+  await worker.fetch(
+    req(`/leads/${lead.id}/call/reopen`, { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf } }),
+    env
+  );
+
+  const after = await db.getLeadById(env, lead.id);
+  eq(after.call_outcome, null, "back in the queue");
+  assert(after.call_due_at, "the original window is kept - a correction is not a new send");
+  eq(
+    (await db.getOutreachForLead(env, lead.id)).filter((e) => e.kind === "call").length,
+    1,
+    "the ledger still says a call was logged - a correction does not get to rewrite what was done"
+  );
+  assert((await auditActions(env)).includes("call_reopened"), "audited");
+});
+
+await test("skipped calls are counted but kept out of the comparable set", async () => {
+  const env = sendingEnv();
+  const { session, csrf } = await founderSession(env);
+  for (const outcome of ["picked_up_cold", "replied_first", "no_response", "skipped"]) {
+    const lead = await sentLead(env, { session, csrf }, { contact_email: `${outcome}@bakery.co.za`, name: `Lead ${outcome}` });
+    await worker.fetch(
+      req(`/leads/${lead.id}/call/log`, { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf, outcome } }),
+      env
+    );
+  }
+  const stats = await db.getCallOutcomeStats(env);
+  eq(stats.skipped, 1, "skipped is still counted");
+  eq(stats.comparable, 3, "but a call that never happened says nothing about whether calling works");
+
+  const page = await (await worker.fetch(req("/calls", { cookies: { c7_session: session } }), env)).text();
+  has(page, "3 comparable calls", "the page says which number is the comparable one");
+  has(page, "1 skipped and excluded", "and is explicit that skipped is excluded");
+});
+
+await test("a re-send opens a fresh window and drops the previous outcome", async () => {
+  const env = sendingEnv();
+  const { session, csrf } = await founderSession(env);
+  const lead = await sentLead(env, { session, csrf });
+  await worker.fetch(
+    req(`/leads/${lead.id}/call/log`, { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf, outcome: "no_response" } }),
+    env
+  );
+
+  const stub = stubMakeEndpoint();
+  try {
+    await worker.fetch(
+      req(`/leads/${lead.id}/outreach/send`, { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf } }),
+      env
+    );
+  } finally {
+    stub.restore();
+  }
+  const after = await db.getLeadById(env, lead.id);
+  eq(after.call_outcome, null, "the old outcome would otherwise be read as the new call's result");
+  eq((await db.getCallQueue(env)).length, 1, "back in the queue for the new send");
+  eq(
+    (await db.getOutreachForLead(env, lead.id)).filter((e) => e.kind === "call").length,
+    1,
+    "the first call is still in the history"
+  );
+});
+
+await test("the calls page and its actions are founder-only and CSRF-guarded", async () => {
+  const env = sendingEnv();
+  const auth = await founderSession(env);
+  const { session } = auth;
+  const lead = await sentLead(env, auth);
+
+  const noCsrf = await worker.fetch(
+    req(`/leads/${lead.id}/call/log`, { method: "POST", cookies: { c7_session: session }, form: { outcome: "no_response" } }),
+    env
+  );
+  eq(noCsrf.status, 403, "logging needs a CSRF token");
+  eq((await db.getLeadById(env, lead.id)).call_outcome, null, "unchanged");
+
+  const fl = await seedFreelancer(env);
+  const { session: theirs } = await login(env, fl.email, FREELANCER_PW);
+  eq((await worker.fetch(req("/calls", { cookies: { c7_session: theirs } }), env)).status, 404, "calls page is founder-only");
+  const theirCsrf = await csrfFor(env, theirs);
+  const attempt = await worker.fetch(
+    req(`/leads/${lead.id}/call/log`, {
+      method: "POST",
+      cookies: { c7_session: theirs },
+      form: { _csrf: theirCsrf, outcome: "picked_up_cold" },
+    }),
+    env
+  );
+  eq(attempt.status, 404, "a freelancer cannot log a call");
+  eq((await db.getLeadById(env, lead.id)).call_outcome, null, "still unchanged");
+});
+
 
 console.log("\nSecurity headers");
 

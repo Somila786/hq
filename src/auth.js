@@ -414,6 +414,23 @@ export function outreachSendingConfigured(env) {
   return !!(env.MAKE_OUTREACH_URL && env.MAKE_WEBHOOK_SECRET);
 }
 
+// How long Sequence B's "short window" runs before the call is due, in hours
+// from the send. The decision log says "same day or next morning"; 18 hours
+// delivers that from either a morning or an afternoon send, which is why it is
+// the default. Override with a CALL_WINDOW_HOURS variable on the Worker.
+//
+// Clamped rather than trusted: a misconfigured value that parsed as 0 would
+// make every lead due instantly and the queue meaningless, and one that parsed
+// as 100000 would hide the queue forever. Both fail quietly, which is worse
+// than being wrong loudly, so neither is reachable.
+export const CALL_WINDOW_DEFAULT_HOURS = 18;
+
+export function callWindowHours(env) {
+  const raw = Number(env?.CALL_WINDOW_HOURS);
+  if (!Number.isFinite(raw)) return CALL_WINDOW_DEFAULT_HOURS;
+  return Math.min(168, Math.max(1, Math.round(raw)));
+}
+
 // The C7 webhook envelope, signed the same way Make signs its posts to us.
 // `data` carries the lead fields Make's Gmail module needs to map.
 export function buildOutreachPayload(lead, actor) {

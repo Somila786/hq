@@ -46,7 +46,8 @@ export async function getLeads(env) {
     `SELECT id, name, company, contact_email, stage, value_estimate, source, owner, notes,
             created_at, updated_at,
             COALESCE(outreach_status,'pending') AS outreach_status,
-            outreach_approved_by, outreach_approved_at, outreach_last_sent_at
+            outreach_approved_by, outreach_approved_at, outreach_last_sent_at,
+            call_due_at, call_outcome, call_logged_at, call_logged_by
      FROM leads ORDER BY CASE stage WHEN 'won' THEN 1 WHEN 'lost' THEN 1 ELSE 0 END, updated_at DESC`
   ).all();
   return results;
@@ -606,7 +607,8 @@ export async function getLeadById(env, id) {
     `SELECT id, name, company, contact_email, stage, value_estimate, source, owner, notes,
             created_at, updated_at,
             COALESCE(outreach_status,'pending') AS outreach_status,
-            outreach_approved_by, outreach_approved_at, outreach_last_sent_at
+            outreach_approved_by, outreach_approved_at, outreach_last_sent_at,
+            call_due_at, call_outcome, call_logged_at, call_logged_by
      FROM leads WHERE id = ?`
   )
     .bind(id)
@@ -676,8 +678,124 @@ export async function setOutreachStatus(env, id, status, actor) {
     .run();
 }
 
-export async function markOutreachSent(env, id) {
-  return env.DB.prepare("UPDATE leads SET outreach_last_sent_at = datetime('now') WHERE id = ?").bind(id).run();
+// A successful send is what opens the Sequence B call window, so the two are
+// stamped together. Doing it here rather than in the route means there is no
+// path that records a send without also putting the call on the tracker --
+// which was the exact failure the decision log describes as "off the tracker".
+//
+// Any prior outcome is cleared: a re-send starts a fresh window, and leaving the
+// old outcome would attribute a previous call to the new one.
+export async function markOutreachSent(env, id, windowHours = 18) {
+  const hours = Math.min(168, Math.max(1, Math.round(Number(windowHours) || 18)));
+  return env.DB.prepare(
+    `UPDATE leads
+        SET outreach_last_sent_at = datetime('now'),
+            call_due_at = datetime('now', ?),
+            call_outcome = NULL,
+            call_logged_at = NULL,
+            call_logged_by = NULL
+      WHERE id = ?`
+  )
+    .bind(`+${hours} hours`, id)
+    .run();
+}
+
+// ---- The call window (CRM step 3) ----
+//
+// Sequence B calls REGARDLESS of whether the lead replied, so this queue is
+// deliberately not filtered by reply state. `replied_since_send` is carried
+// along as context for the person making the call, not as a reason to skip it.
+export const CALL_OUTCOMES = ["picked_up_cold", "replied_first", "no_response", "skipped"];
+
+export const CALL_OUTCOME_LABELS = {
+  picked_up_cold: "Picked up cold",
+  replied_first: "Replied first",
+  no_response: "No response",
+  skipped: "Skipped",
+};
+
+export async function getCallQueue(env, limit = 200) {
+  const { results } = await env.DB.prepare(
+    `SELECT l.id, l.name, l.company, l.contact_email, l.stage, l.owner, l.source,
+            l.value_estimate, l.outreach_last_sent_at, l.call_due_at,
+            l.call_due_at <= datetime('now') AS due_now,
+            EXISTS (
+              SELECT 1 FROM outreach_events o
+               WHERE o.lead_id = l.id AND o.kind = 'reply'
+                 AND o.occurred_at >= COALESCE(l.outreach_last_sent_at, '0000')
+            ) AS replied_since_send
+       FROM leads l
+      WHERE l.call_due_at IS NOT NULL AND l.call_outcome IS NULL
+      ORDER BY l.call_due_at ASC
+      LIMIT ?`
+  )
+    .bind(limit)
+    .all();
+  return results;
+}
+
+export async function countCallQueue(env) {
+  const row = await env.DB.prepare(
+    `SELECT
+       SUM(call_due_at <= datetime('now')) AS due,
+       SUM(call_due_at >  datetime('now')) AS waiting
+     FROM leads WHERE call_due_at IS NOT NULL AND call_outcome IS NULL`
+  ).first();
+  return { due: row?.due || 0, waiting: row?.waiting || 0 };
+}
+
+// The comparable data the sequence exists to produce. `skipped` is counted but
+// kept out of `comparable`, because a call that never happened says nothing
+// about whether calling works.
+export async function getCallOutcomeStats(env) {
+  const { results } = await env.DB.prepare(
+    `SELECT call_outcome AS outcome, COUNT(*) AS n
+       FROM leads WHERE call_outcome IS NOT NULL GROUP BY call_outcome`
+  ).all();
+  const by = Object.fromEntries(results.map((r) => [r.outcome, r.n]));
+  const counts = Object.fromEntries(CALL_OUTCOMES.map((o) => [o, by[o] || 0]));
+  counts.comparable = counts.picked_up_cold + counts.replied_first + counts.no_response;
+  return counts;
+}
+
+// Closes the window and writes the call into the ledger in one go. The event
+// carries the same wording the queue showed, so the timeline and the queue can
+// never disagree about what was recorded.
+export async function logCallOutcome(env, { leadId, leadEmail, outcome, notes, actor }) {
+  if (!CALL_OUTCOMES.includes(outcome)) throw new Error(`unknown call outcome: ${outcome}`);
+  const occurredAt = new Date().toISOString();
+  await recordOutreachEvent(env, {
+    event_id: `evt_call_${crypto.randomUUID()}`,
+    lead_id: leadId,
+    lead_email: leadEmail || null,
+    kind: "call",
+    sequence: "sequence_b",
+    step: "call",
+    subject: CALL_OUTCOME_LABELS[outcome],
+    detail: notes ? String(notes).slice(0, 1000) : null,
+    occurred_at: occurredAt,
+    source: "catalyst7_hq",
+  });
+  await env.DB.prepare(
+    `UPDATE leads SET call_outcome = ?, call_logged_at = datetime('now'), call_logged_by = ?
+      WHERE id = ?`
+  )
+    .bind(outcome, actor || null, leadId)
+    .run();
+  return occurredAt;
+}
+
+// Reopening is a correction, not a new window: it clears the outcome and puts
+// the lead back where it was, rather than pretending a fresh send happened.
+// The logged call stays in the ledger -- the record of what was done is not
+// something a correction gets to erase.
+export async function reopenCallWindow(env, id) {
+  return env.DB.prepare(
+    `UPDATE leads SET call_outcome = NULL, call_logged_at = NULL, call_logged_by = NULL
+      WHERE id = ?`
+  )
+    .bind(id)
+    .run();
 }
 
 // The review queue: everything still awaiting a decision, newest first.

@@ -39,7 +39,7 @@ Cloudflare D1 (managed SQLite), already created and live: `catalyst7-kpi` (`ba62
 | `users` | Login accounts + role | Email, name, password hash + salt |
 | `freelancers` | Contractor roster | Name, email, rate |
 | `clients` | Client roster | Name, contact name/email |
-| `leads` | Pipeline | Name, company, contact email |
+| `leads` | Pipeline, plus outreach approval and the Sequence B call window | Name, company, contact email |
 | `weekly_entries` | Freelancer hours/deliverables per week | Linked to freelancer_id |
 | `revenue_entries` | Revenue per week per client | Amount, client link |
 | `sessions` | Login sessions | Session token + CSRF token only (not personal data) |
@@ -50,6 +50,7 @@ Cloudflare D1 (managed SQLite), already created and live: `catalyst7-kpi` (`ba62
 | `retention_flags` | Records due for a retention decision | Entity link + reason |
 | `oauth_states` | In-flight Google sign-in handshakes (10 min TTL, single-use) | None — nonce + PKCE verifier only |
 | `totp_backup_codes` | Single-use 2FA recovery codes | None — SHA-256 hashes only |
+| `outreach_events` | Ledger of emails sent/replied/bounced, and calls logged | Lead email, subject, reply/call notes |
 
 14 tables total now (7 original + 5 in the security hardening pass + 2 for Google sign-in and backup codes).
 
@@ -60,7 +61,13 @@ Migration `001` (the two newest tables plus `users.google_sub`) **has been appli
 - All queries are parameterized (`.bind()`) — no string-concatenated SQL, so no SQL injection surface.
 - `CHECK` constraints enforce valid values at the database layer (e.g. lead stage, revenue type) — tested live, confirmed rejecting bad data.
 - No ORM. Deliberate — this schema is small enough that a query layer adds more indirection than value.
-- All of the above verified with 63 end-to-end tests (`tests/run.mjs`) run against a real SQLite engine (Node's `node:sqlite`) loaded with this exact schema and exercising the actual `src/` code — not a reimplementation. All 63 pass.
+- All of the above verified with 125 end-to-end tests (`tests/run.mjs`) run against a real SQLite engine (Node's `node:sqlite`) loaded with this exact schema and exercising the actual `src/` code — not a reimplementation. All 125 pass, and the same suite also runs against the built `dist/worker.js` (`npm run test:bundle`).
+
+### CRM outreach columns on `leads`
+
+`outreach_status` / `outreach_approved_by` / `outreach_approved_at` are the approval gate (migration 007). It is deliberately a separate axis from `stage`: stage says where a deal is, approval says whether a human cleared this person to be emailed. Conflating them would let a pipeline move silently authorise an email.
+
+`call_due_at` / `call_outcome` / `call_logged_at` / `call_logged_by` are the Sequence B call window (migration 008). `call_due_at` is stamped in the same statement that records a successful send, so there is no code path that sends without also putting the follow-up call on the tracker. The outcome itself is written into `outreach_events` as `kind = 'call'` — the lead columns are only a projection of what is due now, and the ledger stays the record of what happened. The webhook's inbound `kind` allowlist stays at the original four; `call` is only ever written from inside HQ, because Make has no way of knowing a call happened.
 
 ## 4. Privacy — POPIA
 

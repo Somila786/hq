@@ -62,10 +62,18 @@ CREATE TABLE IF NOT EXISTS leads (
   outreach_status TEXT DEFAULT 'pending',
   outreach_approved_by TEXT,
   outreach_approved_at TEXT,
-  outreach_last_sent_at TEXT
+  outreach_last_sent_at TEXT,
+  -- The Sequence B call window (see migrations/008_call_window.sql). call_due_at
+  -- is when the window closes, stamped on a successful send. It orders the call
+  -- queue; it never blocks an early call.
+  call_due_at TEXT,
+  call_outcome TEXT,
+  call_logged_at TEXT,
+  call_logged_by TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_leads_outreach ON leads (outreach_status);
+CREATE INDEX IF NOT EXISTS idx_leads_call_due ON leads (call_due_at) WHERE call_outcome IS NULL;
 
 CREATE TABLE IF NOT EXISTS weekly_entries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -231,14 +239,15 @@ CREATE INDEX IF NOT EXISTS idx_mcp_tokens_user ON mcp_tokens (user_id, kind);
 CREATE INDEX IF NOT EXISTS idx_oauth_codes_expiry ON oauth_codes (expires_at);
 
 -- ---- Outreach ledger (see migrations/006_outreach_events.sql) ----
--- What Make actually sent, what came back, what failed. event_id is UNIQUE so
--- a webhook retry lands once.
+-- What Make actually sent, what came back, what failed, and the calls a founder
+-- logged. event_id is UNIQUE so a webhook retry lands once.
+-- 'call' is written only from inside HQ; the webhook's allowlist stays at four.
 CREATE TABLE IF NOT EXISTS outreach_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   event_id TEXT UNIQUE NOT NULL,
   lead_id INTEGER REFERENCES leads(id),
   lead_email TEXT,
-  kind TEXT NOT NULL CHECK(kind IN ('sent','reply','bounce','failed')),
+  kind TEXT NOT NULL CHECK(kind IN ('sent','reply','bounce','failed','call')),
   sequence TEXT,
   step TEXT,
   subject TEXT,
