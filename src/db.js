@@ -700,6 +700,38 @@ export async function markOutreachSent(env, id, windowHours = 18) {
     .run();
 }
 
+// A send that HQ did not trigger still has to open a window. Make sends most of
+// the Apify pipeline's email, and without this those leads would never reach
+// /calls -- the queue would sit empty while outreach went out, which is the
+// exact "off the tracker" failure this step exists to fix.
+//
+// Three guards, all of them about a webhook being an untrusted, retryable,
+// possibly-late messenger:
+//   - The window is dated off the event's own occurred_at, not now. A webhook
+//     that arrives six hours late must not push the call six hours out.
+//   - It only moves forward. An out-of-order delivery of an older `sent` event
+//     cannot roll a newer window back, and cannot wipe an outcome already
+//     logged against a later send.
+//   - datetime() normalises the ISO timestamp to D1's stored format. Comparing
+//     the raw ISO string against a stored SQL datetime would compare "T"
+//     against " " and always look newer, defeating the guard entirely.
+export async function openCallWindowFromEvent(env, id, occurredAt, windowHours = 18) {
+  const hours = Math.min(168, Math.max(1, Math.round(Number(windowHours) || 18)));
+  const res = await env.DB.prepare(
+    `UPDATE leads
+        SET outreach_last_sent_at = datetime(?),
+            call_due_at = datetime(?, ?),
+            call_outcome = NULL,
+            call_logged_at = NULL,
+            call_logged_by = NULL
+      WHERE id = ?
+        AND datetime(?) > COALESCE(outreach_last_sent_at, '0000')`
+  )
+    .bind(occurredAt, occurredAt, `+${hours} hours`, id, occurredAt)
+    .run();
+  return res.meta.changes === 1;
+}
+
 // ---- The call window (CRM step 3) ----
 //
 // Sequence B calls REGARDLESS of whether the lead replied, so this queue is

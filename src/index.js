@@ -472,6 +472,21 @@ export default {
           source: typeof payload.source === "string" ? payload.source.slice(0, 80) : null,
         });
 
+        // An email actually went out, so the Sequence B call window opens --
+        // whoever pressed send. Only on a first delivery: replaying a stored
+        // event must not reset a window or discard a call already logged.
+        if (stored && lead && kind === "sent") {
+          const opened = await db.openCallWindowFromEvent(
+            env,
+            lead.id,
+            new Date(timestamp).toISOString(),
+            callWindowHours(env)
+          );
+          if (opened) {
+            await db.logAudit(env, null, "call_window_opened", "lead", lead.id, lead.name, reqIp);
+          }
+        }
+
         // A duplicate is a success from Make's point of view -- returning an
         // error would make it retry forever.
         return json({

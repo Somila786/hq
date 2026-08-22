@@ -2908,6 +2908,138 @@ await test("the calls page and its actions are founder-only and CSRF-guarded", a
 });
 
 
+// A send Make made itself must still open the window. Most of the Apify
+// pipeline's email is sent by the scenario, not by HQ, so without this the
+// queue would sit empty while outreach went out.
+
+async function postSent(env, { email, at, eventId = `evt_${crypto.randomUUID()}`, kind = "sent" }) {
+  const payload = {
+    event_id: eventId,
+    timestamp: at || new Date().toISOString(),
+    source: "make_outreach",
+    form_name: "outreach_event_v1",
+    data: { kind, email, sequence: "cold_outreach_v2", step: 1, subject: "Quick question" },
+  };
+  const body = JSON.stringify(payload);
+  const sig = await signBody(env.MAKE_WEBHOOK_SECRET, body);
+  return worker.fetch(
+    new Request("https://hq.test/webhooks/make", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Signature-256": `sha256=${sig}` },
+      body,
+    }),
+    env
+  );
+}
+
+await test("a send reported by Make opens the call window too", async () => {
+  const env = sendingEnv();
+  const seeded = await seedLead(env);
+  eq(seeded.call_due_at, null, "no window before the send");
+
+  const res = await postSent(env, { email: "thandi@bakery.co.za" });
+  eq(res.status, 200, "webhook accepted");
+
+  const after = await db.getLeadById(env, seeded.id);
+  assert(after.call_due_at, "Make sent it, so the call is still due - the queue must not sit empty while outreach goes out");
+  eq((await db.getCallQueue(env)).length, 1, "and it is in the queue");
+  assert((await auditActions(env)).includes("call_window_opened"), "audited");
+});
+
+await test("the window is dated off the event, not off when the webhook arrived", async () => {
+  const env = sendingEnv();
+  const seeded = await seedLead(env);
+
+  // Make fires late: the email went out 6 hours ago.
+  const sixHoursAgo = new Date(Date.now() - 6 * 3_600_000).toISOString();
+  await postSent(env, { email: "thandi@bakery.co.za", at: sixHoursAgo });
+
+  const after = await db.getLeadById(env, seeded.id);
+  const gap = (Date.parse(String(after.call_due_at).replace(" ", "T") + "Z") - Date.now()) / 3_600_000;
+  assert(gap > 11 && gap < 13, `18h from the send, i.e. ~12h from now, got ${gap.toFixed(1)}h`);
+});
+
+await test("a replayed webhook cannot reset the window or discard a logged call", async () => {
+  const env = sendingEnv();
+  const { session, csrf } = await founderSession(env);
+  const seeded = await seedLead(env);
+
+  const eventId = "evt_stable_1";
+  await postSent(env, { email: "thandi@bakery.co.za", eventId });
+  await worker.fetch(
+    req(`/leads/${seeded.id}/call/log`, {
+      method: "POST",
+      cookies: { c7_session: session },
+      form: { _csrf: csrf, outcome: "no_response" },
+    }),
+    env
+  );
+
+  // Make retries the same event.
+  const res = await postSent(env, { email: "thandi@bakery.co.za", eventId });
+  eq(res.status, 200, "retry still succeeds, or Make would retry forever");
+
+  const after = await db.getLeadById(env, seeded.id);
+  eq(after.call_outcome, "no_response", "the logged call survives the replay");
+  eq((await db.getCallQueue(env)).length, 0, "and it does not reappear in the queue");
+});
+
+await test("an out-of-order older send cannot roll a newer window back", async () => {
+  const env = sendingEnv();
+  const seeded = await seedLead(env);
+
+  await postSent(env, { email: "thandi@bakery.co.za", at: new Date().toISOString(), eventId: "evt_new" });
+  const newWindow = (await db.getLeadById(env, seeded.id)).call_due_at;
+
+  // A much older send event turns up afterwards.
+  const twoDaysAgo = new Date(Date.now() - 48 * 3_600_000).toISOString();
+  await postSent(env, { email: "thandi@bakery.co.za", at: twoDaysAgo, eventId: "evt_old" });
+
+  eq((await db.getLeadById(env, seeded.id)).call_due_at, newWindow, "the newer window stands");
+});
+
+await test("an out-of-order send on the SAME DAY cannot roll the window back", async () => {
+  const env = sendingEnv();
+  const seeded = await seedLead(env);
+
+  // Both on yesterday's UTC date, so the day part is identical and only the
+  // time separates them. This is the case that catches an unnormalised
+  // comparison: raw ISO puts "T" where the stored format has a space, and "T"
+  // sorts after " ", so an older same-day event would look newer than
+  // everything and sail through the forward-only guard.
+  const day = new Date(Date.now() - 24 * 3_600_000).toISOString().slice(0, 10);
+  const later = `${day}T12:00:00.000Z`;
+  const earlier = `${day}T09:00:00.000Z`;
+
+  await postSent(env, { email: "thandi@bakery.co.za", at: later, eventId: "evt_late" });
+  const window = (await db.getLeadById(env, seeded.id)).call_due_at;
+
+  await postSent(env, { email: "thandi@bakery.co.za", at: earlier, eventId: "evt_early" });
+  eq((await db.getLeadById(env, seeded.id)).call_due_at, window, "the 12:00 send still owns the window, not the 09:00 one");
+});
+
+await test("replies and bounces do not open a call window", async () => {
+  const env = sendingEnv();
+  const seeded = await seedLead(env);
+
+  await postSent(env, { email: "thandi@bakery.co.za", kind: "reply", eventId: "evt_r" });
+  await postSent(env, { email: "thandi@bakery.co.za", kind: "bounce", eventId: "evt_b" });
+
+  const after = await db.getLeadById(env, seeded.id);
+  eq(after.call_due_at, null, "nothing was sent, so there is nothing to follow up");
+  eq((await db.getCallQueue(env)).length, 0, "queue stays empty");
+});
+
+await test("a send to an address with no lead opens no window and still records", async () => {
+  const env = sendingEnv();
+  await seedLead(env);
+  const res = await postSent(env, { email: "nobody@nowhere.test" });
+  eq(res.status, 200, "still accepted");
+  eq((await db.getCallQueue(env)).length, 0, "no lead, no window");
+  eq((await db.getUnmatchedOutreach(env)).length, 1, "but the event is kept, not dropped");
+});
+
+
 console.log("\nSecurity headers");
 
 await test("every response carries the security header set", async () => {

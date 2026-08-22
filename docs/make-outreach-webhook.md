@@ -209,14 +209,24 @@ Nothing to configure. It switches itself on the first time a send succeeds.
 
 ## How it works
 
-1. A send succeeds → HQ stamps a **call window** on the lead, closing 18 hours
-   later. The window and the send are written in one statement, so there is no
-   path that records a send without also putting the call on the tracker.
+1. An email goes out → HQ stamps a **call window** on the lead, closing 18 hours
+   later.
 2. The lead appears on **`/calls`**, sorted by how overdue it is.
 3. You call, pick an outcome, and hit **Log call**.
 
+**Both send paths open a window** — the one you trigger from HQ, and one your
+scenario reports through `/webhooks/make` with `kind: "sent"`. That second path
+matters: the Apify orchestrator sends most of your email itself, and if only
+HQ-triggered sends counted, `/calls` would sit empty while outreach went out.
+
 A failed send opens **no** window. If the email never left, calling would be a
-cold call, not Sequence B.
+cold call, not Sequence B. Replies and bounces don't open one either.
+
+A window opened from a webhook is dated off the event's own `timestamp`, not
+off when the webhook landed, so a scenario that fires late doesn't push the call
+out by however late it was. Windows only ever move forward: replaying a stored
+event, or an out-of-order delivery of an older `sent`, can't roll a window back
+or discard a call you've already logged.
 
 ## Changing the window
 
