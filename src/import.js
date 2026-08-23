@@ -95,7 +95,7 @@ function pick(row, names) {
 // number in the email column, not to adjudicate RFC 5322 -- an over-strict
 // pattern would silently drop real addresses, which is worse than letting an
 // odd one through for a human to notice on the lead.
-function looksLikeEmail(s) {
+export function looksLikeEmail(s) {
   return typeof s === "string" && /^[^\s@]+@[^\s@.]+\.[^\s@]+$/.test(s);
 }
 

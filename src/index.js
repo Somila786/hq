@@ -57,7 +57,7 @@ import {
 } from "./auth.js";
 import * as db from "./db.js";
 import * as views from "./views.js";
-import { parseLeads, classifyLeads } from "./import.js";
+import { parseLeads, classifyLeads, looksLikeEmail } from "./import.js";
 
 // ---- Security response headers ----
 //
@@ -194,11 +194,14 @@ function json(body, status = 200, extraHeaders = {}) {
   });
 }
 
-// ---- MCP tool surface (read-only) ----
+// ---- MCP tool surface ----
 //
 // Every tool runs with the HQ user the token was issued for, and reuses the
 // same role rules as the web UI: a founder sees the business, a freelancer
-// sees only their own log. Nothing here writes.
+// sees only their own log.
+//
+// Six reads, and two writes that put leads IN and record what was found about
+// them. Nothing here approves outreach or sends anything -- see MCP_FORBIDDEN.
 const MCP_TOOLS = [
   {
     name: "get_week_summary",
@@ -245,6 +248,62 @@ const MCP_TOOLS = [
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
+    name: "create_leads",
+    description:
+      "Add one or more leads to the Catalyst 7 pipeline — typically businesses just scraped from Apify. " +
+      "Put the qualifying research in `notes`: the gap you found, whether they have a website, rating and review " +
+      "count, and the wedge you would lead with. That is what the founder reads when deciding whether to approve " +
+      "outreach. Leads with an email address already in the pipeline are skipped, so re-running a scrape is safe. " +
+      "New leads always land awaiting approval — this does NOT authorise any email. Founders only.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        leads: {
+          type: "array",
+          minItems: 1,
+          maxItems: 200,
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string", description: "Business or person name. Required." },
+              company: { type: "string", description: "Company, if different from name." },
+              contact_email: { type: "string", description: "Email. Outreach matches on this, so it matters." },
+              value_estimate: { type: "number", description: "Estimated deal value in rand." },
+              source: { type: "string", description: "Where it came from, e.g. apify. Defaults to apify." },
+              notes: { type: "string", description: "The qualifying research: gap, website, rating, wedge." },
+            },
+            required: ["name"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["leads"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "qualify_lead",
+    description:
+      "Record qualification on an existing lead: move its stage, set an estimated value, and append what you found. " +
+      "Notes are APPENDED, never overwritten, so the original scrape context survives. Use list_leads to get the id. " +
+      "This does not approve anything for outreach. Founders only.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        lead_id: { type: "integer", description: "The lead's id, from list_leads." },
+        stage: {
+          type: "string",
+          enum: ["new", "contacted", "qualified", "proposal", "won", "lost"],
+          description: "Where the deal now sits. Qualifying usually means 'qualified' or 'lost'.",
+        },
+        value_estimate: { type: "number", description: "Estimated deal value in rand." },
+        notes: { type: "string", description: "What you found — the gap, the wedge, why they do or don't fit." },
+      },
+      required: ["lead_id"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "get_my_weekly_log",
     description:
       "Your own weekly log history — hours, deliverables and status for recent weeks. Works for any signed-in user; a freelancer sees only their own entries.",
@@ -258,15 +317,120 @@ const MCP_TOOLS = [
   },
 ];
 
-const FOUNDER_ONLY = new Set(["get_week_summary", "list_leads", "list_clients", "list_revenue", "list_freelancers"]);
+const FOUNDER_ONLY = new Set([
+  "get_week_summary",
+  "list_leads",
+  "list_clients",
+  "list_revenue",
+  "list_freelancers",
+  "create_leads",
+  "qualify_lead",
+]);
+
+// The line this connector does not cross. Claude can put leads in and write
+// what it found; approving outreach and triggering a send stay in the web UI,
+// behind a founder who clicked. That gate is why the outreach is any good, and
+// an agent that could authorise its own sends would quietly remove it.
+const MCP_FORBIDDEN = new Set(["approve_outreach", "send_outreach", "reject_outreach", "delete_lead"]);
 
 const money = (n) => "R" + Number(n || 0).toLocaleString("en-ZA", { maximumFractionDigits: 0 });
 
-async function runMcpTool(name, args, { env, user }) {
+async function runMcpTool(name, args, { env, user, ip = null }) {
+  // Belt and braces. Nothing routes to these names today, but if one is ever
+  // added to MCP_TOOLS by accident it fails closed rather than handing an agent
+  // the ability to authorise its own outreach.
+  if (MCP_FORBIDDEN.has(name)) {
+    return "Approving and sending outreach is deliberately not available through this connector. Do it in HQ at /outreach.";
+  }
+
   if (FOUNDER_ONLY.has(name) && user.role !== "founder") {
     // Same rule as the web UI, enforced server-side rather than by hiding the
     // tool: a freelancer's token cannot read business data.
     return `That information is only available to founders. You're signed in as ${user.name} (freelancer).`;
+  }
+
+  if (name === "create_leads") {
+    const incoming = Array.isArray(args.leads) ? args.leads : [];
+    if (!incoming.length) return "No leads given — pass a `leads` array with at least one entry.";
+    if (incoming.length > 200) return `That's ${incoming.length} leads; the limit is 200 per call. Split it up.`;
+
+    const { emails } = await db.getLeadDedupeKeys(env);
+    const seen = new Set();
+    const created = [];
+    const skipped = [];
+    const rejected = [];
+
+    for (const raw of incoming) {
+      const name_ = typeof raw?.name === "string" ? raw.name.trim().slice(0, 200) : "";
+      if (!name_) {
+        rejected.push("(no name)");
+        continue;
+      }
+      const emailRaw = typeof raw.contact_email === "string" ? raw.contact_email.trim().toLowerCase() : null;
+      // An invalid address is dropped rather than stored: outreach matches on
+      // this field, and a junk value would look like a contactable lead.
+      const email = emailRaw && looksLikeEmail(emailRaw) ? emailRaw : null;
+
+      if (email && (emails.has(email) || seen.has(email))) {
+        skipped.push(`${name_} <${email}>`);
+        continue;
+      }
+      if (email) seen.add(email);
+
+      await db.createLead(env, {
+        name: name_,
+        company: typeof raw.company === "string" ? raw.company.trim().slice(0, 200) : null,
+        contact_email: email,
+        value_estimate: Number.isFinite(Number(raw.value_estimate)) ? Number(raw.value_estimate) : null,
+        source: (typeof raw.source === "string" && raw.source.trim().slice(0, 60)) || "apify",
+        notes: typeof raw.notes === "string" ? raw.notes.slice(0, 1000) : null,
+        owner: user.name,
+      });
+      created.push(name_ + (email ? "" : " (no email — can't be emailed)"));
+    }
+
+    await db.logAudit(env, user, "mcp_leads_created", "lead", null, `${created.length} via connector`, ip);
+
+    const out = [`Added ${created.length} ${created.length === 1 ? "lead" : "leads"} to the pipeline.`];
+    if (created.length) out.push("", ...created.map((c) => `  + ${c}`));
+    if (skipped.length) out.push("", `Already in the pipeline, skipped (${skipped.length}):`, ...skipped.map((x) => `  - ${x}`));
+    if (rejected.length) out.push("", `Rejected for having no name (${rejected.length}).`);
+    out.push(
+      "",
+      "All of them are awaiting approval. Nothing has been emailed — a founder approves at /outreach in HQ."
+    );
+    return out.join("\n");
+  }
+
+  if (name === "qualify_lead") {
+    const id = Number(args.lead_id);
+    if (!Number.isInteger(id)) return "Pass a numeric `lead_id` — use list_leads to find it.";
+    const lead = await db.getLeadById(env, id);
+    if (!lead) return `No lead with id ${id}.`;
+
+    const changes = [];
+    if (args.stage) {
+      if (!views.STAGES.includes(args.stage)) return `"${args.stage}" isn't a stage. Use one of: ${views.STAGES.join(", ")}.`;
+      await db.updateLeadStage(env, id, args.stage);
+      changes.push(`stage ${lead.stage} → ${args.stage}`);
+    }
+    if (args.value_estimate !== undefined && Number.isFinite(Number(args.value_estimate))) {
+      await db.setLeadValue(env, id, Number(args.value_estimate));
+      changes.push(`value ${money(Number(args.value_estimate))}`);
+    }
+    if (typeof args.notes === "string" && args.notes.trim()) {
+      // Appended, not replaced. The scrape context (no website, rating, phone)
+      // is the evidence the qualification rests on -- overwriting it would
+      // leave a conclusion with its reasoning deleted.
+      await db.appendLeadNotes(env, id, args.notes.trim().slice(0, 1000));
+      changes.push("notes added");
+    }
+    if (!changes.length) return "Nothing to change — pass a stage, a value_estimate, or notes.";
+
+    await db.logAudit(env, user, "mcp_lead_qualified", "lead", id, `${lead.name}: ${changes.join(", ")}`, ip);
+    return `Updated ${lead.name}: ${changes.join(", ")}.
+
+This does not approve outreach — that's a founder's call at /outreach.`;
   }
 
   if (name === "get_week_summary") {
@@ -367,7 +531,9 @@ async function handleMcp(rpc, ctx) {
         serverInfo: { name: "Catalyst 7 HQ", version: "1.0.0" },
         instructions:
           "Catalyst 7 HQ tracks the studio's weekly numbers: freelancer hours, revenue, clients and sales pipeline. " +
-          "All tools are read-only. Money is in South African rand. Weeks run Monday to Sunday (UTC).",
+          "You can read all of it, add leads (create_leads) and record qualification on them (qualify_lead). " +
+          "You CANNOT approve a lead for outreach or send anything — that is deliberate and a founder does it in HQ. " +
+          "Leads you add always land awaiting approval. Money is in South African rand. Weeks run Monday to Sunday (UTC).",
       });
     }
     case "ping":

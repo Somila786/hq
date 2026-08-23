@@ -82,6 +82,29 @@ export async function getLeadDedupeKeys(env) {
   };
 }
 
+export async function setLeadValue(env, id, value) {
+  return env.DB.prepare("UPDATE leads SET value_estimate = ?, updated_at = datetime('now') WHERE id = ?")
+    .bind(value, id)
+    .run();
+}
+
+// Appends rather than replaces. Notes carry the scrape context the
+// qualification was reasoned from; overwriting would leave a conclusion with
+// its evidence deleted. Dated so a lead's notes read as a history.
+export async function appendLeadNotes(env, id, text) {
+  return env.DB.prepare(
+    `UPDATE leads
+        SET notes = CASE
+              WHEN notes IS NULL OR notes = '' THEN ?
+              ELSE notes || char(10) || char(10) || ?
+            END,
+            updated_at = datetime('now')
+      WHERE id = ?`
+  )
+    .bind(text, text, id)
+    .run();
+}
+
 export async function updateLeadStage(env, id, stage) {
   return env.DB.prepare("UPDATE leads SET stage = ?, updated_at = datetime('now') WHERE id = ?").bind(stage, id).run();
 }

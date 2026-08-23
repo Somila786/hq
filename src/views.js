@@ -589,7 +589,7 @@ export function securityPage({
           : `<div class="security-copy">No applications are connected to your account.<br /><br />
              To connect Claude, add a custom connector pointing at <span class="mono-box" style="display:inline-block;margin:6px 0 0">${esc(
                mcpUrl
-             )}</span> and approve it when asked. It gets read-only access, limited to what your role can already see.</div>`
+             )}</span> and approve it when asked. It can read whatever your role can already see, and can add leads and record qualification on them. It <strong>cannot</strong> approve a lead for outreach or send anything &mdash; that stays with you, here in HQ.</div>`
       }
     </div></div>
 
@@ -836,7 +836,9 @@ export function clientsPage({ user, clients, csrf, theme }) {
 }
 
 // ---------- Founder: Leads ----------
-const STAGES = ["new", "contacted", "qualified", "proposal", "won", "lost"];
+// Exported so index.js validates against the same list the UI renders and the
+// database CHECK constraint enforces, rather than a third copy that can drift.
+export const STAGES = ["new", "contacted", "qualified", "proposal", "won", "lost"];
 export function leadsPage({ user, leads, csrf, theme, outreach = {} }) {
   const rows = leads
     .map((l) => {
@@ -1398,14 +1400,19 @@ export function mcpAboutPage({ theme, origin }) {
     body: `
     <div class="authcard" style="max-width:640px">
       <h1>Catalyst 7 HQ connector</h1>
-      <p class="lead">Read-only access to the studio's weekly numbers, for use as a Claude connector.</p>
+      <p class="lead">The studio's numbers and pipeline, for use as a Claude connector. Reads anything your role can see; adds and qualifies leads; never approves or sends.</p>
       <div class="security-copy">
         Add it in Claude under <strong>Settings &rarr; Connectors &rarr; Add custom connector</strong>, using:
         <span class="mono-box">${esc(origin)}/mcp</span>
-        You'll be asked to sign in to HQ and approve access. The connector reads as you and follows your
-        role — a freelancer's connector only ever sees their own weekly log.
+        You'll be asked to sign in to HQ and approve access. The connector acts as you and follows your
+        role &mdash; a freelancer's connector only ever sees their own weekly log.
         <br /><br />
-        Nothing it does can change your data. Revoke it any time from Security.
+        It can read your data, add leads to the pipeline, and record what it found out about them. It
+        <strong>cannot approve a lead for outreach or send anything</strong>: that decision stays with a
+        founder, in HQ. Leads it adds always arrive awaiting your approval. Every write is recorded in the
+        audit log as a connector action, so you can tell it apart from something a person did.
+        <br /><br />
+        Revoke it any time from Security.
       </div>
     </div>`,
   });

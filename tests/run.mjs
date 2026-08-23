@@ -2092,7 +2092,7 @@ await test("refresh tokens rotate and the old one dies", async () => {
   eq(reuse.body.error, "invalid_grant", "the code Claude expects");
 });
 
-await test("the tools are read-only and answer with real data", async () => {
+await test("the read tools answer with real data and change nothing", async () => {
   const env = makeEnv();
   const { session, csrf } = await founderSession(env);
   await db.createClient(env, { name: "Umlazi Foods", source: "referral" });
@@ -2102,8 +2102,16 @@ await test("the tools are read-only and answer with real data", async () => {
 
   const list = await rpc(env, grant.access_token, "tools/list");
   const names = list.body.result.tools.map((t) => t.name);
-  eq(names.length, 6, "six tools");
-  for (const n of names) assert(!/^(add|create|update|delete|log|set)_/.test(n), `${n} must not be a write tool`);
+  eq(names.length, 8, "six reads plus two writes");
+
+  // The connector can create and qualify leads. It must never be able to
+  // approve outreach or trigger a send: that gate is the whole reason the
+  // outreach is any good, and an agent that could authorise its own sends
+  // would quietly remove it.
+  for (const forbidden of ["approve_outreach", "send_outreach", "reject_outreach", "delete_lead", "log_call"]) {
+    assert(!names.includes(forbidden), `${forbidden} must never be exposed over MCP`);
+  }
+  assert(!names.some((n) => /approve|send|delete|erase/i.test(n)), `no approving or sending tool: ${names.join(", ")}`);
 
   const summary = await rpc(env, grant.access_token, "tools/call", { name: "get_week_summary", arguments: {} });
   // en-ZA groups thousands with a non-breaking space, not a comma, so compare
@@ -2119,7 +2127,7 @@ await test("the tools are read-only and answer with real data", async () => {
   const clients = await rpc(env, grant.access_token, "tools/call", { name: "list_clients", arguments: {} });
   has(clients.body.result.content[0].text, "Umlazi Foods", "clients");
 
-  // Data is unchanged by any of it.
+  // None of the READ tools changed anything.
   eq((await db.getClients(env)).length, 1, "no writes happened");
   eq((await db.getLeads(env)).length, 1, "no writes happened");
 });
@@ -3294,6 +3302,239 @@ await test("import is founder-only and CSRF-guarded", async () => {
   );
   eq(attempt.status, 404, "and so is the import itself");
   eq((await db.getLeads(env)).length, 0, "nothing written");
+});
+
+
+console.log("\nMCP write tools — create and qualify, never approve");
+
+async function callTool(env, token, name, args = {}) {
+  const r = await rpc(env, token, "tools/call", { name, arguments: args });
+  return { text: r.body.result?.content?.[0]?.text || "", isError: r.body.result?.isError, body: r.body };
+}
+
+await test("create_leads adds leads, awaiting approval and owned by the caller", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const grant = await connectAsClaude(env, session, csrf);
+
+  const res = await callTool(env, grant.access_token, "create_leads", {
+    leads: [
+      {
+        name: "Phiishe Biokinetics",
+        contact_email: "info@phiishe.co.za",
+        value_estimate: 18000,
+        notes: "No website. 4.8 stars over 37 reviews. Wedge: unclaimed GBP and no booking path.",
+      },
+      { name: "Menlyn Dental", contact_email: "hello@menlyn.co.za" },
+    ],
+  });
+  eq(res.isError, false, "succeeds");
+  has(res.text, "Added 2 leads", "reports what it did");
+
+  const leads = await db.getLeads(env);
+  eq(leads.length, 2, "both created");
+  const p = leads.find((l) => l.name === "Phiishe Biokinetics");
+  eq(p.contact_email, "info@phiishe.co.za", "email stored - outreach matches on it");
+  eq(p.outreach_status, "pending", "awaiting approval, NOT pre-authorised");
+  eq(p.source, "apify", "defaults to apify");
+  has(p.notes, "Wedge:", "the qualifying research is what the founder will read");
+  assert(p.owner, "attributed to the founder whose token was used");
+  assert((await auditActions(env)).includes("mcp_leads_created"), "audited as a connector action, distinguishable from a human one");
+});
+
+await test("the reply says plainly that nothing has been emailed", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const grant = await connectAsClaude(env, session, csrf);
+  const res = await callTool(env, grant.access_token, "create_leads", {
+    leads: [{ name: "A Co", contact_email: "a@co.za" }],
+  });
+  has(res.text, "Nothing has been emailed", "the model is told the boundary, not left to assume");
+  has(res.text, "/outreach", "and where a human closes the gap");
+});
+
+await test("re-running a scrape does not duplicate leads", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const grant = await connectAsClaude(env, session, csrf);
+  const leads = [
+    { name: "Phiishe Biokinetics", contact_email: "info@phiishe.co.za" },
+    { name: "Menlyn Dental", contact_email: "hello@menlyn.co.za" },
+  ];
+
+  await callTool(env, grant.access_token, "create_leads", { leads });
+  const second = await callTool(env, grant.access_token, "create_leads", { leads });
+
+  eq((await db.getLeads(env)).length, 2, "still two after a repeat run");
+  has(second.text, "Added 0 leads", "says it added nothing");
+  has(second.text, "Already in the pipeline, skipped (2)", "and names what it skipped, rather than failing silently");
+});
+
+await test("duplicates within one call are caught too", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const grant = await connectAsClaude(env, session, csrf);
+  await callTool(env, grant.access_token, "create_leads", {
+    leads: [
+      { name: "Same Co", contact_email: "same@co.za" },
+      { name: "Same Co Again", contact_email: "SAME@co.za" },
+    ],
+  });
+  eq((await db.getLeads(env)).length, 1, "one row - the first insert isn't visible to the second without this");
+});
+
+await test("junk emails are dropped rather than stored as contactable", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const grant = await connectAsClaude(env, session, csrf);
+  const res = await callTool(env, grant.access_token, "create_leads", {
+    leads: [{ name: "No Email Co", contact_email: "N/A" }],
+  });
+  const lead = (await db.getLeads(env))[0];
+  eq(lead.contact_email, null, "not stored - a junk value would look like a contactable lead");
+  has(res.text, "no email", "and the model is told why it can't be emailed");
+});
+
+await test("a lead with no name is rejected, not written blank", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const grant = await connectAsClaude(env, session, csrf);
+  const res = await callTool(env, grant.access_token, "create_leads", {
+    leads: [{ contact_email: "x@y.co.za" }, { name: "   ", contact_email: "z@y.co.za" }, { name: "Real Co" }],
+  });
+  eq((await db.getLeads(env)).length, 1, "only the one with a name");
+  has(res.text, "Rejected for having no name (2)", "and says so");
+});
+
+await test("a batch over the limit is refused whole", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const grant = await connectAsClaude(env, session, csrf);
+  const leads = Array.from({ length: 201 }, (_, i) => ({ name: `Co ${i}`, contact_email: `c${i}@x.co.za` }));
+  const res = await callTool(env, grant.access_token, "create_leads", { leads });
+  has(res.text, "limit is 200", "explains the cap");
+  eq((await db.getLeads(env)).length, 0, "nothing partially written");
+});
+
+await test("qualify_lead moves the stage and APPENDS notes", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const grant = await connectAsClaude(env, session, csrf);
+  await db.createLead(env, { name: "Phiishe", stage: "new", notes: "No website found · Rating 4.8 (37 reviews)" });
+  const lead = (await db.getLeads(env))[0];
+
+  const res = await callTool(env, grant.access_token, "qualify_lead", {
+    lead_id: lead.id,
+    stage: "qualified",
+    value_estimate: 22000,
+    notes: "Gap: no online booking. Wedge: booking page as the free asset.",
+  });
+  eq(res.isError, false, "succeeds");
+
+  const after = await db.getLeadById(env, lead.id);
+  eq(after.stage, "qualified", "stage moved");
+  eq(after.value_estimate, 22000, "value set");
+  has(after.notes, "No website found", "the ORIGINAL scrape context survives - it's the evidence the call rests on");
+  has(after.notes, "Gap: no online booking", "and the new finding is added");
+  assert((await auditActions(env)).includes("mcp_lead_qualified"), "audited");
+});
+
+await test("qualify_lead refuses an invalid stage and a missing lead", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const grant = await connectAsClaude(env, session, csrf);
+  await db.createLead(env, { name: "Phiishe", stage: "new" });
+  const lead = (await db.getLeads(env))[0];
+
+  const bad = await callTool(env, grant.access_token, "qualify_lead", { lead_id: lead.id, stage: "amazing" });
+  has(bad.text, "isn't a stage", "names the problem");
+  eq((await db.getLeadById(env, lead.id)).stage, "new", "unchanged");
+
+  const missing = await callTool(env, grant.access_token, "qualify_lead", { lead_id: 9999, stage: "qualified" });
+  has(missing.text, "No lead with id 9999", "and a missing lead is a plain answer, not a crash");
+});
+
+await test("qualify_lead with nothing to change says so instead of pretending", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const grant = await connectAsClaude(env, session, csrf);
+  await db.createLead(env, { name: "Phiishe", stage: "new" });
+  const lead = (await db.getLeads(env))[0];
+  const res = await callTool(env, grant.access_token, "qualify_lead", { lead_id: lead.id });
+  has(res.text, "Nothing to change", "honest no-op");
+});
+
+// ---- the boundary ----
+
+await test("the connector cannot approve outreach or trigger a send", async () => {
+  const env = sendingEnv();
+  const { session, csrf } = await founderSession(env);
+  const grant = await connectAsClaude(env, session, csrf);
+  await db.createLead(env, { name: "Phiishe", contact_email: "info@phiishe.co.za" });
+  const lead = (await db.getLeads(env))[0];
+
+  // Not exposed at all...
+  const names = (await rpc(env, grant.access_token, "tools/list")).body.result.tools.map((t) => t.name);
+  for (const n of ["approve_outreach", "send_outreach", "reject_outreach"]) {
+    assert(!names.includes(n), `${n} is not offered`);
+  }
+
+  // ...and calling one anyway is refused rather than falling through.
+  for (const n of ["approve_outreach", "send_outreach", "delete_lead"]) {
+    const r = await rpc(env, grant.access_token, "tools/call", { name: n, arguments: { lead_id: lead.id } });
+    assert(r.res.status === 404 || r.body.error || r.body.result?.isError !== false, `${n} refused`);
+  }
+
+  const after = await db.getLeadById(env, lead.id);
+  eq(after.outreach_status, "pending", "still awaiting a human decision");
+  eq(after.outreach_last_sent_at, null, "nothing sent");
+  eq((await db.getOutreachForLead(env, lead.id)).length, 0, "nothing on the timeline");
+});
+
+await test("an MCP token cannot reach the web approval routes either", async () => {
+  const env = sendingEnv();
+  const { session, csrf } = await founderSession(env);
+  const grant = await connectAsClaude(env, session, csrf);
+  await db.createLead(env, { name: "Phiishe", contact_email: "info@phiishe.co.za" });
+  const lead = (await db.getLeads(env))[0];
+  await db.setOutreachStatus(env, lead.id, "approved", "Somila");
+
+  // A bearer token is not a session cookie: the browser routes must not accept it.
+  const res = await worker.fetch(
+    new Request(`https://hq.test/leads/${lead.id}/outreach/send`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${grant.access_token}`, "Content-Type": "application/x-www-form-urlencoded" },
+      body: "_csrf=whatever",
+    }),
+    env
+  );
+  // A 302 here is the redirect TO /login, i.e. the rejection -- not the
+  // redirect back to the lead that a successful send produces. Asserting the
+  // destination rather than the bare status is what makes this test mean
+  // anything.
+  eq(res.headers.get("location"), "/login", "bounced to login, not treated as a session");
+  eq((await db.getLeadById(env, lead.id)).outreach_last_sent_at, null, "nothing sent");
+  eq((await db.getOutreachForLead(env, lead.id)).length, 0, "and nothing on the timeline");
+});
+
+await test("a freelancer's token cannot create or qualify leads", async () => {
+  const env = makeEnv();
+  const fl = await seedFreelancer(env);
+  const { session: theirs } = await login(env, fl.email, FREELANCER_PW);
+  const theirCsrf = await csrfFor(env, theirs);
+  const grant = await connectAsClaude(env, theirs, theirCsrf);
+
+  const create = await callTool(env, grant.access_token, "create_leads", {
+    leads: [{ name: "Sneaky Co", contact_email: "s@co.za" }],
+  });
+  has(create.text, "only available to founders", "refused");
+  eq((await db.getLeads(env)).length, 0, "nothing written");
+
+  await db.createLead(env, { name: "Real Lead", stage: "new" });
+  const lead = (await db.getLeads(env))[0];
+  const qualify = await callTool(env, grant.access_token, "qualify_lead", { lead_id: lead.id, stage: "won" });
+  has(qualify.text, "only available to founders", "refused");
+  eq((await db.getLeadById(env, lead.id)).stage, "new", "unchanged");
 });
 
 

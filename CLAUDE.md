@@ -73,6 +73,12 @@ The CRM work is built in four steps, all committed:
    `outreach_events` as `kind='call'`. See `docs/make-outreach-webhook.md`.
 4. **Import** — `/leads/import` parses an Apify JSON/CSV paste into leads,
    with a preview-before-write step. Parser lives in `src/import.js`.
+5. **MCP write tools** — `create_leads` and `qualify_lead` let Claude put
+   scraped, qualified leads straight into HQ. **`MCP_FORBIDDEN` is the line
+   this connector does not cross:** no approving outreach, no sending, no
+   deleting. That gate is why the outreach is any good; an agent that could
+   authorise its own sends would quietly remove it. There are tests for both
+   the absence of those tools and the refusal if one is ever added by mistake.
 
 ### Deploying — there is no terminal in this workflow
 
