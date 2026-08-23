@@ -433,6 +433,54 @@ export function callWindowHours(env) {
 
 // The C7 webhook envelope, signed the same way Make signs its posts to us.
 // `data` carries the lead fields Make's Gmail module needs to map.
+// ---- The greeting ----
+//
+// House rule: the greeting matches the clock time of the SEND, not of the
+// drafting. A lead written up at 10:00 and approved at 18:00 must not go out
+// saying "Good morning", so the greeting is never stored with the draft -- the
+// body carries a {{greeting}} placeholder and this fills it at send time.
+//
+// South Africa is UTC+2 year round with no daylight saving, so a fixed offset
+// is correct here rather than a lucky simplification. Workers have no tz
+// database, and Intl with a timeZone would be the alternative if that ever
+// changed.
+export const SAST_OFFSET_MINUTES = 120;
+
+export function greetingFor(when = new Date()) {
+  const local = new Date(when.getTime() + SAST_OFFSET_MINUTES * 60_000);
+  const hour = local.getUTCHours();
+  if (hour < 12) return "Good morning";
+  if (hour < 17) return "Good afternoon";
+  return "Good evening";
+}
+
+// Substitutes the greeting. If a draft has no placeholder the greeting is put
+// on the front rather than dropped -- an email that opens cold breaks the one
+// rule the style guide is most explicit about ("No 'Hi there,' ever").
+export function renderEmailBody(body, when = new Date()) {
+  const greeting = greetingFor(when);
+  const text = String(body || "");
+  if (/\{\{\s*greeting\s*\}\}/i.test(text)) {
+    return text.replace(/\{\{\s*greeting\s*\}\}/gi, greeting);
+  }
+  return text.trim() ? `${greeting},
+
+${text}` : text;
+}
+
+// The 20 Aug 2026 style addendum bans em dashes in outreach copy outright.
+// Surfaced rather than auto-corrected: silently rewriting someone's copy is
+// worse than telling them, and the founder is about to read it anyway.
+export function copyStyleWarnings(subject, body) {
+  const warnings = [];
+  const text = `${subject || ""}
+${body || ""}`;
+  if (/—|–/.test(text)) warnings.push("Contains an em or en dash. The house style rule bans them -- use a comma or a separate sentence.");
+  if (/\bhi there\b/i.test(text)) warnings.push('Opens with "Hi there" -- the style rule rules it out explicitly.');
+  if (!/Warm regards,\s+Catalyst 7/i.test(body || "")) warnings.push('Missing the "Warm regards, Catalyst 7" sign-off.');
+  return warnings;
+}
+
 export function buildOutreachPayload(lead, actor) {
   return {
     event_id: `evt_${crypto.randomUUID()}`,
@@ -451,6 +499,11 @@ export function buildOutreachPayload(lead, actor) {
       value_estimate: lead.value_estimate || null,
       notes: lead.notes || "",
       approved_by: actor,
+      // Rendered here, at the moment of sending, so the greeting matches the
+      // clock rather than whenever the draft happened to be written.
+      subject: lead.email_subject || "",
+      body: renderEmailBody(lead.email_body, new Date()),
+      greeting: greetingFor(new Date()),
     },
   };
 }

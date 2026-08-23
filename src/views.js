@@ -952,6 +952,11 @@ export function outreachQueuePage({ user, csrf, theme, queue, counts, recent, un
         l.company && l.company !== l.name ? `<br/><span class="hint">${esc(l.company)}</span>` : ""
       }</td>
       <td class="muted">${l.contact_email ? esc(l.contact_email) : `<span class="hint">no email &mdash; can't be approved</span>`}</td>
+      <td>${
+        l.has_draft
+          ? `<a href="/leads/${l.id}" class="link-inline">read the email</a>`
+          : `<span class="hint">no draft &mdash; can't be sent</span>`
+      }</td>
       <td class="muted">${esc(l.source || "—")}</td>
       <td class="mono">${l.value_estimate ? money(l.value_estimate) : "—"}</td>
       <td class="right">
@@ -1020,7 +1025,7 @@ export function outreachQueuePage({ user, csrf, theme, queue, counts, recent, un
       <div class="table-wrap">
         ${
           queueRows
-            ? `<table><thead><tr><th>Lead</th><th>Email</th><th>Source</th><th>Value</th><th class="right">Decision</th></tr></thead><tbody>${queueRows}</tbody></table>`
+            ? `<table><thead><tr><th>Lead</th><th>Email</th><th>Draft</th><th>Source</th><th>Value</th><th class="right">Decision</th></tr></thead><tbody>${queueRows}</tbody></table>`
             : `<div class="empty">Nothing waiting. Scraped leads land here for you to qualify before anyone is emailed.</div>`
         }
       </div>
@@ -1055,6 +1060,54 @@ export function outreachQueuePage({ user, csrf, theme, queue, counts, recent, un
 
 // ---------- Founder: single lead + outreach timeline ----------
 // Step 1 of the CRM work: HQ shows what Make actually did, per lead.
+// The draft the founder reads before approving. This is what makes the
+// approval gate mean something: before it existed you authorised a send whose
+// contents you had never seen.
+//
+// The greeting is shown as a live preview rather than baked in, because it is
+// resolved against the clock at the moment of sending, not now.
+function draftPanel(lead, csrf, greetingNow, warnings) {
+  const has = lead.email_subject && lead.email_body;
+  return `<div class="panel">
+    <div class="panel-head">Outreach email${has ? "" : " &mdash; not written yet"}</div>
+    <div class="security-body">
+      ${
+        has
+          ? `<div class="hint" style="margin-bottom:10px">Drafted${
+              lead.drafted_by ? ` by ${esc(lead.drafted_by)}` : ""
+            }${lead.drafted_at ? ` on ${esc(String(lead.drafted_at).replace("T", " ").slice(0, 16))} UTC` : ""}. Edit it here before you approve.</div>`
+          : `<div class="security-copy" style="margin-bottom:10px">No draft yet. Sending is blocked until there is one, because Make maps this straight into Gmail and would deliver a blank email. Ask Claude to write it, or type it below.</div>`
+      }
+      ${
+        warnings.length
+          ? `<div class="msg msg-error"><strong>House style checks:</strong><ul style="margin:8px 0 0 18px">${warnings
+              .map((w) => `<li>${esc(w)}</li>`)
+              .join("")}</ul></div>`
+          : ""
+      }
+      <form method="post" action="/leads/${lead.id}/draft" class="plain">
+        ${csrfField(csrf)}
+        <div class="field field-block">
+          <label for="subject">Subject</label>
+          <input id="subject" name="subject" maxlength="300" value="${esc(lead.email_subject || "")}"
+            placeholder="Braamfontein Bakery, 4.8 stars is a wonderful result" />
+        </div>
+        <div class="field field-block">
+          <label for="body">Body</label>
+          <textarea id="body" name="body" rows="16" class="data-paste">${esc(lead.email_body || "")}</textarea>
+          <div class="hint">
+            Keep <span class="mono">{{greeting}}</span> on the first line. HQ replaces it when the email actually
+            goes, so the greeting matches the clock. Right now it would read <strong>&ldquo;${esc(greetingNow)}&rdquo;</strong>.
+          </div>
+        </div>
+        <div class="form-foot">
+          <button type="submit" class="btn btn-primary">Save draft</button>
+        </div>
+      </form>
+    </div>
+  </div>`;
+}
+
 // The Sequence B window on a single lead. Rendered only once a send has opened
 // a window: before that there is nothing to say, and an empty "no call yet"
 // block on every lead would be noise.
@@ -1104,7 +1157,7 @@ function callPanel(lead, csrf) {
   </div>`;
 }
 
-export function leadDetailPage({ user, lead, events, theme, webhookReady, csrf, sendingReady = false }) {
+export function leadDetailPage({ user, lead, events, theme, webhookReady, csrf, sendingReady = false, greetingNow = "Good day", styleWarnings = [] }) {
   const kindPill = (k) =>
     k === "reply"
       ? pill("reply", "green")
@@ -1163,6 +1216,8 @@ export function leadDetailPage({ user, lead, events, theme, webhookReady, csrf, 
         lead.value_estimate ? money(lead.value_estimate) : "&mdash;"
       }</div></div>
     </div>
+
+    ${draftPanel(lead, csrf, greetingNow, styleWarnings)}
 
     <div class="panel">
       <div class="panel-head">Outreach</div>

@@ -47,7 +47,8 @@ export async function getLeads(env) {
             created_at, updated_at,
             COALESCE(outreach_status,'pending') AS outreach_status,
             outreach_approved_by, outreach_approved_at, outreach_last_sent_at,
-            call_due_at, call_outcome, call_logged_at, call_logged_by
+            call_due_at, call_outcome, call_logged_at, call_logged_by,
+            email_subject, email_body, drafted_at, drafted_by
      FROM leads ORDER BY CASE stage WHEN 'won' THEN 1 WHEN 'lost' THEN 1 ELSE 0 END, updated_at DESC`
   ).all();
   return results;
@@ -80,6 +81,21 @@ export async function getLeadDedupeKeys(env) {
     emails: new Set(results.filter((r) => r.email).map((r) => r.email)),
     keys: new Set(results.map((r) => `${r.name}|${r.company}`)),
   };
+}
+
+// The draft a founder reads before approving. Stored WITHOUT a greeting: the
+// house rule ties the greeting to the clock time of the send, so the body keeps
+// a {{greeting}} placeholder that is filled in at the moment Make is triggered.
+export async function setLeadDraft(env, id, { subject, body, actor }) {
+  return env.DB.prepare(
+    `UPDATE leads
+        SET email_subject = ?, email_body = ?,
+            drafted_at = datetime('now'), drafted_by = ?,
+            updated_at = datetime('now')
+      WHERE id = ?`
+  )
+    .bind(subject, body, actor || null, id)
+    .run();
 }
 
 export async function setLeadValue(env, id, value) {
@@ -643,7 +659,8 @@ export async function getLeadById(env, id) {
             created_at, updated_at,
             COALESCE(outreach_status,'pending') AS outreach_status,
             outreach_approved_by, outreach_approved_at, outreach_last_sent_at,
-            call_due_at, call_outcome, call_logged_at, call_logged_by
+            call_due_at, call_outcome, call_logged_at, call_logged_by,
+            email_subject, email_body, drafted_at, drafted_by
      FROM leads WHERE id = ?`
   )
     .bind(id)
@@ -868,7 +885,8 @@ export async function reopenCallWindow(env, id) {
 // The review queue: everything still awaiting a decision, newest first.
 export async function getLeadsAwaitingApproval(env, limit = 100) {
   const { results } = await env.DB.prepare(
-    `SELECT id, name, company, contact_email, stage, source, value_estimate, created_at
+    `SELECT id, name, company, contact_email, stage, source, value_estimate, created_at,
+            email_subject IS NOT NULL AND email_body IS NOT NULL AS has_draft
      FROM leads
      WHERE COALESCE(outreach_status,'pending') = 'pending'
      ORDER BY created_at DESC LIMIT ?`

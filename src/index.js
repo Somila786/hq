@@ -42,6 +42,9 @@ import {
   timestampWithinWindow,
   outreachSendingConfigured,
   callWindowHours,
+  renderEmailBody,
+  greetingFor,
+  copyStyleWarnings,
   buildOutreachPayload,
   triggerOutreach,
   googleConfigured,
@@ -347,6 +350,28 @@ const MCP_TOOLS = [
     },
   },
   {
+    name: "draft_outreach",
+    description:
+      "Write the outreach email for a lead, so a founder can read the actual message before approving it. " +
+      "Follow the Catalyst 7 template: subject is \"[Business Name], [rating] stars is a wonderful result\". " +
+      "Body opens with the literal placeholder {{greeting}} on its own line — do NOT write \"Good morning\" " +
+      "yourself, HQ fills that in at send time so it matches the clock. Then: 'I hope this email finds you well.', " +
+      "specific praise for what the research found (rating, reviews, standing) BEFORE any mention of a gap, the " +
+      "gap line, how Catalyst 7 puts a system in place, a 30 minute discovery call ask, and the sign-off " +
+      "'Warm regards, Catalyst 7'. House style: NO em or en dashes anywhere, never 'Hi there', one idea per short " +
+      "paragraph with blank lines between. Founders only. This does not approve or send anything.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        lead_id: { type: "integer", description: "The lead's id, from list_leads." },
+        subject: { type: "string", description: "The subject line." },
+        body: { type: "string", description: "The full body, starting with {{greeting}} on its own line." },
+      },
+      required: ["lead_id", "subject", "body"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "qualify_lead",
     description:
       "Record qualification on an existing lead: move its stage, set an estimated value, and append what you found. " +
@@ -390,6 +415,7 @@ const FOUNDER_ONLY = new Set([
   "list_freelancers",
   "create_leads",
   "qualify_lead",
+  "draft_outreach",
 ]);
 
 // The line this connector does not cross. Claude can put leads in and write
@@ -464,6 +490,31 @@ async function runMcpTool(name, args, { env, user, ip = null }) {
       "",
       "All of them are awaiting approval. Nothing has been emailed — a founder approves at /outreach in HQ."
     );
+    return out.join("\n");
+  }
+
+  if (name === "draft_outreach") {
+    const id = Number(args.lead_id);
+    if (!Number.isInteger(id)) return "Pass a numeric `lead_id` — use list_leads to find it.";
+    const lead = await db.getLeadById(env, id);
+    if (!lead) return `No lead with id ${id}.`;
+
+    const subject = String(args.subject || "").trim().slice(0, 300);
+    const body = String(args.body || "").trim().slice(0, 8000);
+    if (!subject || !body) return "Both `subject` and `body` are required.";
+
+    await db.setLeadDraft(env, id, { subject, body, actor: user.name });
+    await db.logAudit(env, user, "mcp_outreach_drafted", "lead", id, lead.name, ip);
+
+    // Warnings, not rejections. The house style rules are the founder's to
+    // enforce, and refusing the write would lose copy that is mostly right.
+    const warnings = copyStyleWarnings(subject, body);
+    const out = [`Draft saved for ${lead.name}. A founder reads it at /leads/${id} before approving.`];
+    if (warnings.length) out.push("", "Style checks that did not pass:", ...warnings.map((w) => `  - ${w}`));
+    if (!/\{\{\s*greeting\s*\}\}/i.test(body)) {
+      out.push("", "Note: no {{greeting}} placeholder found, so HQ will put the greeting on the front itself.");
+    }
+    out.push("", "Nothing has been approved or sent.");
     return out.join("\n");
   }
 
@@ -1716,6 +1767,8 @@ async function handleRequest(request, env) {
               csrf,
               webhookReady: makeWebhookConfigured(env),
               sendingReady: outreachSendingConfigured(env),
+              greetingNow: greetingFor(new Date()),
+              styleWarnings: copyStyleWarnings(lead.email_subject, lead.email_body),
             })
           );
         }
@@ -1803,6 +1856,26 @@ async function handleRequest(request, env) {
           return redirect("/leads");
         }
 
+        // ---- Save the email draft ----
+        // A founder can rewrite whatever Claude produced. The draft is what
+        // Make puts in front of the lead, so this is the last edit point.
+        const draftMatch = path.match(/^\/leads\/(\d+)\/draft$/);
+        if (draftMatch && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          const lead = await db.getLeadById(env, draftMatch[1]);
+          if (!lead) return html(views.errorPage("That lead no longer exists.", 404, theme), 404);
+
+          await db.setLeadDraft(env, lead.id, {
+            subject: String(f.subject || "").trim().slice(0, 300) || null,
+            body: String(f.body || "").trim().slice(0, 8000) || null,
+            actor: user.name,
+          });
+          await db.logAudit(env, user, "outreach_drafted", "lead", lead.id, lead.name, reqIp);
+          return redirect(`/leads/${lead.id}`);
+        }
+
         // ---- Outreach approval gate ----
         // Nothing is emailed without a founder explicitly approving it. The
         // decision is recorded against them, not against "the system".
@@ -1850,6 +1923,18 @@ async function handleRequest(request, env) {
           }
           if (!lead.contact_email) {
             return html(views.errorPage("That lead has no email address.", 400, theme), 400);
+          }
+          // Make maps the subject and body straight into Gmail. With no draft
+          // it would send a blank email, and an email cannot be unsent.
+          if (!lead.email_subject || !lead.email_body) {
+            return html(
+              views.errorPage(
+                "That lead has no email draft yet, so sending would deliver a blank message. Ask Claude to draft it, or write one on the lead page.",
+                400,
+                theme
+              ),
+              400
+            );
           }
 
           const payload = buildOutreachPayload(lead, user.name);

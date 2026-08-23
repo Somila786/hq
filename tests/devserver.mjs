@@ -68,6 +68,14 @@ for (const l of [
   await db.createLead(env, l);
 }
 
+// A drafted email on one lead so the draft panel has something to show.
+await db.setLeadDraft(env, (await db.getLeads(env)).find((l) => l.name === "Thandi Mokoena").id, {
+  subject: "Braamfontein Bakery, 4.8 stars is a wonderful result",
+  body:
+    "{{greeting}},\n\nI hope this email finds you well.\n\nI came across Braamfontein Bakery recently, and 4.8 stars across 82 reviews is a genuine reflection of the care you put into the work. That kind of standing takes real, consistent work to build.\n\nThere is no website live at the moment, which means people searching for you online have nowhere proper to land.\n\nWe help bakeries like yours put that system in place, so demand converts reliably without adding extra work on your end.\n\nWould you be open to a 30 minute discovery call this week so we can show you exactly what that could look like for Braamfontein Bakery?\n\nWarm regards,\nCatalyst 7",
+  actor: "Claude",
+});
+
 // Sequence B call windows, so /calls has all three of its states to look at:
 // one overdue, one still open, and one where the lead replied but is called
 // anyway. Timestamps are written directly because the real path (a successful

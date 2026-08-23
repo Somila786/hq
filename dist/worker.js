@@ -443,6 +443,54 @@ function callWindowHours(env) {
 
 // The C7 webhook envelope, signed the same way Make signs its posts to us.
 // `data` carries the lead fields Make's Gmail module needs to map.
+// ---- The greeting ----
+//
+// House rule: the greeting matches the clock time of the SEND, not of the
+// drafting. A lead written up at 10:00 and approved at 18:00 must not go out
+// saying "Good morning", so the greeting is never stored with the draft -- the
+// body carries a {{greeting}} placeholder and this fills it at send time.
+//
+// South Africa is UTC+2 year round with no daylight saving, so a fixed offset
+// is correct here rather than a lucky simplification. Workers have no tz
+// database, and Intl with a timeZone would be the alternative if that ever
+// changed.
+const SAST_OFFSET_MINUTES = 120;
+
+function greetingFor(when = new Date()) {
+  const local = new Date(when.getTime() + SAST_OFFSET_MINUTES * 60_000);
+  const hour = local.getUTCHours();
+  if (hour < 12) return "Good morning";
+  if (hour < 17) return "Good afternoon";
+  return "Good evening";
+}
+
+// Substitutes the greeting. If a draft has no placeholder the greeting is put
+// on the front rather than dropped -- an email that opens cold breaks the one
+// rule the style guide is most explicit about ("No 'Hi there,' ever").
+function renderEmailBody(body, when = new Date()) {
+  const greeting = greetingFor(when);
+  const text = String(body || "");
+  if (/\{\{\s*greeting\s*\}\}/i.test(text)) {
+    return text.replace(/\{\{\s*greeting\s*\}\}/gi, greeting);
+  }
+  return text.trim() ? `${greeting},
+
+${text}` : text;
+}
+
+// The 20 Aug 2026 style addendum bans em dashes in outreach copy outright.
+// Surfaced rather than auto-corrected: silently rewriting someone's copy is
+// worse than telling them, and the founder is about to read it anyway.
+function copyStyleWarnings(subject, body) {
+  const warnings = [];
+  const text = `${subject || ""}
+${body || ""}`;
+  if (/—|–/.test(text)) warnings.push("Contains an em or en dash. The house style rule bans them -- use a comma or a separate sentence.");
+  if (/\bhi there\b/i.test(text)) warnings.push('Opens with "Hi there" -- the style rule rules it out explicitly.');
+  if (!/Warm regards,\s+Catalyst 7/i.test(body || "")) warnings.push('Missing the "Warm regards, Catalyst 7" sign-off.');
+  return warnings;
+}
+
 function buildOutreachPayload(lead, actor) {
   return {
     event_id: `evt_${crypto.randomUUID()}`,
@@ -461,6 +509,11 @@ function buildOutreachPayload(lead, actor) {
       value_estimate: lead.value_estimate || null,
       notes: lead.notes || "",
       approved_by: actor,
+      // Rendered here, at the moment of sending, so the greeting matches the
+      // clock rather than whenever the draft happened to be written.
+      subject: lead.email_subject || "",
+      body: renderEmailBody(lead.email_body, new Date()),
+      greeting: greetingFor(new Date()),
     },
   };
 }
@@ -1017,7 +1070,8 @@ async function getLeads(env) {
             created_at, updated_at,
             COALESCE(outreach_status,'pending') AS outreach_status,
             outreach_approved_by, outreach_approved_at, outreach_last_sent_at,
-            call_due_at, call_outcome, call_logged_at, call_logged_by
+            call_due_at, call_outcome, call_logged_at, call_logged_by,
+            email_subject, email_body, drafted_at, drafted_by
      FROM leads ORDER BY CASE stage WHEN 'won' THEN 1 WHEN 'lost' THEN 1 ELSE 0 END, updated_at DESC`
   ).all();
   return results;
@@ -1050,6 +1104,21 @@ async function getLeadDedupeKeys(env) {
     emails: new Set(results.filter((r) => r.email).map((r) => r.email)),
     keys: new Set(results.map((r) => `${r.name}|${r.company}`)),
   };
+}
+
+// The draft a founder reads before approving. Stored WITHOUT a greeting: the
+// house rule ties the greeting to the clock time of the send, so the body keeps
+// a {{greeting}} placeholder that is filled in at the moment Make is triggered.
+async function setLeadDraft(env, id, { subject, body, actor }) {
+  return env.DB.prepare(
+    `UPDATE leads
+        SET email_subject = ?, email_body = ?,
+            drafted_at = datetime('now'), drafted_by = ?,
+            updated_at = datetime('now')
+      WHERE id = ?`
+  )
+    .bind(subject, body, actor || null, id)
+    .run();
 }
 
 async function setLeadValue(env, id, value) {
@@ -1613,7 +1682,8 @@ async function getLeadById(env, id) {
             created_at, updated_at,
             COALESCE(outreach_status,'pending') AS outreach_status,
             outreach_approved_by, outreach_approved_at, outreach_last_sent_at,
-            call_due_at, call_outcome, call_logged_at, call_logged_by
+            call_due_at, call_outcome, call_logged_at, call_logged_by,
+            email_subject, email_body, drafted_at, drafted_by
      FROM leads WHERE id = ?`
   )
     .bind(id)
@@ -1838,7 +1908,8 @@ async function reopenCallWindow(env, id) {
 // The review queue: everything still awaiting a decision, newest first.
 async function getLeadsAwaitingApproval(env, limit = 100) {
   const { results } = await env.DB.prepare(
-    `SELECT id, name, company, contact_email, stage, source, value_estimate, created_at
+    `SELECT id, name, company, contact_email, stage, source, value_estimate, created_at,
+            email_subject IS NOT NULL AND email_body IS NOT NULL AS has_draft
      FROM leads
      WHERE COALESCE(outreach_status,'pending') = 'pending'
      ORDER BY created_at DESC LIMIT ?`
@@ -1977,7 +2048,7 @@ async function runRetentionScan(env) {
   return { leadsFlagged: staleLeads.length, freelancersFlagged: staleFreelancers.length };
 }
 
-return { getFreelancers, getFreelancerById, createFreelancer, setFreelancerActive, getClients, createClient, setClientStatus, getLeads, createLead, getLeadDedupeKeys, setLeadValue, appendLeadNotes, updateLeadStage, getRevenueEntries, createRevenueEntry, getWeeklyEntry, upsertWeeklyEntry, getFreelancerHistory, getDashboard, replaceBackupCodes, countUnusedBackupCodes, redeemBackupCode, clearBackupCodes, listUsers, getUserById, getFreelancersWithoutUser, createUser, setUserTitle, reissueSetupToken, revokeUserAccess, countActiveFounders, createInviteCode, findOpenInviteCode, consumeInviteCode, listInviteCodes, revokeInviteCode, countOpenInviteCodes, getUserByEmail, getUserCredentials, claimSubmission, purgeOldSubmissions, bindGoogleSub, registerOAuthClient, getOAuthClient, createAuthCode, consumeAuthCode, storeMcpToken, getMcpTokenUser, consumeRefreshToken, listMcpGrants, revokeMcpGrant, revokeAllMcpTokensForUser, purgeExpiredOAuth, recordOutreachEvent, findLeadByEmail, getLeadById, getOutreachForLead, getRecentOutreach, getOutreachSummary, getUnmatchedOutreach, setOutreachStatus, markOutreachSent, openCallWindowFromEvent, getCallQueue, countCallQueue, getCallOutcomeStats, logCallOutcome, reopenCallWindow, getLeadsAwaitingApproval, countOutreachQueue, logAudit, getAuditLog, logError, getErrorLog, flagForRetentionReview, getOpenRetentionFlags, resolveRetentionFlag, eraseLeadPII, eraseFreelancerPII, runRetentionScan, CALL_OUTCOMES, CALL_OUTCOME_LABELS };
+return { getFreelancers, getFreelancerById, createFreelancer, setFreelancerActive, getClients, createClient, setClientStatus, getLeads, createLead, getLeadDedupeKeys, setLeadDraft, setLeadValue, appendLeadNotes, updateLeadStage, getRevenueEntries, createRevenueEntry, getWeeklyEntry, upsertWeeklyEntry, getFreelancerHistory, getDashboard, replaceBackupCodes, countUnusedBackupCodes, redeemBackupCode, clearBackupCodes, listUsers, getUserById, getFreelancersWithoutUser, createUser, setUserTitle, reissueSetupToken, revokeUserAccess, countActiveFounders, createInviteCode, findOpenInviteCode, consumeInviteCode, listInviteCodes, revokeInviteCode, countOpenInviteCodes, getUserByEmail, getUserCredentials, claimSubmission, purgeOldSubmissions, bindGoogleSub, registerOAuthClient, getOAuthClient, createAuthCode, consumeAuthCode, storeMcpToken, getMcpTokenUser, consumeRefreshToken, listMcpGrants, revokeMcpGrant, revokeAllMcpTokensForUser, purgeExpiredOAuth, recordOutreachEvent, findLeadByEmail, getLeadById, getOutreachForLead, getRecentOutreach, getOutreachSummary, getUnmatchedOutreach, setOutreachStatus, markOutreachSent, openCallWindowFromEvent, getCallQueue, countCallQueue, getCallOutcomeStats, logCallOutcome, reopenCallWindow, getLeadsAwaitingApproval, countOutreachQueue, logAudit, getAuditLog, logError, getErrorLog, flagForRetentionReview, getOpenRetentionFlags, resolveRetentionFlag, eraseLeadPII, eraseFreelancerPII, runRetentionScan, CALL_OUTCOMES, CALL_OUTCOME_LABELS };
 })();
 
 // ===================== src/views.js ====================
@@ -2937,6 +3008,11 @@ function outreachQueuePage({ user, csrf, theme, queue, counts, recent, unmatched
         l.company && l.company !== l.name ? `<br/><span class="hint">${esc(l.company)}</span>` : ""
       }</td>
       <td class="muted">${l.contact_email ? esc(l.contact_email) : `<span class="hint">no email &mdash; can't be approved</span>`}</td>
+      <td>${
+        l.has_draft
+          ? `<a href="/leads/${l.id}" class="link-inline">read the email</a>`
+          : `<span class="hint">no draft &mdash; can't be sent</span>`
+      }</td>
       <td class="muted">${esc(l.source || "—")}</td>
       <td class="mono">${l.value_estimate ? money(l.value_estimate) : "—"}</td>
       <td class="right">
@@ -3005,7 +3081,7 @@ function outreachQueuePage({ user, csrf, theme, queue, counts, recent, unmatched
       <div class="table-wrap">
         ${
           queueRows
-            ? `<table><thead><tr><th>Lead</th><th>Email</th><th>Source</th><th>Value</th><th class="right">Decision</th></tr></thead><tbody>${queueRows}</tbody></table>`
+            ? `<table><thead><tr><th>Lead</th><th>Email</th><th>Draft</th><th>Source</th><th>Value</th><th class="right">Decision</th></tr></thead><tbody>${queueRows}</tbody></table>`
             : `<div class="empty">Nothing waiting. Scraped leads land here for you to qualify before anyone is emailed.</div>`
         }
       </div>
@@ -3040,6 +3116,54 @@ function outreachQueuePage({ user, csrf, theme, queue, counts, recent, unmatched
 
 // ---------- Founder: single lead + outreach timeline ----------
 // Step 1 of the CRM work: HQ shows what Make actually did, per lead.
+// The draft the founder reads before approving. This is what makes the
+// approval gate mean something: before it existed you authorised a send whose
+// contents you had never seen.
+//
+// The greeting is shown as a live preview rather than baked in, because it is
+// resolved against the clock at the moment of sending, not now.
+function draftPanel(lead, csrf, greetingNow, warnings) {
+  const has = lead.email_subject && lead.email_body;
+  return `<div class="panel">
+    <div class="panel-head">Outreach email${has ? "" : " &mdash; not written yet"}</div>
+    <div class="security-body">
+      ${
+        has
+          ? `<div class="hint" style="margin-bottom:10px">Drafted${
+              lead.drafted_by ? ` by ${esc(lead.drafted_by)}` : ""
+            }${lead.drafted_at ? ` on ${esc(String(lead.drafted_at).replace("T", " ").slice(0, 16))} UTC` : ""}. Edit it here before you approve.</div>`
+          : `<div class="security-copy" style="margin-bottom:10px">No draft yet. Sending is blocked until there is one, because Make maps this straight into Gmail and would deliver a blank email. Ask Claude to write it, or type it below.</div>`
+      }
+      ${
+        warnings.length
+          ? `<div class="msg msg-error"><strong>House style checks:</strong><ul style="margin:8px 0 0 18px">${warnings
+              .map((w) => `<li>${esc(w)}</li>`)
+              .join("")}</ul></div>`
+          : ""
+      }
+      <form method="post" action="/leads/${lead.id}/draft" class="plain">
+        ${csrfField(csrf)}
+        <div class="field field-block">
+          <label for="subject">Subject</label>
+          <input id="subject" name="subject" maxlength="300" value="${esc(lead.email_subject || "")}"
+            placeholder="Braamfontein Bakery, 4.8 stars is a wonderful result" />
+        </div>
+        <div class="field field-block">
+          <label for="body">Body</label>
+          <textarea id="body" name="body" rows="16" class="data-paste">${esc(lead.email_body || "")}</textarea>
+          <div class="hint">
+            Keep <span class="mono">{{greeting}}</span> on the first line. HQ replaces it when the email actually
+            goes, so the greeting matches the clock. Right now it would read <strong>&ldquo;${esc(greetingNow)}&rdquo;</strong>.
+          </div>
+        </div>
+        <div class="form-foot">
+          <button type="submit" class="btn btn-primary">Save draft</button>
+        </div>
+      </form>
+    </div>
+  </div>`;
+}
+
 // The Sequence B window on a single lead. Rendered only once a send has opened
 // a window: before that there is nothing to say, and an empty "no call yet"
 // block on every lead would be noise.
@@ -3089,7 +3213,7 @@ function callPanel(lead, csrf) {
   </div>`;
 }
 
-function leadDetailPage({ user, lead, events, theme, webhookReady, csrf, sendingReady = false }) {
+function leadDetailPage({ user, lead, events, theme, webhookReady, csrf, sendingReady = false, greetingNow = "Good day", styleWarnings = [] }) {
   const kindPill = (k) =>
     k === "reply"
       ? pill("reply", "green")
@@ -3148,6 +3272,8 @@ function leadDetailPage({ user, lead, events, theme, webhookReady, csrf, sending
         lead.value_estimate ? money(lead.value_estimate) : "&mdash;"
       }</div></div>
     </div>
+
+    ${draftPanel(lead, csrf, greetingNow, styleWarnings)}
 
     <div class="panel">
       <div class="panel-head">Outreach</div>
@@ -4366,6 +4492,28 @@ const MCP_TOOLS = [
     },
   },
   {
+    name: "draft_outreach",
+    description:
+      "Write the outreach email for a lead, so a founder can read the actual message before approving it. " +
+      "Follow the Catalyst 7 template: subject is \"[Business Name], [rating] stars is a wonderful result\". " +
+      "Body opens with the literal placeholder {{greeting}} on its own line — do NOT write \"Good morning\" " +
+      "yourself, HQ fills that in at send time so it matches the clock. Then: 'I hope this email finds you well.', " +
+      "specific praise for what the research found (rating, reviews, standing) BEFORE any mention of a gap, the " +
+      "gap line, how Catalyst 7 puts a system in place, a 30 minute discovery call ask, and the sign-off " +
+      "'Warm regards, Catalyst 7'. House style: NO em or en dashes anywhere, never 'Hi there', one idea per short " +
+      "paragraph with blank lines between. Founders only. This does not approve or send anything.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        lead_id: { type: "integer", description: "The lead's id, from list_leads." },
+        subject: { type: "string", description: "The subject line." },
+        body: { type: "string", description: "The full body, starting with {{greeting}} on its own line." },
+      },
+      required: ["lead_id", "subject", "body"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "qualify_lead",
     description:
       "Record qualification on an existing lead: move its stage, set an estimated value, and append what you found. " +
@@ -4409,6 +4557,7 @@ const FOUNDER_ONLY = new Set([
   "list_freelancers",
   "create_leads",
   "qualify_lead",
+  "draft_outreach",
 ]);
 
 // The line this connector does not cross. Claude can put leads in and write
@@ -4483,6 +4632,31 @@ async function runMcpTool(name, args, { env, user, ip = null }) {
       "",
       "All of them are awaiting approval. Nothing has been emailed — a founder approves at /outreach in HQ."
     );
+    return out.join("\n");
+  }
+
+  if (name === "draft_outreach") {
+    const id = Number(args.lead_id);
+    if (!Number.isInteger(id)) return "Pass a numeric `lead_id` — use list_leads to find it.";
+    const lead = await db.getLeadById(env, id);
+    if (!lead) return `No lead with id ${id}.`;
+
+    const subject = String(args.subject || "").trim().slice(0, 300);
+    const body = String(args.body || "").trim().slice(0, 8000);
+    if (!subject || !body) return "Both `subject` and `body` are required.";
+
+    await db.setLeadDraft(env, id, { subject, body, actor: user.name });
+    await db.logAudit(env, user, "mcp_outreach_drafted", "lead", id, lead.name, ip);
+
+    // Warnings, not rejections. The house style rules are the founder's to
+    // enforce, and refusing the write would lose copy that is mostly right.
+    const warnings = copyStyleWarnings(subject, body);
+    const out = [`Draft saved for ${lead.name}. A founder reads it at /leads/${id} before approving.`];
+    if (warnings.length) out.push("", "Style checks that did not pass:", ...warnings.map((w) => `  - ${w}`));
+    if (!/\{\{\s*greeting\s*\}\}/i.test(body)) {
+      out.push("", "Note: no {{greeting}} placeholder found, so HQ will put the greeting on the front itself.");
+    }
+    out.push("", "Nothing has been approved or sent.");
     return out.join("\n");
   }
 
@@ -5735,6 +5909,8 @@ async function handleRequest(request, env) {
               csrf,
               webhookReady: makeWebhookConfigured(env),
               sendingReady: outreachSendingConfigured(env),
+              greetingNow: greetingFor(new Date()),
+              styleWarnings: copyStyleWarnings(lead.email_subject, lead.email_body),
             })
           );
         }
@@ -5822,6 +5998,26 @@ async function handleRequest(request, env) {
           return redirect("/leads");
         }
 
+        // ---- Save the email draft ----
+        // A founder can rewrite whatever Claude produced. The draft is what
+        // Make puts in front of the lead, so this is the last edit point.
+        const draftMatch = path.match(/^\/leads\/(\d+)\/draft$/);
+        if (draftMatch && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          const lead = await db.getLeadById(env, draftMatch[1]);
+          if (!lead) return html(views.errorPage("That lead no longer exists.", 404, theme), 404);
+
+          await db.setLeadDraft(env, lead.id, {
+            subject: String(f.subject || "").trim().slice(0, 300) || null,
+            body: String(f.body || "").trim().slice(0, 8000) || null,
+            actor: user.name,
+          });
+          await db.logAudit(env, user, "outreach_drafted", "lead", lead.id, lead.name, reqIp);
+          return redirect(`/leads/${lead.id}`);
+        }
+
         // ---- Outreach approval gate ----
         // Nothing is emailed without a founder explicitly approving it. The
         // decision is recorded against them, not against "the system".
@@ -5869,6 +6065,18 @@ async function handleRequest(request, env) {
           }
           if (!lead.contact_email) {
             return html(views.errorPage("That lead has no email address.", 400, theme), 400);
+          }
+          // Make maps the subject and body straight into Gmail. With no draft
+          // it would send a blank email, and an email cannot be unsent.
+          if (!lead.email_subject || !lead.email_body) {
+            return html(
+              views.errorPage(
+                "That lead has no email draft yet, so sending would deliver a blank message. Ask Claude to draft it, or write one on the lead page.",
+                400,
+                theme
+              ),
+              400
+            );
           }
 
           const payload = buildOutreachPayload(lead, user.name);

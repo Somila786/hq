@@ -69,7 +69,14 @@ CREATE TABLE IF NOT EXISTS leads (
   call_due_at TEXT,
   call_outcome TEXT,
   call_logged_at TEXT,
-  call_logged_by TEXT
+  call_logged_by TEXT,
+  -- The outreach email draft (see migrations/009_outreach_draft.sql). The
+  -- greeting is NOT stored: it must match the clock time of the send, so the
+  -- body holds a {{greeting}} placeholder that HQ fills in at send time.
+  email_subject TEXT,
+  email_body TEXT,
+  drafted_at TEXT,
+  drafted_by TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_leads_outreach ON leads (outreach_status);

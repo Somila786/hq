@@ -21,6 +21,9 @@ import {
   hashBackupCode,
   normalizeBackupCode,
   callWindowHours,
+  greetingFor,
+  renderEmailBody,
+  copyStyleWarnings,
 } from "../src/auth.js";
 import * as db from "../src/db.js";
 import { parseLeads, classifyLeads } from "../src/import.js";
@@ -2102,12 +2105,15 @@ await test("the read tools answer with real data and change nothing", async () =
 
   const list = await rpc(env, grant.access_token, "tools/list");
   const names = list.body.result.tools.map((t) => t.name);
-  eq(names.length, 8, "six reads plus two writes");
+  eq(names.length, 9, "six reads plus three writes");
 
   // The connector can create and qualify leads. It must never be able to
   // approve outreach or trigger a send: that gate is the whole reason the
   // outreach is any good, and an agent that could authorise its own sends
   // would quietly remove it.
+  for (const expected of ["create_leads", "qualify_lead", "draft_outreach"]) {
+    assert(names.includes(expected), `${expected} is offered`);
+  }
   for (const forbidden of ["approve_outreach", "send_outreach", "reject_outreach", "delete_lead", "log_call"]) {
     assert(!names.includes(forbidden), `${forbidden} must never be exposed over MCP`);
   }
@@ -2427,7 +2433,18 @@ async function seedLead(env, over = {}) {
   // is whichever the tie broke toward -- and every later assertion would be
   // pointed at the wrong lead.
   const all = await db.getLeads(env);
-  return all.reduce((newest, l) => (l.id > newest.id ? l : newest), all[0]);
+  const lead = all.reduce((newest, l) => (l.id > newest.id ? l : newest), all[0]);
+  // Sending refuses a lead with no draft, because Make maps subject and body
+  // straight into Gmail and a blank email cannot be unsent. Every send test
+  // therefore needs one; the refusal itself is tested separately.
+  if (over.draft !== false) {
+    await db.setLeadDraft(env, lead.id, {
+      subject: `${lead.company || lead.name}, 4.8 stars is a wonderful result`,
+      body: "{{greeting}},\n\nI hope this email finds you well.\n\nWarm regards,\nCatalyst 7",
+      actor: "Test",
+    });
+  }
+  return db.getLeadById(env, lead.id);
 }
 
 await test("a new lead starts unapproved and appears in the queue", async () => {
@@ -3859,6 +3876,180 @@ await test("the whole handshake completes end to end", async () => {
   assert(grant.access_token, "a token exists — the thing that never once happened in production");
   const list = await rpc(env, grant.access_token, "tools/list");
   eq(list.res.status, 200, "and the connector works");
+});
+
+
+console.log("\nOutreach draft — read the email before you approve it");
+
+const SAST = (hour) => new Date(Date.UTC(2026, 7, 23, hour - 2, 0, 0));
+
+await test("the greeting follows the clock, at the stated boundaries", async () => {
+  eq(greetingFor(SAST(0)), "Good morning", "midnight");
+  eq(greetingFor(SAST(11)), "Good morning", "11:59 side of noon");
+  eq(greetingFor(SAST(12)), "Good afternoon", "12:00 flips");
+  eq(greetingFor(SAST(16)), "Good afternoon", "still afternoon at 16");
+  eq(greetingFor(SAST(17)), "Good evening", "17:00 flips");
+  eq(greetingFor(SAST(23)), "Good evening", "late");
+});
+
+await test("the greeting is resolved at SEND time, not at drafting time", async () => {
+  // The whole reason it is not stored: a lead written up in the morning and
+  // approved in the evening must not go out saying "Good morning".
+  const body = "{{greeting}},\n\nI hope this email finds you well.";
+  has(renderEmailBody(body, SAST(9)), "Good morning,", "drafted in the morning");
+  has(renderEmailBody(body, SAST(18)), "Good evening,", "same draft, sent in the evening");
+  assert(!renderEmailBody(body, SAST(18)).includes("Good morning"), "the morning greeting is gone, not left behind");
+});
+
+await test("a draft with no placeholder still gets a greeting rather than opening cold", async () => {
+  const out = renderEmailBody("I hope this email finds you well.", SAST(14));
+  has(out, "Good afternoon,", "greeting prepended");
+  assert(!/^I hope/.test(out), 'never opens cold - the style rule bans "Hi there" and a bare start is worse');
+});
+
+await test("house style violations are reported, not silently corrected", async () => {
+  const bad = copyStyleWarnings("A subject", "Hi there, we can help — really.");
+  assert(bad.some((w) => /em or en dash/i.test(w)), "flags the em dash the 20 Aug rule bans");
+  assert(bad.some((w) => /Hi there/i.test(w)), 'flags "Hi there"');
+  assert(bad.some((w) => /sign-off/i.test(w)), "flags the missing sign-off");
+
+  const good = copyStyleWarnings(
+    "Braamfontein Bakery, 4.8 stars is a wonderful result",
+    "{{greeting}},\n\nI hope this email finds you well.\n\nWarm regards,\nCatalyst 7"
+  );
+  eq(good.length, 0, `a template-shaped draft passes clean: ${good.join(" | ")}`);
+});
+
+await test("draft_outreach saves the copy and reports the style checks", async () => {
+  const env = sendingEnv();
+  const { session, csrf } = await founderSession(env);
+  const grant = await connectAsClaude(env, session, csrf);
+  const lead = await seedLead(env, { draft: false });
+
+  const res = await rpc(env, grant.access_token, "tools/call", {
+    name: "draft_outreach",
+    arguments: {
+      lead_id: lead.id,
+      subject: "Braamfontein Bakery, 4.8 stars is a wonderful result",
+      body: "{{greeting}},\n\nI hope this email finds you well.\n\nWarm regards,\nCatalyst 7",
+    },
+  });
+  const text = res.body.result.content[0].text;
+  has(text, "Draft saved", "confirms");
+  has(text, "Nothing has been approved or sent", "and states the boundary");
+
+  const after = await db.getLeadById(env, lead.id);
+  has(after.email_subject, "4.8 stars", "subject stored");
+  has(after.email_body, "{{greeting}}", "placeholder kept, NOT resolved at write time");
+  assert(after.drafted_by, "attributed");
+  assert((await auditActions(env)).includes("mcp_outreach_drafted"), "audited as a connector action");
+});
+
+await test("a draft that breaks house style is still saved, with the problems named", async () => {
+  const env = sendingEnv();
+  const { session, csrf } = await founderSession(env);
+  const grant = await connectAsClaude(env, session, csrf);
+  const lead = await seedLead(env, { draft: false });
+
+  const res = await rpc(env, grant.access_token, "tools/call", {
+    name: "draft_outreach",
+    arguments: { lead_id: lead.id, subject: "S", body: "Hi there — we can help." },
+  });
+  const text = res.body.result.content[0].text;
+  has(text, "Style checks that did not pass", "problems surfaced");
+  assert((await db.getLeadById(env, lead.id)).email_body, "but the copy is kept - refusing would lose work that is mostly right");
+});
+
+// ---- the guard that matters ----
+
+await test("a lead with no draft cannot be sent, because Gmail would deliver a blank email", async () => {
+  const env = sendingEnv();
+  const { session, csrf } = await founderSession(env);
+  const lead = await seedLead(env, { draft: false });
+  await db.setOutreachStatus(env, lead.id, "approved", "Somila");
+
+  const stub = stubMakeEndpoint();
+  try {
+    const res = await worker.fetch(
+      req(`/leads/${lead.id}/outreach/send`, { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf } }),
+      env
+    );
+    eq(res.status, 400, "refused");
+    eq(stub.calls.length, 0, "Make was never called");
+    eq((await db.getOutreachForLead(env, lead.id)).length, 0, "nothing recorded");
+    eq((await db.getLeadById(env, lead.id)).call_due_at, null, "and no call window opened");
+  } finally {
+    stub.restore();
+  }
+});
+
+await test("the send carries the rendered copy, with the greeting already resolved", async () => {
+  const env = sendingEnv();
+  const { session, csrf } = await founderSession(env);
+  const lead = await seedLead(env);
+
+  await db.setLeadDraft(env, lead.id, {
+    subject: "Braamfontein Bakery, 4.8 stars is a wonderful result",
+    body: "{{greeting}},\n\nI hope this email finds you well.\n\nWarm regards,\nCatalyst 7",
+    actor: "Claude",
+  });
+  await db.setOutreachStatus(env, lead.id, "approved", "Somila");
+
+  const stub = stubMakeEndpoint();
+  try {
+    await worker.fetch(
+      req(`/leads/${lead.id}/outreach/send`, { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf } }),
+      env
+    );
+    eq(stub.calls.length, 1, "sent");
+    const sent = JSON.parse(stub.calls[0].body);
+    has(sent.data.subject, "4.8 stars", "subject travels");
+    assert(!sent.data.body.includes("{{greeting}}"), "the placeholder is resolved before it leaves HQ");
+    assert(/^Good (morning|afternoon|evening),/.test(sent.data.body), `body opens with a real greeting: ${sent.data.body.slice(0, 30)}`);
+    has(sent.data.body, "Warm regards", "and keeps the sign-off");
+    assert(sent.data.greeting, "the greeting is also sent on its own, in case Make wants it separately");
+  } finally {
+    stub.restore();
+  }
+});
+
+await test("a founder can rewrite the draft in HQ", async () => {
+  const env = sendingEnv();
+  const { session, csrf } = await founderSession(env);
+  const lead = await seedLead(env);
+
+  await worker.fetch(
+    req(`/leads/${lead.id}/draft`, {
+      method: "POST",
+      cookies: { c7_session: session },
+      form: { _csrf: csrf, subject: "My own subject", body: "{{greeting}},\n\nMy own words.\n\nWarm regards,\nCatalyst 7" },
+    }),
+    env
+  );
+  const after = await db.getLeadById(env, lead.id);
+  eq(after.email_subject, "My own subject", "founder's edit wins over whatever Claude wrote");
+  has(after.email_body, "My own words", "body replaced");
+  assert(after.drafted_by && after.drafted_by !== "Test", `re-attributed to whoever last touched it, got ${after.drafted_by}`);
+  assert((await auditActions(env)).includes("outreach_drafted"), "audited");
+});
+
+await test("the lead page shows the draft and what the greeting would say right now", async () => {
+  const env = sendingEnv();
+  const { session } = await founderSession(env);
+  const lead = await seedLead(env);
+  const page = await (await worker.fetch(req(`/leads/${lead.id}`, { cookies: { c7_session: session } }), env)).text();
+
+  has(page, "Outreach email", "the panel is there");
+  has(page, "4.8 stars is a wonderful result", "showing the actual subject");
+  assert(/Good (morning|afternoon|evening)/.test(page), "and previews the greeting as it stands now");
+});
+
+await test("the approval queue says which leads have no draft", async () => {
+  const env = sendingEnv();
+  const { session } = await founderSession(env);
+  await seedLead(env, { draft: false, name: "No Draft Co", contact_email: "nodraft@x.co.za" });
+  const page = await (await worker.fetch(req("/outreach", { cookies: { c7_session: session } }), env)).text();
+  has(page, "no draft", "flagged before you approve it, not after you try to send");
 });
 
 

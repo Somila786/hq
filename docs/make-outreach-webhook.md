@@ -148,12 +148,37 @@ Same C7 envelope, signed the same way, with the lead in `data`:
     "source": "apify",
     "value_estimate": 25000,
     "notes": "",
-    "approved_by": "Somila Tenza Sogaxa"
+    "approved_by": "Somila Tenza Sogaxa",
+    "subject": "Braamfontein Bakery, 4.8 stars is a wonderful result",
+    "body": "Good afternoon,
+
+I hope this email finds you well.
+
+...
+
+Warm regards,
+Catalyst 7",
+    "greeting": "Good afternoon"
   }
 }
 ```
 
 `first_name` is split out because Gmail merge fields usually want it.
+
+### The copy travels with the send
+
+`subject` and `body` are the email itself, written in HQ and read by a founder
+before they approved it. Map the Gmail module at **`data.subject`** and
+**`data.body`** rather than expecting the caller to supply copy.
+
+**`body` arrives with the greeting already resolved.** The house rule ties the
+greeting to the clock time of the send, so a lead drafted at 10:00 and approved
+at 18:00 must not go out saying "Good morning". HQ stores the draft with a
+`{{greeting}}` placeholder and substitutes it at the moment it calls Make, in
+SAST. `greeting` is also sent on its own if you would rather compose it in Make.
+
+A lead with no draft **cannot be sent at all** -- HQ returns 400 rather than let
+Make deliver a blank email.
 
 ## ⚠️ Your scenario currently expects Apify's payload
 

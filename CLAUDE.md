@@ -44,7 +44,7 @@ src/views.js    — every page's HTML, plus the shared CSS/layout
 schema.sql      — reference copy of the live D1 schema
 wrangler.toml   — Worker config, D1 binding, monthly Cron Trigger
 tests/d1.mjs    — node:sqlite wrapper matching D1's prepare/bind/first/all/run
-tests/run.mjs   — 148 end-to-end tests (`npm test`)
+tests/run.mjs   — 191 end-to-end tests (`npm test`)
 tests/devserver.mjs — local preview server (`npm run preview`), seeded demo data
 README.md       — deploy steps, day-to-day usage, known limitations
 ARCHITECTURE.md — full frontend/backend/database/privacy/security breakdown
@@ -59,7 +59,7 @@ repo is on GitHub.
 **Live and working.** `hq.catalyst7.co.za` serves the Worker `catalyst7-kpi`
 against D1 `ba622992-c6dc-4a9b-a099-3b8a5fbe3a83`. Migrations **001-008 are all
 applied**. `MAKE_WEBHOOK_SECRET` is set and verified end to end against
-production. **148/148 tests pass**, against `src/` and against `dist/worker.js`.
+production. **191/191 tests pass**, against `src/` and against `dist/worker.js`.
 
 The CRM work is built in four steps, all committed:
 
@@ -79,6 +79,15 @@ The CRM work is built in four steps, all committed:
    deleting. That gate is why the outreach is any good; an agent that could
    authorise its own sends would quietly remove it. There are tests for both
    the absence of those tools and the refusal if one is ever added by mistake.
+
+6. **Outreach drafts** — `email_subject` / `email_body` on the lead, written by
+   Claude via `draft_outreach` or typed by a founder at `/leads/:id`. A founder
+   now reads the actual email before approving it. **The greeting is never
+   stored:** the house rule ties it to the clock time of the *send*, so the body
+   holds a `{{greeting}}` placeholder that HQ resolves in SAST when it triggers
+   Make. Sending is refused outright without a draft, since Make maps the body
+   straight into Gmail. `copyStyleWarnings()` flags the 20 Aug 2026 style rules
+   (no em dashes, never "Hi there", the sign-off) without rewriting anyone's copy.
 
 ### Deploying — there is no terminal in this workflow
 
@@ -164,7 +173,7 @@ looks visually wrong and you want to diff against the original mockup.
 Security hardening pass is complete: login rate limiting, CSRF protection,
 audit log, optional TOTP 2FA, error log, monthly retention review with a
 founder-approved erasure action. All of it is covered by an end-to-end test
-suite (see Testing below) — 148/148 passing as of the last run.
+suite (see Testing below) — 191/191 passing as of the last run.
 
 ## Testing
 
