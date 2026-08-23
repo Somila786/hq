@@ -3767,6 +3767,101 @@ await test("no page still describes the connector as read-only", async () => {
 });
 
 
+console.log("\nform-action must not strangle the OAuth redirect");
+
+// The bug this pins: `form-action 'self'` is enforced across the whole redirect
+// chain, not just the immediate POST target. The consent form posts to HQ, HQ
+// answers 302 to the client's redirect_uri, and the browser then kills the
+// navigation. Server-side everything looks perfect — the grant is audited and
+// the code is minted — while the browser simply stays on the consent page and
+// the code never leaves. Every connector attempt died here.
+
+async function registerAndConsent(env, session, redirectUri = "https://claude.ai/api/mcp/auth_callback") {
+  const reg = await worker.fetch(
+    new Request("https://hq.test/oauth/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ client_name: "Claude", redirect_uris: [redirectUri], token_endpoint_auth_method: "none" }),
+    }),
+    env
+  );
+  const client = await reg.json();
+  const q =
+    `?response_type=code&client_id=${client.client_id}&redirect_uri=${encodeURIComponent(redirectUri)}` +
+    `&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&state=s&scope=mcp%3Aread`;
+  return { client, q, res: await worker.fetch(req(`/oauth/authorize${q}`, { cookies: { c7_session: session } }), env) };
+}
+
+const formAction = (res) => ((res.headers.get("content-security-policy") || "").match(/form-action ([^;]*)/) || [])[1] || "";
+
+await test("the consent page allows the redirect target it is about to send you to", async () => {
+  const env = makeEnv();
+  const { session } = await founderSession(env);
+  const { res } = await registerAndConsent(env, session);
+
+  eq(res.status, 200, "consent renders");
+  has(formAction(res), "https://claude.ai", "the origin the 302 goes to must be allowed, or the browser blocks the navigation");
+  has(formAction(res), "'self'", "and self is still allowed");
+});
+
+await test("the allowance is exactly one origin, taken from the registered URI", async () => {
+  const env = makeEnv();
+  const { session } = await founderSession(env);
+  const { res } = await registerAndConsent(env, session, "https://example.test/cb");
+
+  const fa = formAction(res);
+  eq(fa.trim(), "'self' https://example.test", "one origin, no path, nothing wildcarded");
+  assert(!fa.includes("*"), "never a wildcard");
+  assert(!fa.includes("claude.ai"), "not a hardcoded vendor — it follows the client's own registration");
+});
+
+await test("every other page keeps form-action locked to self", async () => {
+  const env = makeEnv();
+  const { session } = await founderSession(env);
+  for (const path of ["/dashboard", "/leads", "/outreach", "/calls", "/security", "/team", "/revenue"]) {
+    const res = await worker.fetch(req(path, { cookies: { c7_session: session } }), env);
+    eq(formAction(res).trim(), "'self'", `${path} must not be widened`);
+  }
+  const login = await worker.fetch(req("/login"), env);
+  eq(formAction(login).trim(), "'self'", "login page too");
+});
+
+await test("an unregistered redirect_uri never reaches the CSP", async () => {
+  const env = makeEnv();
+  const { session } = await founderSession(env);
+  const reg = await worker.fetch(
+    new Request("https://hq.test/oauth/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_name: "Claude",
+        redirect_uris: ["https://claude.ai/api/mcp/auth_callback"],
+        token_endpoint_auth_method: "none",
+      }),
+    }),
+    env
+  );
+  const client = await reg.json();
+  // Attacker swaps the redirect_uri for their own origin.
+  const q =
+    `?response_type=code&client_id=${client.client_id}&redirect_uri=${encodeURIComponent("https://evil.test/steal")}` +
+    `&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&state=s&scope=mcp%3Aread`;
+  const res = await worker.fetch(req(`/oauth/authorize${q}`, { cookies: { c7_session: session } }), env);
+
+  eq(res.status, 400, "refused before any consent screen is shown");
+  assert(!formAction(res).includes("evil.test"), "and evil.test is never named in a CSP we send");
+});
+
+await test("the whole handshake completes end to end", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const grant = await connectAsClaude(env, session, csrf);
+  assert(grant.access_token, "a token exists — the thing that never once happened in production");
+  const list = await rpc(env, grant.access_token, "tools/list");
+  eq(list.res.status, 200, "and the connector works");
+});
+
+
 console.log("\nSecurity headers");
 
 await test("every response carries the security header set", async () => {

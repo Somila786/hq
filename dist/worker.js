@@ -4117,6 +4117,27 @@ const CSP = [
   "frame-ancestors 'none'",
 ].join("; ");
 
+// The consent page is the one page in the site whose form legitimately ends up
+// off-origin: it POSTs to /oauth/authorize, which answers 302 to the client's
+// registered redirect_uri. `form-action` is enforced across the WHOLE redirect
+// chain, so a bare 'self' silently kills that navigation -- the grant is
+// recorded and the code minted server-side, and the browser simply stays put.
+// That is what stopped every connector attempt.
+//
+// Widened by exactly one origin, and only on this page. The origin comes from
+// a redirect_uri that redirectUriAllowed() has already checked against the
+// client's registration, so this can never name somewhere the flow would not
+// have gone anyway.
+function cspAllowingFormAction(redirectUri) {
+  let origin;
+  try {
+    origin = new URL(redirectUri).origin;
+  } catch {
+    return CSP;
+  }
+  return CSP.replace("form-action 'self'", `form-action 'self' ${origin}`);
+}
+
 const SECURITY_HEADERS = {
   "Content-Security-Policy": CSP,
   "X-Content-Type-Options": "nosniff",
@@ -4900,7 +4921,9 @@ async function handleRequest(request, env) {
               clientName: client.client_name,
               scope: requestedScope,
               query: url.search,
-            })
+            }),
+            200,
+            { "Content-Security-Policy": cspAllowingFormAction(redirectUri) }
           );
         }
 
