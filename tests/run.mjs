@@ -3538,6 +3538,114 @@ await test("a freelancer's token cannot create or qualify leads", async () => {
 });
 
 
+console.log("\nCORS — reachable by a browser-based connector, without opening the site up");
+
+// Claude's connector runs in a browser, so the OAuth handshake and /mcp are
+// cross-origin fetches from https://claude.ai. Getting this wrong produces the
+// worst kind of bug: authorize succeeds, HQ issues a code, and the token
+// exchange is blocked by the browser before it is ever sent — so the server
+// logs look perfectly healthy while approving visibly does nothing.
+
+const MACHINE_PATHS = [
+  "/mcp",
+  "/oauth/token",
+  "/oauth/register",
+  "/.well-known/oauth-protected-resource",
+  "/.well-known/oauth-authorization-server",
+];
+
+await test("a preflight is answered without a redirect", async () => {
+  const env = makeEnv();
+  for (const path of MACHINE_PATHS) {
+    const res = await worker.fetch(
+      new Request(`https://hq.test${path}`, {
+        method: "OPTIONS",
+        headers: {
+          Origin: "https://claude.ai",
+          "Access-Control-Request-Method": "POST",
+          "Access-Control-Request-Headers": "content-type,authorization",
+        },
+      }),
+      env
+    );
+    // A 302 here is the bug: an OPTIONS request carries no cookie and no
+    // bearer token, so falling through to the auth gate redirects it to
+    // /login, the preflight fails, and the real request is never sent.
+    assert(res.status >= 200 && res.status < 300, `${path} preflight must be 2xx, got ${res.status}`);
+    eq(res.headers.get("access-control-allow-origin"), "*", `${path} allows the origin`);
+    has(res.headers.get("access-control-allow-headers") || "", "Authorization", `${path} allows the auth header`);
+  }
+});
+
+await test("the responses themselves are readable cross-origin", async () => {
+  const env = makeEnv();
+  const meta = await worker.fetch(req("/.well-known/oauth-authorization-server"), env);
+  eq(meta.headers.get("access-control-allow-origin"), "*", "metadata is readable");
+  eq(meta.headers.get("cross-origin-resource-policy"), "cross-origin", "CORP must be relaxed here or the browser still blocks the read");
+
+  // The 401 challenge is how a client discovers where to authenticate. If the
+  // header isn't exposed, the browser hides it and discovery dead-ends.
+  const unauth = await worker.fetch(
+    new Request("https://hq.test/mcp", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+    }),
+    env
+  );
+  eq(unauth.status, 401, "challenges");
+  has(unauth.headers.get("access-control-expose-headers") || "", "WWW-Authenticate", "and the challenge is readable");
+});
+
+await test("the token exchange works from a browser origin end to end", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const grant = await connectAsClaude(env, session, csrf);
+  assert(grant.access_token, "a token was actually issued — the step that never completed in production");
+
+  const call = await rpc(env, grant.access_token, "tools/list");
+  eq(call.res.status, 200, "and it works");
+  assert(call.body.result.tools.length >= 8, "with the full tool list");
+});
+
+await test("cookie-authenticated routes are NOT opened up", async () => {
+  const env = makeEnv();
+  const { session } = await founderSession(env);
+
+  // Allowing cross-origin reads on these would hand any site the contents of a
+  // logged-in session. /oauth/authorize is included deliberately: it is a
+  // browser navigation the user is meant to see, not a fetch.
+  for (const path of ["/dashboard", "/leads", "/outreach", "/calls", "/security", "/oauth/authorize"]) {
+    const res = await worker.fetch(req(path, { cookies: { c7_session: session } }), env);
+    eq(res.headers.get("access-control-allow-origin"), null, `${path} must not send CORS headers`);
+    eq(res.headers.get("cross-origin-resource-policy"), "same-origin", `${path} keeps CORP locked`);
+  }
+});
+
+await test("no endpoint ever allows credentials", async () => {
+  const env = makeEnv();
+  // `Allow-Origin: *` is only safe because these endpoints authenticate with a
+  // bearer token or a PKCE code, never a cookie. Allowing credentials
+  // alongside it would be a genuine hole.
+  for (const path of MACHINE_PATHS) {
+    const res = await worker.fetch(
+      new Request(`https://hq.test${path}`, { method: "OPTIONS", headers: { Origin: "https://evil.test" } }),
+      env
+    );
+    eq(res.headers.get("access-control-allow-credentials"), null, `${path} must never allow credentials`);
+  }
+});
+
+await test("a preflight on an unknown path is not silently allowed", async () => {
+  const env = makeEnv();
+  const res = await worker.fetch(
+    new Request("https://hq.test/leads", { method: "OPTIONS", headers: { Origin: "https://claude.ai" } }),
+    env
+  );
+  eq(res.headers.get("access-control-allow-origin"), null, "CORS is an allowlist, not a default");
+});
+
+
 console.log("\nSecurity headers");
 
 await test("every response carries the security header set", async () => {

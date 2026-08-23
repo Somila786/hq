@@ -117,6 +117,50 @@ const SECURITY_HEADERS = {
   "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
 };
 
+// ---- CORS, for the machine-readable endpoints only ----
+//
+// Claude's connector runs in a browser, so the OAuth handshake and the MCP
+// endpoint are cross-origin fetches from https://claude.ai. Without these the
+// authorize step completes, HQ issues a code, and the token exchange is then
+// blocked by the browser before it is ever sent -- which looks exactly like
+// "approving does nothing", with no error anywhere on the server.
+//
+// `*` is safe here and ONLY here, because every one of these endpoints
+// authenticates with a bearer token, an authorization code plus PKCE verifier,
+// or nothing at all. None of them trusts a cookie, so a hostile page gains
+// nothing by being allowed to call them: it still has to present a credential
+// it does not have.
+//
+// The cookie-authenticated routes -- every page, every form POST, and
+// /oauth/authorize, which is a browser navigation the user must see -- are
+// deliberately NOT in this list. Allowing cross-origin reads there would hand
+// any site the contents of a logged-in session.
+const CORS_PATHS = [
+  "/mcp",
+  "/oauth/token",
+  "/oauth/register",
+  "/.well-known/oauth-protected-resource",
+  "/.well-known/oauth-protected-resource/mcp",
+  "/.well-known/oauth-authorization-server",
+  "/.well-known/openid-configuration",
+];
+
+function corsHeaders(path) {
+  if (!CORS_PATHS.includes(path)) return {};
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, Mcp-Session-Id, MCP-Protocol-Version",
+    // Without this the browser hides the 401 challenge, so a client cannot
+    // discover where to authenticate.
+    "Access-Control-Expose-Headers": "WWW-Authenticate, Mcp-Session-Id",
+    "Access-Control-Max-Age": "86400",
+    // The site-wide default is `same-origin`, which blocks these responses
+    // being read cross-origin even once CORS allows the request.
+    "Cross-Origin-Resource-Policy": "cross-origin",
+  };
+}
+
 // Set-Cookie cannot be safely comma-joined into a single header (cookie
 // Expires values contain commas), so any extraHeaders["Set-Cookie"] may be
 // a string or an array of strings -- each gets its own header line.
@@ -566,7 +610,34 @@ async function handleMcp(rpc, ctx) {
 }
 
 export default {
+  // Thin wrapper so the CORS headers are attached in exactly one place. Doing
+  // it per call site means the one endpoint someone forgets is the one that
+  // silently breaks the connector.
   async fetch(request, env) {
+    const path = new URL(request.url).pathname;
+    const res = await handleRequest(request, env);
+    const cors = corsHeaders(path);
+    if (!Object.keys(cors).length) return res;
+
+    const headers = new Headers(res.headers);
+    for (const [k, v] of Object.entries(cors)) headers.set(k, v);
+    return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+  },
+
+  // Monthly Cron Trigger (see wrangler.toml [triggers]) -- flags stale
+  // records for a human retention decision. Never deletes anything itself.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(
+      (async () => {
+        await db.runRetentionScan(env);
+        await db.purgeOldSubmissions(env);
+      })()
+    );
+  },
+};
+
+async function handleRequest(request, env) {
+  {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
@@ -574,6 +645,14 @@ export default {
     // Captured once so every audit entry can record where the action came
     // from, per the C7 standard's audit field list.
     const reqIp = clientIp(request);
+
+    // Preflight, answered before anything else. It has to sit above the auth
+    // gate: an OPTIONS request carries no cookie and no bearer token, so
+    // falling through would redirect it to /login, and a 302 fails the
+    // preflight -- the browser then never sends the real request at all.
+    if (method === "OPTIONS" && CORS_PATHS.includes(path)) {
+      return new Response(null, { status: 204, headers: buildHeaders({}, corsHeaders(path)) });
+    }
 
     try {
       // ---------- Inbound webhook from Make (C7 webhook standard) ----------
@@ -2120,16 +2199,5 @@ export default {
       await db.logError(env, path, err.stack || err.message || String(err));
       return html(views.errorPage("Something went wrong: " + err.message, 500, theme), 500);
     }
-  },
-
-  // Monthly Cron Trigger (see wrangler.toml [triggers]) -- flags stale
-  // records for a human retention decision. Never deletes anything itself.
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(
-      (async () => {
-        await db.runRetentionScan(env);
-        await db.purgeOldSubmissions(env);
-      })()
-    );
-  },
-};
+  }
+}
