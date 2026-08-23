@@ -654,6 +654,25 @@ async function handleRequest(request, env) {
       return new Response(null, { status: 204, headers: buildHeaders({}, corsHeaders(path)) });
     }
 
+    // Public and above the auth gate: the browser fetches it on the login page
+    // too, and a 302 to /login there would leave every unauthenticated page
+    // with no icon. Cached, because unlike every other response here it is
+    // static and identical for everyone -- hence the explicit override of the
+    // site-wide no-store.
+    if (path === "/favicon.svg" && (method === "GET" || method === "HEAD")) {
+      return new Response(views.FAVICON_SVG, {
+        headers: buildHeaders(
+          { "Content-Type": "image/svg+xml; charset=utf-8" },
+          { "Cache-Control": "public, max-age=86400" }
+        ),
+      });
+    }
+    // Browsers without SVG-favicon support ask for this by convention. 204
+    // rather than letting it fall through to a login redirect.
+    if (path === "/favicon.ico") {
+      return new Response(null, { status: 204, headers: buildHeaders({}, { "Cache-Control": "public, max-age=86400" }) });
+    }
+
     try {
       // ---------- Inbound webhook from Make (C7 webhook standard) ----------
       // Public by necessity -- Make posts from its own infrastructure. All

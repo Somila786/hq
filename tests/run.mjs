@@ -3646,6 +3646,42 @@ await test("a preflight on an unknown path is not silently allowed", async () =>
 });
 
 
+console.log("\nFavicon");
+
+await test("the favicon is served, cacheable, and reachable without a session", async () => {
+  const env = makeEnv();
+  // Deliberately no cookie: the browser fetches it on /login too, and a 302
+  // there would leave every unauthenticated page without an icon.
+  const res = await worker.fetch(req("/favicon.svg"), env);
+  eq(res.status, 200, "served to a signed-out browser");
+  has(res.headers.get("content-type") || "", "image/svg+xml", "correct type");
+  has(res.headers.get("cache-control") || "", "max-age", "cached — it is static and identical for everyone");
+  assert(!/no-store/.test(res.headers.get("cache-control") || ""), "the site-wide no-store is overridden here");
+
+  const body = await res.text();
+  has(body, "<svg", "is an svg");
+  has(body, "#0D0D0D", "brand black");
+  has(body, "#C1272D", "brand red");
+  assert(!/<text|font-family/i.test(body), "drawn as paths — a font-dependent favicon renders differently on every platform");
+});
+
+await test("every page points at it", async () => {
+  const env = makeEnv();
+  const { session } = await founderSession(env);
+  const loggedOut = await (await worker.fetch(req("/login"), env)).text();
+  has(loggedOut, 'rel="icon"', "login page");
+  const dash = await (await worker.fetch(req("/dashboard", { cookies: { c7_session: session } }), env)).text();
+  has(dash, '/favicon.svg', "dashboard");
+});
+
+await test("/favicon.ico is answered rather than bounced to login", async () => {
+  const env = makeEnv();
+  const res = await worker.fetch(req("/favicon.ico"), env);
+  eq(res.status, 204, "no content, not a redirect");
+  eq(res.headers.get("location"), null, "definitely not a login bounce");
+});
+
+
 console.log("\nSecurity headers");
 
 await test("every response carries the security header set", async () => {

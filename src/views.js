@@ -118,6 +118,23 @@ document.cookie="c7_theme="+n+"; Path=/; Max-Age=31536000; SameSite=Lax; Secure"
 });
 </script>`;
 
+// The C7 mark, drawn as paths rather than <text> on purpose: a favicon that
+// leans on a system font renders differently on every platform, and at 16px
+// those differences are the whole image.
+//
+// Black tile with a red mark, per the brand's two-colour rule. It works in both
+// tab strips for different reasons -- against a light one the black tile is the
+// shape you see, against a dark one the tile disappears and the red mark floats.
+//
+// Geometry: the C is a 260-degree arc so the aperture stays open at small
+// sizes (a tighter gap closes up and reads as an O), and the 7 is two strokes
+// rather than a glyph. 4px strokes on a 32px grid keep both legible at 16.
+export const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <rect width="32" height="32" rx="7" fill="#0D0D0D"/>
+  <path d="M14.86 11.40 A 6 6 0 1 0 14.86 20.60" fill="none" stroke="#C1272D" stroke-width="4" stroke-linecap="round"/>
+  <path d="M18.6 11 H27 L21.4 21.6" fill="none" stroke="#C1272D" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`;
+
 function layout({ title, user, active, body, theme = "dark" }) {
   const safeTheme = theme === "light" ? "light" : "dark";
   const themeLabel = safeTheme === "dark" ? "Dark" : "Light";
@@ -164,6 +181,7 @@ function layout({ title, user, active, body, theme = "dark" }) {
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>${esc(title)} &middot; Catalyst 7 HQ</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
 <style>
 :root {
   --bg: #0D0D0D; --text: #F5EDD8; --text-muted: #9c9686;
