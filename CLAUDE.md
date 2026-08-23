@@ -20,7 +20,7 @@ there is no such person on the team.
   zero runtime dependencies. `wrangler` is the only devDependency.
 - **Database:** Cloudflare D1 (managed SQLite). Already created and live:
   `catalyst7-kpi`, id `ba622992-c6dc-4a9b-a099-3b8a5fbe3a83`. Schema in
-  `schema.sql` — 14 tables (see ARCHITECTURE.md for the full breakdown).
+  `schema.sql` — 15 tables (see ARCHITECTURE.md for the full breakdown).
   Pending migrations live in `migrations/`.
 - **Frontend:** server-rendered HTML strings in `src/views.js`. No React, no
   build step, no client bundle. Forms POST and the page reloads. This is
@@ -36,6 +36,7 @@ there is no such person on the team.
 ```
 src/index.js    — router, all HTTP handling, the scheduled() Cron handler
 src/db.js       — data access layer, every query lives here, all parameterized
+src/import.js   — Apify export parsing: CSV, loose field matching, dedupe
 src/auth.js     — password hashing, sessions, CSRF, rate limiting, TOTP,
                   backup codes, Google OAuth helpers
 migrations/     — incremental SQL for the already-live database
@@ -43,7 +44,7 @@ src/views.js    — every page's HTML, plus the shared CSS/layout
 schema.sql      — reference copy of the live D1 schema
 wrangler.toml   — Worker config, D1 binding, monthly Cron Trigger
 tests/d1.mjs    — node:sqlite wrapper matching D1's prepare/bind/first/all/run
-tests/run.mjs   — 63 end-to-end tests (`npm test`)
+tests/run.mjs   — 148 end-to-end tests (`npm test`)
 tests/devserver.mjs — local preview server (`npm run preview`), seeded demo data
 README.md       — deploy steps, day-to-day usage, known limitations
 ARCHITECTURE.md — full frontend/backend/database/privacy/security breakdown
@@ -55,50 +56,57 @@ repo is on GitHub.
 
 ## Current state — READ THIS FIRST
 
-**The design port is complete and the app runs.** The theme plumbing that was
-outstanding at the previous handoff has landed:
+**Live and working.** `hq.catalyst7.co.za` serves the Worker `catalyst7-kpi`
+against D1 `ba622992-c6dc-4a9b-a099-3b8a5fbe3a83`. Migrations **001-008 are all
+applied**. `MAKE_WEBHOOK_SECRET` is set and verified end to end against
+production. **148/148 tests pass**, against `src/` and against `dist/worker.js`.
 
-- `src/auth.js` exports `themeCookie(theme)` alongside the other cookie helpers.
-- `src/index.js` computes `theme` from the `c7_theme` cookie on every request,
-  serves a public `GET /theme/toggle` route ahead of the auth gate, and threads
-  `theme` into all 30 `views.*Page()` call sites (plus `csrfGuard`, which now
-  takes it so the 403 page matches the rest of the site).
-- The mobile nav and the collapsible add-forms were verified in a real browser
-  at 1280 / 1000 / 900 / 875 / 375 / 320px. One bug was found and fixed in
-  `views.js`: `.hamburger-toggle:checked ~ .mobile-menu` sat outside the
-  `@media (max-width:859px)` block, so a menu left open while the viewport
-  widened stayed open underneath the restored desktop nav. It's now scoped to
-  the breakpoint, with a regression test.
-- README.md and ARCHITECTURE.md describe the real brand system.
+The CRM work is built in four steps, all committed:
 
-The test suite was **not** in the handoff zip and has been rebuilt from the
-description in "Testing" below: `tests/d1.mjs` (the D1 adapter) and
-`tests/run.mjs` (63 tests). It is a reconstruction, not the byte-identical
-original — it covers the same documented ground (auth, rate limiting, CSRF,
-roles, audit, 2FA, retention/erasure, CHECK constraints) plus the new theme
-routes and the checkbox-hack markup contracts. 63/63 pass.
+1. **Record outreach** — `/webhooks/make` ingests signed C7-envelope events
+   (`sent`/`reply`/`bounce`/`failed`) into `outreach_events`. `event_id` is
+   UNIQUE, so a Make retry lands once.
+2. **Approve and send** — `/outreach` is the founder gate. Nothing is emailed
+   without an explicit approval, recorded against a named person.
+3. **Call window** — Sequence B. A successful send opens an 18h window
+   (`CALL_WINDOW_HOURS`); `/calls` lists what is due; outcomes are logged into
+   `outreach_events` as `kind='call'`. See `docs/make-outreach-webhook.md`.
+4. **Import** — `/leads/import` parses an Apify JSON/CSV paste into leads,
+   with a preview-before-write step. Parser lives in `src/import.js`.
 
-**A second pass then added Google sign-in, security headers and 2FA backup
-codes** (see "Auth & security" below). That pass introduced migration
-`migrations/001_google_auth_and_backup_codes.sql`, which has **not** been run
-against the live D1 database yet — do that before deploying, or `/security` and
-Google sign-in will error on the missing tables.
+### Deploying — there is no terminal in this workflow
+
+The user has ruled out `wrangler`/npm. Deploys are: `npm run bundle` locally,
+then **paste `dist/worker.js` into the Cloudflare dashboard editor**. Migrations
+run statement-by-statement through the Cloudflare MCP `d1_database_query` tool.
+
+**The trap that will cost you an hour:** adding a secret or variable in the
+dashboard creates a **new Worker version but does not deploy it**. The Settings
+page shows the row as though it were live while the Worker keeps serving the old
+version with no binding. Finish with **Deployments → Version History → ⋯ →
+Promote version → 100%**.
+
+To check what is actually deployed from outside, `POST /webhooks/make`
+unauthenticated: `404` JSON means the code is at CRM step 1 or later, `302` to
+`/login` means it predates it, `401` means the secret is bound too. Every other
+route redirects to login, so this is the only external signal.
 
 ### What's actually left
 
-1. **Run the migration** — `npx wrangler d1 execute catalyst7-kpi --remote
-   --file=./migrations/001_google_auth_and_backup_codes.sql`.
-2. **Deploy** — `npx wrangler login && npx wrangler deploy`. Still a human step;
-   no tool here pushes Worker code live.
-3. **Push to GitHub** — the repo is committed locally but has no remote yet.
-   Note README.md still contains a live founder setup token; make the repo
-   private or rotate that token first.
-4. **Optionally configure Google sign-in** — needs an OAuth client created in
-   Google Cloud Console (steps in README.md). Without it the feature stays
-   dormant and password login is unaffected.
-5. Optional, in rough priority order: keyboard accessibility for the two
-   checkbox-hack toggles (see ARCHITECTURE.md §1 — currently mouse/touch only),
-   a `.github/workflows/deploy.yml`, edit/delete UI for business records.
+1. **Wire Make to post to HQ** — the scenario doesn't call `/webhooks/make`
+   yet, so `outreach_events` is empty and no call windows open. This is the
+   single thing blocking the pipeline.
+2. **Leads need email addresses** — matching is by email *at the moment the
+   event arrives*. A send to someone not yet in HQ records as unmatched and
+   **never** opens a call window; adding the lead afterwards does not backfill.
+3. `Catalia` (user id 1) is a dormant founder account with no password and no
+   Google link — a leftover from the setup-token era. Safe to delete; two
+   activated founders remain.
+4. Thembalethu has no 2FA.
+5. **No git remote.** Commits live only on this machine; the user has uploaded
+   to GitHub manually, which will not include the dot-files (`.githooks/`,
+   `.github/`, `.gitignore`).
+6. Not built: multi-step drip sequences, stop-on-reply, edit/delete UI.
 
 ## Auth & security
 
@@ -150,7 +158,7 @@ looks visually wrong and you want to diff against the original mockup.
 Security hardening pass is complete: login rate limiting, CSRF protection,
 audit log, optional TOTP 2FA, error log, monthly retention review with a
 founder-approved erasure action. All of it is covered by an end-to-end test
-suite (see Testing below) — 63/63 passing as of the last run.
+suite (see Testing below) — 148/148 passing as of the last run.
 
 ## Testing
 

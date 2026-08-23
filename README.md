@@ -59,6 +59,7 @@ Your domain is already on Cloudflare (same account as this Worker), so:
 
 ## Day-to-day use
 
+- **Importing scraped leads** (`/leads/import`, founders only) — paste an Apify JSON or CSV export. It shows you exactly what it parsed and what it will do with each row *before* anything is written: new, already in HQ, no email, unusable. Business name, email, phone, address, category and rating are read under loosely-matched field names, and the qualifying context is kept as notes — including "No website found", since for the Apify clusters the absence is the signal. Rows with no email are skipped by default; they can't be emailed, and they can't be reliably de-duplicated on a re-import. Re-pasting the same export imports nothing.
 - **Founders** (`/dashboard`, `/freelancers`, `/clients`, `/leads`, `/outreach`, `/calls`, `/revenue`): log revenue and lead/client changes as they happen; check the dashboard weekly for the freelancer-hours vs last week, revenue vs last week, pipeline value, and who hasn't logged their week yet.
 - **Freelancers** (`/log`): after you generate their invite link from the Freelancers page and send it to them, they set their own password and log hours/deliverables/status each week from `/log`. They only ever see and edit their own row.
 - **Team** (`/team`, founders only): add founders and freelancers, hand out one-time invite links, and revoke access when someone leaves. Revoking signs them out everywhere immediately and keeps their history intact — nothing is deleted.

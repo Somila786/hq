@@ -57,6 +57,7 @@ import {
 } from "./auth.js";
 import * as db from "./db.js";
 import * as views from "./views.js";
+import { parseLeads, classifyLeads } from "./import.js";
 
 // ---- Security response headers ----
 //
@@ -1440,6 +1441,71 @@ export default {
           await db.logAudit(env, user, "lead_created", "lead", null, l.name, reqIp);
           return redirect("/leads");
         }
+        // ---- Import scraped leads (pipeline step 1) ----
+        // Two-step: parse and show, then write. A paste is opaque, so nothing
+        // is created until the parse has been shown back and confirmed.
+        if (path === "/leads/import" && method === "GET") {
+          return html(views.leadImportPage({ user, csrf, theme }));
+        }
+
+        if (path === "/leads/import" && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+
+          const source = (f.source || "apify").slice(0, 60);
+          const skipNoEmail = f.skip_no_email === "1";
+          const { rows, error } = parseLeads(f.raw, { source });
+          if (error) {
+            return html(views.leadImportPage({ user, csrf, theme, error, raw: f.raw, source, skipNoEmail }));
+          }
+
+          const { emails, keys } = await db.getLeadDedupeKeys(env);
+          const counts = classifyLeads(rows, { existingEmails: emails, existingKeys: keys, skipNoEmail });
+          return html(
+            views.leadImportPreviewPage({ user, csrf, theme, rows, counts, raw: f.raw, source, skipNoEmail })
+          );
+        }
+
+        if (path === "/leads/import/confirm" && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          // Re-submitting must not import the batch twice.
+          if (!(await claimOnce(env, f))) return redirect("/leads");
+
+          const source = (f.source || "apify").slice(0, 60);
+          const skipNoEmail = f.skip_no_email === "1";
+          // Re-parsed from the same raw text the preview used, rather than
+          // trusting a list of rows posted back from the browser. The preview
+          // and the write therefore cannot disagree, and nothing a client
+          // tampers with can smuggle in a row that was never shown.
+          const { rows, error } = parseLeads(f.raw, { source });
+          if (error) {
+            return html(views.leadImportPage({ user, csrf, theme, error, raw: f.raw, source, skipNoEmail }));
+          }
+
+          const { emails, keys } = await db.getLeadDedupeKeys(env);
+          classifyLeads(rows, { existingEmails: emails, existingKeys: keys, skipNoEmail });
+
+          let created = 0;
+          for (const r of rows) {
+            if (r.status !== "new") continue;
+            await db.createLead(env, {
+              name: r.name,
+              company: r.company,
+              contact_email: r.contact_email,
+              value_estimate: r.value_estimate,
+              source: r.source,
+              notes: r.notes,
+              owner: user.name,
+            });
+            created++;
+          }
+          await db.logAudit(env, user, "leads_imported", "lead", null, `${created} from ${source}`, reqIp);
+          return redirect("/leads");
+        }
+
         const stageMatch = path.match(/^\/leads\/(\d+)\/stage$/);
         if (stageMatch && method === "POST") {
           const f = await readForm(request);

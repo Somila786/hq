@@ -299,6 +299,17 @@ form.plain{margin:0}
 input, select, textarea{font-size:13px;padding:9px 10px;border-radius:var(--radius);border:1px solid var(--border);background:var(--input-bg);color:var(--text);font-family:var(--font);width:100%}
 textarea{min-height:70px;resize:vertical}
 .form-foot{display:flex;justify-content:flex-end;gap:8px;padding:14px 16px;border-top:1px solid var(--border)}
+/* Import form: fields sitting directly in a panel rather than inside a grid,
+   so they carry their own padding. */
+.field-block{padding:16px 16px 0}
+/* The global rule stretches every input to 100%, which turns a checkbox into a
+   block. Checkboxes opt out and sit inline with their label instead. */
+.checkbox-field{padding:0 16px 4px}
+.checkbox-field label{display:flex;align-items:center;gap:8px;text-transform:none;font-size:13px;font-weight:500;color:var(--text);letter-spacing:0}
+.checkbox-field input[type=checkbox]{width:auto;margin:0;flex:0 0 auto}
+.checkbox-field .hint{margin-top:6px}
+/* Pasted data is data: monospace makes a shifted column visible. */
+textarea.data-paste{font-family:var(--font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:12px;min-height:220px;white-space:pre}
 
 /* collapsible add-forms -- pure CSS, no JS */
 .form-toggle{display:none}
@@ -833,7 +844,9 @@ export function leadsPage({ user, leads, csrf, theme, outreach = {} }) {
       const selCls = l.stage === "won" ? "stage-won" : l.stage === "lost" ? "stage-lost" : "";
       return `<tr>
       <td class="strong"><a href="/leads/${l.id}" class="link-inline" style="text-decoration:none">${esc(l.name)}</a>${
-        l.company ? `<br/><span class="hint">${esc(l.company)}</span>` : ""
+        // Scraped business leads have no separate contact person, so name and
+        // company are the same string. Printing it twice just looks broken.
+        l.company && l.company !== l.name ? `<br/><span class="hint">${esc(l.company)}</span>` : ""
       }</td>
       <td class="muted">${(() => {
         const o = outreach[l.id];
@@ -868,7 +881,10 @@ export function leadsPage({ user, leads, csrf, theme, outreach = {} }) {
         <div class="page-title">Leads</div>
         <div class="page-sub">${leads.length} ${leads.length === 1 ? "lead" : "leads"}</div>
       </div>
-      <label for="add-toggle" class="btn btn-primary"><span class="toggle-open">Add lead</span><span class="toggle-close">Close</span></label>
+      <div class="row-actions">
+        <a href="/leads/import" class="btn">Import</a>
+        <label for="add-toggle" class="btn btn-primary"><span class="toggle-open">Add lead</span><span class="toggle-close">Close</span></label>
+      </div>
     </div>
 
     <div class="panel add-panel">
@@ -878,6 +894,7 @@ export function leadsPage({ user, leads, csrf, theme, outreach = {} }) {
         <div class="form-grid">
           <div class="field"><label>Name</label><input name="name" required placeholder="Zanele Buthelezi" /></div>
           <div class="field"><label>Company</label><input name="company" placeholder="Rivonia Retail Group" /></div>
+          <div class="field"><label>Email</label><input name="contact_email" type="email" placeholder="zanele@rivonia.co.za" /></div>
           <div class="field"><label>Value estimate (R)</label><input name="value_estimate" type="number" step="0.01" placeholder="25000" /></div>
           <div class="field"><label>Owner</label><input name="owner" placeholder="Thembalethu, Somila, Lethu..." /></div>
           <div class="field"><label>Source</label><input name="source" placeholder="referral, outbound..." /></div>
@@ -910,7 +927,9 @@ export function outreachQueuePage({ user, csrf, theme, queue, counts, recent, un
     .map(
       (l) => `<tr>
       <td class="strong"><a href="/leads/${l.id}" class="link-inline" style="text-decoration:none">${esc(l.name)}</a>${
-        l.company ? `<br/><span class="hint">${esc(l.company)}</span>` : ""
+        // Scraped business leads have no separate contact person, so name and
+        // company are the same string. Printing it twice just looks broken.
+        l.company && l.company !== l.name ? `<br/><span class="hint">${esc(l.company)}</span>` : ""
       }</td>
       <td class="muted">${l.contact_email ? esc(l.contact_email) : `<span class="hint">no email &mdash; can't be approved</span>`}</td>
       <td class="muted">${esc(l.source || "—")}</td>
@@ -1110,7 +1129,7 @@ export function leadDetailPage({ user, lead, events, theme, webhookReady, csrf, 
     <div class="page-head">
       <div class="page-title">${esc(lead.name)}</div>
       <div class="page-sub">
-        ${lead.company ? esc(lead.company) + " &middot; " : ""}${esc(lead.stage)}
+        ${lead.company && lead.company !== lead.name ? esc(lead.company) + " &middot; " : ""}${esc(lead.stage)}
         ${lead.owner ? ` &middot; owner ${esc(lead.owner)}` : ""}
         ${lead.contact_email ? ` &middot; ${esc(lead.contact_email)}` : " &middot; no email on file"}
       </div>
@@ -1808,7 +1827,9 @@ export function callQueuePage({ user, csrf, theme, queue, counts, stats, windowH
       const state = callDue(l.call_due_at);
       return `<tr>
       <td class="strong"><a href="/leads/${l.id}" class="link-inline" style="text-decoration:none">${esc(l.name)}</a>${
-        l.company ? `<br/><span class="hint">${esc(l.company)}</span>` : ""
+        // Scraped business leads have no separate contact person, so name and
+        // company are the same string. Printing it twice just looks broken.
+        l.company && l.company !== l.name ? `<br/><span class="hint">${esc(l.company)}</span>` : ""
       }</td>
       <td>${state ? pill(state.text, state.cls, true) : pill("no window")}${
         l.call_due_at
@@ -1876,6 +1897,153 @@ export function callQueuePage({ user, csrf, theme, queue, counts, stats, windowH
     </div>
 
     <p style="margin-top:24px"><a href="/outreach" class="btn btn-sm">Back to outreach</a></p>
+  `,
+  });
+}
+
+// ---------- Founder: import scraped leads ----------
+//
+// Step 1 of the pipeline the Call-Timing Decision Log describes: Apify scrapes,
+// a founder qualifies in HQ, approves, then outreach goes. Until this existed
+// the scrape landed nowhere and leads had to be retyped one at a time.
+//
+// Two-step on purpose. A paste is opaque -- you cannot tell by looking whether
+// a column shifted or an email column is full of "N/A" -- so nothing is written
+// until the parse has been shown back and confirmed.
+export function leadImportPage({ user, csrf, theme, error = null, raw = "", source = "apify", skipNoEmail = true }) {
+  return layout({
+    user,
+    active: "leads",
+    title: "Import leads",
+    theme,
+    body: `
+    <div class="page-head">
+      <div class="page-title">Import leads</div>
+      <div class="page-sub">Paste an Apify export. Nothing is saved until you have seen what it parsed.</div>
+    </div>
+
+    ${error ? `<div class="msg msg-error">${esc(error)}</div>` : ""}
+
+    <div class="panel">
+      <div class="panel-head">Paste the export</div>
+      <form class="plain" method="post" action="/leads/import">
+        ${csrfField(csrf)}
+        <div class="field field-block">
+          <label for="raw">JSON or CSV</label>
+          <textarea id="raw" name="raw" rows="12" required class="data-paste"
+            placeholder='Paste the Apify dataset export here.
+
+JSON:  [{"title":"Braamfontein Bakery","address":"12 Smit St","phone":"011 555 0100","website":"","emails":["thandi@bakery.co.za"]}]
+
+CSV:   title,address,phone,website,email
+       Braamfontein Bakery,12 Smit St,011 555 0100,,thandi@bakery.co.za'>${esc(raw)}</textarea>
+        </div>
+        <div class="form-grid">
+          <div class="field"><label>Source label</label><input name="source" value="${esc(source)}" placeholder="apify" /></div>
+        </div>
+        <div class="field checkbox-field">
+          <label><input type="checkbox" name="skip_no_email" value="1" ${skipNoEmail ? "checked" : ""} />
+          Skip rows with no email address</label>
+          <div class="hint">They can't be emailed, and they can't be reliably de-duplicated on a re-import.</div>
+        </div>
+        <div class="form-foot">
+          <a href="/leads" class="btn">Cancel</a>
+          <button type="submit" class="btn btn-primary">Preview</button>
+        </div>
+      </form>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">What it reads</div>
+      <div class="security-body">
+        <div class="security-copy">
+          Business name comes from <span class="mono">title</span>, <span class="mono">name</span> or
+          <span class="mono">companyName</span>; email from <span class="mono">email</span>,
+          <span class="mono">emails</span> or <span class="mono">contact_email</span>. Field names are matched
+          loosely, so <span class="mono">contactEmail</span> and <span class="mono">Contact Email</span> both work.
+        </div>
+        <div class="security-copy" style="margin-top:10px">
+          Phone, address, category, rating and website are kept as notes on the lead &mdash; including
+          <strong>&ldquo;No website found&rdquo;</strong>, since for these clusters the absence is the qualifying signal.
+        </div>
+      </div>
+    </div>
+  `,
+  });
+}
+
+const IMPORT_STATUS = {
+  new: ["will import", "green"],
+  duplicate: ["already in HQ", ""],
+  no_email: ["no email — skipped", ""],
+  invalid: ["no name — can't import", "red"],
+};
+
+export function leadImportPreviewPage({ user, csrf, theme, rows, counts, raw, source, skipNoEmail }) {
+  const shown = rows.slice(0, 200);
+  const body = shown
+    .map((r) => {
+      const [label, kind] = IMPORT_STATUS[r.status] || [r.status, ""];
+      return `<tr>
+      <td class="strong">${esc(r.name || "—")}${
+        r.company && r.company !== r.name ? `<br/><span class="hint">${esc(r.company)}</span>` : ""
+      }</td>
+      <td class="muted">${
+        r.contact_email
+          ? esc(r.contact_email)
+          : r.rejected_email
+            ? `<span class="hint">ignored: ${esc(r.rejected_email)}</span>`
+            : `<span class="hint">—</span>`
+      }</td>
+      <td class="detail">${r.notes ? esc(r.notes) : "—"}</td>
+      <td>${pill(label, kind, true)}</td>
+    </tr>`;
+    })
+    .join("");
+
+  return layout({
+    user,
+    active: "leads",
+    title: "Import preview",
+    theme,
+    body: `
+    <div class="page-head">
+      <div class="page-title">Import preview</div>
+      <div class="page-sub">Nothing has been saved yet. Check this reads the way you expect, then confirm.</div>
+    </div>
+
+    <div class="metrics-grid">
+      <div class="metric-card"><div class="metric-label">Will import</div><div class="metric-value">${counts.new || 0}</div></div>
+      <div class="metric-card"><div class="metric-label">Already in HQ</div><div class="metric-value">${counts.duplicate || 0}</div></div>
+      <div class="metric-card"><div class="metric-label">No email</div><div class="metric-value">${counts.no_email || 0}</div></div>
+      <div class="metric-card"><div class="metric-label">Unusable</div><div class="metric-value">${counts.invalid || 0}</div></div>
+    </div>
+
+    ${
+      counts.new
+        ? ""
+        : `<div class="msg msg-error">Nothing here would be imported. If that's a surprise, the columns may not have lined up &mdash; go back and check the paste.</div>`
+    }
+
+    <div class="panel">
+      <div class="panel-head">Parsed rows${rows.length > shown.length ? ` &mdash; showing the first ${shown.length} of ${rows.length}` : ""}</div>
+      <div class="table-wrap">
+        <table><thead><tr><th>Lead</th><th>Email</th><th>Notes</th><th>Outcome</th></tr></thead><tbody>${body}</tbody></table>
+      </div>
+    </div>
+
+    <form method="post" action="/leads/import/confirm" class="plain" style="margin-top:20px">
+      ${csrfField(csrf)}
+      <input type="hidden" name="raw" value="${esc(raw)}" />
+      <input type="hidden" name="source" value="${esc(source)}" />
+      ${skipNoEmail ? `<input type="hidden" name="skip_no_email" value="1" />` : ""}
+      <div class="form-foot">
+        <a href="/leads/import" class="btn">Back</a>
+        <button type="submit" class="btn btn-primary" ${counts.new ? "" : "disabled"}>
+          Import ${counts.new || 0} ${counts.new === 1 ? "lead" : "leads"}
+        </button>
+      </div>
+    </form>
   `,
   });
 }

@@ -23,6 +23,7 @@ import {
   callWindowHours,
 } from "../src/auth.js";
 import * as db from "../src/db.js";
+import { parseLeads, classifyLeads } from "../src/import.js";
 import { makeEnv } from "./d1.mjs";
 
 const ORIGIN = "https://kpi.catalyst7.test";
@@ -3037,6 +3038,262 @@ await test("a send to an address with no lead opens no window and still records"
   eq(res.status, 200, "still accepted");
   eq((await db.getCallQueue(env)).length, 0, "no lead, no window");
   eq((await db.getUnmatchedOutreach(env)).length, 1, "but the event is kept, not dropped");
+});
+
+
+console.log("\nLead import (pipeline step 1)");
+
+// Real Apify Google Maps output shape: business name in `title`, email in an
+// `emails` array, and the qualifying signal being the ABSENCE of `website`.
+const APIFY_JSON = JSON.stringify([
+  {
+    title: "Braamfontein Bakery",
+    categoryName: "Bakery",
+    address: "12 Smit St, Braamfontein, Johannesburg",
+    phone: "011 555 0100",
+    website: "",
+    totalScore: 4.6,
+    reviewsCount: 82,
+    emails: ["thandi@bakery.co.za"],
+  },
+  {
+    title: "Centurion Motors",
+    categoryName: "Car dealer",
+    address: "9 Main Rd, Centurion",
+    phone: "012 555 0200",
+    website: "https://centurionmotors.co.za",
+    totalScore: 3.9,
+    reviewsCount: 14,
+    emails: ["johan@motors.co.za"],
+  },
+]);
+
+await test("parses Apify JSON, keeping the qualifying signals as notes", async () => {
+  const { rows, error } = parseLeads(APIFY_JSON);
+  eq(error, null, "parses cleanly");
+  eq(rows.length, 2, "two leads");
+
+  eq(rows[0].name, "Braamfontein Bakery", "title becomes the name");
+  eq(rows[0].company, "Braamfontein Bakery", "and the company");
+  eq(rows[0].contact_email, "thandi@bakery.co.za", "email lifted out of the emails array");
+  has(rows[0].notes, "No website found", "absence of a website is stated, not left blank - it IS the wedge");
+  has(rows[0].notes, "Phone: 011 555 0100", "phone kept");
+  has(rows[0].notes, "Rating 4.6 (82 reviews)", "GBP signals kept");
+  has(rows[1].notes, "Website: https://centurionmotors.co.za", "a website that exists is recorded too");
+});
+
+await test("CSV with quoted commas does not shift columns", async () => {
+  // A naive split(",") puts the address fragment into `phone` and everything
+  // after it slides one column left, producing leads that look plausible and
+  // are wrong.
+  const csv =
+    'title,address,phone,website,email\n' +
+    'Braamfontein Bakery,"12 Smit St, Braamfontein, Johannesburg",011 555 0100,,thandi@bakery.co.za\n';
+  const { rows } = parseLeads(csv);
+  eq(rows.length, 1, "one row");
+  eq(rows[0].contact_email, "thandi@bakery.co.za", "email is still the email, not a fragment of the address");
+  has(rows[0].notes, "12 Smit St, Braamfontein, Johannesburg", "address kept whole");
+  has(rows[0].notes, "Phone: 011 555 0100", "phone is the phone");
+});
+
+await test("escaped quotes inside a CSV field survive", async () => {
+  const csv = 'title,email\n"The ""Old"" Mill",info@oldmill.co.za\n';
+  const { rows } = parseLeads(csv);
+  eq(rows[0].name, 'The "Old" Mill', "doubled quotes collapse to one");
+  eq(rows[0].contact_email, "info@oldmill.co.za", "and the next column is intact");
+});
+
+await test("field names are matched loosely", async () => {
+  const variants = [
+    { companyName: "A Co", contactEmail: "a@x.co.za" },
+    { "Business Name": "A Co", "Contact Email": "a@x.co.za" },
+    { name: "A Co", email: "a@x.co.za" },
+  ];
+  for (const v of variants) {
+    const { rows } = parseLeads(JSON.stringify([v]));
+    eq(rows[0].contact_email, "a@x.co.za", `email found in ${Object.keys(v).join("/")}`);
+    assert(rows[0].name, "and a name");
+  }
+});
+
+await test("junk in the email column is ignored rather than stored", async () => {
+  const csv = "title,email\nNo Email Co,N/A\nDash Co,-\nPhone Co,011 555 0100\nGood Co,good@co.za\n";
+  const { rows } = parseLeads(csv);
+  eq(rows[0].contact_email, null, "N/A is not an email");
+  eq(rows[0].rejected_email, "N/A", "but what was ignored is surfaced, so the preview can say why");
+  eq(rows[2].contact_email, null, "a phone number in the email column is not an email");
+  eq(rows[3].contact_email, "good@co.za", "a real one still lands");
+});
+
+await test("malformed JSON is reported, not silently treated as CSV", async () => {
+  const { rows, error } = parseLeads('[{"title":"Broken",}]');
+  eq(rows.length, 0, "nothing parsed");
+  assert(error && /parse/i.test(error), `explains itself: ${error}`);
+});
+
+await test("classify marks duplicates, including repeats inside the same paste", async () => {
+  const { rows } = parseLeads(
+    JSON.stringify([
+      { title: "Already Here", email: "dupe@x.co.za" },
+      { title: "Fresh", email: "fresh@x.co.za" },
+      { title: "Fresh Again", email: "FRESH@x.co.za" },
+    ])
+  );
+  const counts = classifyLeads(rows, { existingEmails: new Set(["dupe@x.co.za"]) });
+  eq(rows[0].status, "duplicate", "already in HQ");
+  eq(rows[1].status, "new", "genuinely new");
+  eq(rows[2].status, "duplicate", "repeat within the paste caught too - the first insert isn't visible to the second");
+  eq(counts.new, 1, "one to import");
+  eq(counts.duplicate, 2, "two duplicates");
+});
+
+await test("rows with no email are skipped by default and importable on request", async () => {
+  const json = JSON.stringify([{ title: "No Email Co", phone: "011 555 0100" }]);
+  let { rows } = parseLeads(json);
+  let counts = classifyLeads(rows, {});
+  eq(rows[0].status, "no_email", "skipped by default - it can't be emailed or de-duplicated");
+  eq(counts.new, 0, "nothing to import");
+
+  ({ rows } = parseLeads(json));
+  counts = classifyLeads(rows, { skipNoEmail: false });
+  eq(rows[0].status, "new", "importable when asked for");
+  eq(counts.new, 1, "counted");
+});
+
+await test("with no email, name+company still de-duplicates", async () => {
+  const json = JSON.stringify([{ title: "No Email Co" }, { title: "No Email Co" }]);
+  const { rows } = parseLeads(json);
+  classifyLeads(rows, { skipNoEmail: false, existingKeys: new Set() });
+  eq(rows[0].status, "new", "first one imports");
+  eq(rows[1].status, "duplicate", "the second does not");
+});
+
+await test("a row with no usable name is unusable, not imported blank", async () => {
+  const { rows } = parseLeads(JSON.stringify([{ phone: "011 555 0100", email: "x@y.co.za" }]));
+  const counts = classifyLeads(rows, {});
+  eq(rows[0].status, "invalid", "leads.name is NOT NULL - a blank lead would be a broken row");
+  eq(counts.new, 0, "not imported");
+});
+
+// ---- through the app ----
+
+await test("preview writes nothing, then confirm imports", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+
+  const preview = await worker.fetch(
+    req("/leads/import", { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf, raw: APIFY_JSON, skip_no_email: "1" } }),
+    env
+  );
+  eq(preview.status, 200, "preview renders");
+  const page = await preview.text();
+  has(page, "Braamfontein Bakery", "shows what it parsed");
+  has(page, "will import", "and what it will do with it");
+  eq((await db.getLeads(env)).length, 0, "NOTHING saved by the preview");
+
+  const confirm = await worker.fetch(
+    req("/leads/import/confirm", {
+      method: "POST",
+      cookies: { c7_session: session },
+      form: { _csrf: csrf, raw: APIFY_JSON, skip_no_email: "1" },
+    }),
+    env
+  );
+  eq(confirm.status, 302, "redirects to the list");
+
+  const leads = await db.getLeads(env);
+  eq(leads.length, 2, "both imported");
+  const bakery = leads.find((l) => l.name === "Braamfontein Bakery");
+  eq(bakery.contact_email, "thandi@bakery.co.za", "with the email that outreach matches on");
+  eq(bakery.outreach_status, "pending", "and awaiting approval, not pre-authorised");
+  eq(bakery.source, "apify", "source recorded");
+  assert((await auditActions(env)).includes("leads_imported"), "audited");
+});
+
+await test("re-importing the same export adds nothing", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const form = { _csrf: csrf, raw: APIFY_JSON, skip_no_email: "1" };
+
+  await worker.fetch(req("/leads/import/confirm", { method: "POST", cookies: { c7_session: session }, form }), env);
+  await worker.fetch(req("/leads/import/confirm", { method: "POST", cookies: { c7_session: session }, form }), env);
+  eq((await db.getLeads(env)).length, 2, "still two - a re-paste is safe");
+});
+
+await test("double-submitting confirm imports once", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const nonce = crypto.randomUUID();
+  const form = { _csrf: csrf, raw: APIFY_JSON, skip_no_email: "1", _nonce: nonce };
+
+  await Promise.all([
+    worker.fetch(req("/leads/import/confirm", { method: "POST", cookies: { c7_session: session }, form }), env),
+    worker.fetch(req("/leads/import/confirm", { method: "POST", cookies: { c7_session: session }, form }), env),
+  ]);
+  eq((await db.getLeads(env)).length, 2, "one batch, not two");
+});
+
+await test("confirm re-parses the raw text rather than trusting posted rows", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  // A tampered client posts extra fields alongside the raw text. They must have
+  // no effect: the write is derived from `raw` only.
+  const res = await worker.fetch(
+    req("/leads/import/confirm", {
+      method: "POST",
+      cookies: { c7_session: session },
+      form: {
+        _csrf: csrf,
+        raw: APIFY_JSON,
+        skip_no_email: "1",
+        name: "Injected Lead",
+        contact_email: "attacker@evil.test",
+        rows: '[{"name":"Injected","status":"new"}]',
+      },
+    }),
+    env
+  );
+  eq(res.status, 302, "accepted");
+  const leads = await db.getLeads(env);
+  eq(leads.length, 2, "only what the raw text contained");
+  assert(!leads.some((l) => l.name === "Injected Lead" || l.name === "Injected"), "nothing smuggled in");
+});
+
+await test("a bad paste re-renders the form with the text still in it", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const res = await worker.fetch(
+    req("/leads/import", { method: "POST", cookies: { c7_session: session }, form: { _csrf: csrf, raw: '[{"broken",}]' } }),
+    env
+  );
+  eq(res.status, 200, "not a dead end");
+  const page = await res.text();
+  has(page, "doesn&#39;t parse", "says what went wrong");
+  has(page, "broken", "and hands the paste back rather than making them find it again");
+  eq((await db.getLeads(env)).length, 0, "nothing written");
+});
+
+await test("import is founder-only and CSRF-guarded", async () => {
+  const env = makeEnv();
+  const { session } = await founderSession(env);
+
+  const noCsrf = await worker.fetch(
+    req("/leads/import/confirm", { method: "POST", cookies: { c7_session: session }, form: { raw: APIFY_JSON } }),
+    env
+  );
+  eq(noCsrf.status, 403, "needs a CSRF token");
+  eq((await db.getLeads(env)).length, 0, "nothing written");
+
+  const fl = await seedFreelancer(env);
+  const { session: theirs } = await login(env, fl.email, FREELANCER_PW);
+  eq((await worker.fetch(req("/leads/import", { cookies: { c7_session: theirs } }), env)).status, 404, "page is founder-only");
+  const theirCsrf = await csrfFor(env, theirs);
+  const attempt = await worker.fetch(
+    req("/leads/import/confirm", { method: "POST", cookies: { c7_session: theirs }, form: { _csrf: theirCsrf, raw: APIFY_JSON } }),
+    env
+  );
+  eq(attempt.status, 404, "and so is the import itself");
+  eq((await db.getLeads(env)).length, 0, "nothing written");
 });
 
 

@@ -70,6 +70,18 @@ export async function createLead(env, l) {
     .run();
 }
 
+// Both dedupe keys for the importer, fetched once rather than per row: an
+// 80-lead paste would otherwise be 80 round trips against D1.
+export async function getLeadDedupeKeys(env) {
+  const { results } = await env.DB.prepare(
+    "SELECT lower(contact_email) AS email, lower(name) AS name, lower(COALESCE(company,'')) AS company FROM leads"
+  ).all();
+  return {
+    emails: new Set(results.filter((r) => r.email).map((r) => r.email)),
+    keys: new Set(results.map((r) => `${r.name}|${r.company}`)),
+  };
+}
+
 export async function updateLeadStage(env, id, stage) {
   return env.DB.prepare("UPDATE leads SET stage = ?, updated_at = datetime('now') WHERE id = ?").bind(stage, id).run();
 }
