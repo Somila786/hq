@@ -2576,7 +2576,7 @@ function securityPage({
       <h3 class="sub-label">Connected apps</h3>
       ${
         mcpGrants.length
-          ? `<div class="security-copy">These applications can read Catalyst 7 HQ data as you. They cannot change anything.</div>
+          ? `<div class="security-copy">These applications act as you, within your role. They can read your data and add or qualify leads. They <strong>cannot approve outreach, send anything, or delete anything</strong>.</div>
              <div class="table-wrap"><table><thead><tr><th>Application</th><th>Connected</th><th>Last used</th><th class="right">Action</th></tr></thead><tbody>${mcpGrants
                .map(
                  (g) => `<tr>
@@ -3352,7 +3352,7 @@ function consentPage({ user, theme, csrf, clientName, scope, query }) {
     theme,
     body: `
     <div class="page-head">
-      <div class="page-title">${who} wants to read your Catalyst 7 HQ data</div>
+      <div class="page-title">${who} wants access to your Catalyst 7 HQ data</div>
       <div class="page-sub">You're signed in as ${esc(user.name)}${user.title ? ` &middot; ${esc(user.title)}` : ""} &middot; ${esc(user.email)}</div>
     </div>
 
@@ -3363,16 +3363,31 @@ function consentPage({ user, theme, csrf, clientName, scope, query }) {
         <ul style="margin:10px 0 0 18px;line-height:1.8">
           ${
             user.role === "founder"
-              ? `<li>This week's numbers — hours, revenue, pipeline, log compliance</li>
+              ? `<li>This week's numbers &mdash; hours, revenue, pipeline, log compliance</li>
                  <li>Your leads, clients, revenue entries and freelancer roster</li>`
               : `<li>Your own weekly log and history</li>`
           }
         </ul>
+        ${
+          user.role === "founder"
+            ? `<br />
+        It will also be able to <strong>write</strong>, as you:
+        <ul style="margin:10px 0 0 18px;line-height:1.8">
+          <li>Add leads to your pipeline &mdash; typically ones it has just researched</li>
+          <li>Record qualification on a lead: move its stage, set a value, add notes</li>
+        </ul>`
+            : ""
+        }
         <br />
-        It <strong>cannot</strong> change anything — no adding, editing or deleting. It cannot see passwords,
-        2FA secrets, or the audit log. Access follows your role, so it can never read more than you can.
+        It <strong>cannot approve outreach or send anything.</strong> ${
+          user.role === "founder"
+            ? "Leads it adds always arrive awaiting your approval, and approving is only ever done by you, here in HQ. "
+            : ""
+        }It cannot delete anything, and it cannot see passwords, 2FA secrets, or the audit log. Access follows
+        your role, so it can never reach more than you can.
         <br /><br />
-        You can withdraw this at any time from <strong>Security</strong> in the nav.
+        Every change it makes is recorded in the audit log as a connector action, so you can tell it apart
+        from something a person did. You can withdraw this at any time from <strong>Security</strong> in the nav.
       </div>
       <div class="row-actions" style="justify-content:flex-start;gap:10px">
         <form method="post" action="/oauth/authorize${esc(query)}">

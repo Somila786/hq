@@ -3682,6 +3682,91 @@ await test("/favicon.ico is answered rather than bounced to login", async () => 
 });
 
 
+console.log("\nConsent screen tells the truth about what it is granting");
+
+// This is the screen where permission is actually given. It drifted out of step
+// with the tools once already: the connector gained create_leads and
+// qualify_lead while this page still said "It cannot change anything — no
+// adding, editing or deleting". Telling someone they are approving read-only
+// access and then writing is not a copy problem.
+
+async function consentHtml(env, session, csrf) {
+  const reg = await worker.fetch(
+    new Request("https://hq.test/oauth/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_name: "Claude",
+        redirect_uris: ["https://claude.ai/api/mcp/auth_callback"],
+        token_endpoint_auth_method: "none",
+      }),
+    }),
+    env
+  );
+  const client = await reg.json();
+  const q =
+    `?response_type=code&client_id=${client.client_id}` +
+    `&redirect_uri=${encodeURIComponent("https://claude.ai/api/mcp/auth_callback")}` +
+    `&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&state=s&scope=mcp%3Aread`;
+  const res = await worker.fetch(req(`/oauth/authorize${q}`, { cookies: { c7_session: session } }), env);
+  return res.text();
+}
+
+await test("a founder is told about the writes, not just the reads", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const html = await consentHtml(env, session, csrf);
+
+  has(html, "Add leads to your pipeline", "says it can add leads");
+  has(html, "Record qualification", "and qualify them");
+  assert(
+    !/cannot<\/strong> change anything/.test(html) && !/no adding, editing or deleting/.test(html),
+    "must not still claim it cannot change anything"
+  );
+});
+
+await test("the one thing it cannot do is stated on the screen that grants it", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  const html = await consentHtml(env, session, csrf);
+
+  has(html, "cannot approve outreach or send anything", "the boundary is named where consent is given");
+  has(html, "awaiting your approval", "and what that means in practice");
+  has(html, "audit log as a connector action", "plus how to tell its actions from a person's");
+});
+
+await test("a freelancer is not told about writes they cannot perform", async () => {
+  const env = makeEnv();
+  const fl = await seedFreelancer(env);
+  const { session } = await login(env, fl.email, FREELANCER_PW);
+  const csrf = await csrfFor(env, session);
+  const html = await consentHtml(env, session, csrf);
+
+  has(html, "Your own weekly log", "scoped to what they can actually reach");
+  assert(!/Add leads to your pipeline/.test(html), "no mention of lead writes - create_leads is founder-only");
+});
+
+await test("the security page agrees with the consent screen", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  await connectAsClaude(env, session, csrf);
+  const html = await (await worker.fetch(req("/security", { cookies: { c7_session: session } }), env)).text();
+  assert(!/They cannot change anything/.test(html), "no stale read-only claim");
+});
+
+await test("no page still describes the connector as read-only", async () => {
+  const env = makeEnv();
+  const { session, csrf } = await founderSession(env);
+  await connectAsClaude(env, session, csrf);
+
+  for (const path of ["/mcp/about", "/security"]) {
+    const html = await (await worker.fetch(req(path, { cookies: { c7_session: session } }), env)).text();
+    assert(!/read-only/i.test(html), `${path} must not claim read-only access`);
+    assert(!/Nothing it does can change your data/i.test(html), `${path} must not claim it changes nothing`);
+  }
+});
+
+
 console.log("\nSecurity headers");
 
 await test("every response carries the security header set", async () => {
