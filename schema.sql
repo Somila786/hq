@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   email TEXT UNIQUE NOT NULL,
   name TEXT NOT NULL,
-  role TEXT NOT NULL CHECK(role IN ('founder','freelancer')),
+  role TEXT NOT NULL CHECK(role IN ('founder','coordinator','freelancer')),
   freelancer_id INTEGER REFERENCES freelancers(id),
   password_hash TEXT,
   password_salt TEXT,
@@ -41,6 +41,9 @@ CREATE TABLE IF NOT EXISTS clients (
   contact_email TEXT,
   source TEXT,
   notes TEXT,
+  -- Assigned account, same rule as leads.owner_user_id: coordinators see only
+  -- their own clients, founders see all.
+  owner_user_id INTEGER REFERENCES users(id),
   created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -53,6 +56,11 @@ CREATE TABLE IF NOT EXISTS leads (
   value_estimate REAL,
   source TEXT,
   owner TEXT,
+  -- The account this lead is assigned to (a coordinator, or a founder).
+  -- Distinct from the free-text `owner` label: this is the real user whose
+  -- scoped view the lead appears in. NULL = unassigned; founders see all leads
+  -- regardless, coordinators see only rows where this is their own id.
+  owner_user_id INTEGER REFERENCES users(id),
   notes TEXT,
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now')),
@@ -186,7 +194,7 @@ CREATE INDEX IF NOT EXISTS idx_backup_codes_user ON totp_backup_codes (user_id, 
 CREATE TABLE IF NOT EXISTS invite_codes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   code_hash TEXT NOT NULL,
-  role TEXT NOT NULL CHECK(role IN ('founder','freelancer')),
+  role TEXT NOT NULL CHECK(role IN ('founder','coordinator','freelancer')),
   freelancer_id INTEGER REFERENCES freelancers(id),
   note TEXT,
   created_by INTEGER REFERENCES users(id),

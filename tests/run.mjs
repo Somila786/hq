@@ -4157,6 +4157,272 @@ await test("the CSP script hashes match the inline handlers actually emitted", a
   }
 });
 
+// ------------------------------------------------- coordinator role (scoped) --
+console.log("\nCoordinator role — assignment-scoped, between founder and freelancer");
+
+const COORD_PW = "coordinator-good-passphrase";
+
+async function seedCoordinator(env, { email = "nikita@catalyst7.co.za", withProfile = true } = {}) {
+  let freelancerId = null;
+  if (withProfile) {
+    await env.DB.prepare(
+      "INSERT INTO freelancers (name, email, role_title, rate_type, rate_amount) VALUES ('Nikita Mohlala', ?, 'Ops Coordinator', 'hourly', 135)"
+    )
+      .bind("roster-" + email)
+      .run();
+    const f = await env.DB.prepare("SELECT * FROM freelancers WHERE email = ?").bind("roster-" + email).first();
+    freelancerId = f.id;
+  }
+  await env.DB.prepare("INSERT INTO users (email, name, role, freelancer_id) VALUES (?, 'Nikita Mohlala', 'coordinator', ?)")
+    .bind(email, freelancerId)
+    .run();
+  const u = await env.DB.prepare("SELECT * FROM users WHERE email = ?").bind(email).first();
+  await setPassword(env, u.id, COORD_PW);
+  return { userId: u.id, freelancerId, email };
+}
+
+async function coordinatorSession(env, opts) {
+  const c = await seedCoordinator(env, opts);
+  const { session } = await login(env, c.email, COORD_PW);
+  return { ...c, session, csrf: await csrfFor(env, session) };
+}
+
+async function makeLead(env, { name, ownerUserId = null, email = null, stage = "new" }) {
+  await db.createLead(env, { name, contact_email: email, stage, owner_user_id: ownerUserId });
+  return env.DB.prepare("SELECT * FROM leads WHERE name = ? ORDER BY id DESC").bind(name).first();
+}
+
+const get = (env, path, session) => worker.fetch(req(path, { cookies: { c7_session: session } }), env);
+const post = (env, path, session, csrf, form = {}) =>
+  worker.fetch(req(path, { method: "POST", cookies: { c7_session: session }, form: { ...form, _csrf: csrf } }), env);
+
+await test("a coordinator lands on their leads, not the founder dashboard", async () => {
+  const env = makeEnv();
+  const c = await coordinatorSession(env);
+  const res = await get(env, "/", c.session);
+  eq(res.status, 302, "/ redirects");
+  eq(res.headers.get("Location"), "/leads", "coordinator home is /leads");
+});
+
+await test("a coordinator sees only leads assigned to them", async () => {
+  const env = makeEnv();
+  await founderSession(env); // founder is user 1
+  const c = await coordinatorSession(env);
+  await makeLead(env, { name: "Assigned Bakery", ownerUserId: c.userId });
+  await makeLead(env, { name: "Someone Elses Deal", ownerUserId: null });
+  const body = await (await get(env, "/leads", c.session)).text();
+  has(body, "Assigned Bakery", "own lead shows");
+  lacks(body, "Someone Elses Deal", "unassigned lead is hidden");
+});
+
+await test("a coordinator cannot open a lead that isn't theirs", async () => {
+  const env = makeEnv();
+  const c = await coordinatorSession(env);
+  const other = await makeLead(env, { name: "Not Mine", ownerUserId: null });
+  const res = await get(env, `/leads/${other.id}`, c.session);
+  eq(res.status, 404, "other lead is 404");
+  has(await res.text(), "assigned to you", "with a clear reason");
+});
+
+await test("a coordinator's own lead page hides the outreach approve/send and draft controls", async () => {
+  const env = makeEnv();
+  const c = await coordinatorSession(env);
+  const mine = await makeLead(env, { name: "My Lead", ownerUserId: c.userId, email: "hi@mylead.co" });
+  await db.markOutreachSent(env, mine.id, 18); // open a call window so the call panel renders
+  const body = await (await get(env, `/leads/${mine.id}`, c.session)).text();
+  has(body, "My Lead", "lead renders");
+  lacks(body, "Approve for outreach", "no approve button");
+  lacks(body, "/outreach/send", "no send control");
+  lacks(body, `/leads/${mine.id}/draft`, "no draft form");
+  has(body, `/leads/${mine.id}/call/log`, "but the call-log form is present");
+});
+
+await test("a lead a coordinator creates is assigned to them automatically", async () => {
+  const env = makeEnv();
+  const c = await coordinatorSession(env);
+  await post(env, "/leads", c.session, c.csrf, { name: "Fresh Prospect" });
+  const row = await env.DB.prepare("SELECT owner_user_id FROM leads WHERE name = 'Fresh Prospect'").first();
+  eq(row.owner_user_id, c.userId, "owner_user_id is the coordinator");
+});
+
+await test("a coordinator cannot smuggle another owner_user_id through the create form", async () => {
+  const env = makeEnv();
+  const f = await founderSession(env);
+  const c = await coordinatorSession(env);
+  await post(env, "/leads", c.session, c.csrf, { name: "Sneaky Lead", owner_user_id: String(f.id) });
+  const row = await env.DB.prepare("SELECT owner_user_id FROM leads WHERE name = 'Sneaky Lead'").first();
+  eq(row.owner_user_id, c.userId, "forced to self regardless of the submitted field");
+});
+
+await test("a coordinator can change the stage of their own lead", async () => {
+  const env = makeEnv();
+  const c = await coordinatorSession(env);
+  const mine = await makeLead(env, { name: "Movable", ownerUserId: c.userId });
+  await post(env, `/leads/${mine.id}/stage`, c.session, c.csrf, { stage: "qualified" });
+  const row = await env.DB.prepare("SELECT stage FROM leads WHERE id = ?").bind(mine.id).first();
+  eq(row.stage, "qualified", "stage moved");
+});
+
+await test("a coordinator cannot change the stage of a lead that isn't theirs", async () => {
+  const env = makeEnv();
+  const c = await coordinatorSession(env);
+  const other = await makeLead(env, { name: "Off Limits", ownerUserId: null, stage: "new" });
+  const res = await post(env, `/leads/${other.id}/stage`, c.session, c.csrf, { stage: "won" });
+  eq(res.status, 404, "blocked");
+  const row = await env.DB.prepare("SELECT stage FROM leads WHERE id = ?").bind(other.id).first();
+  eq(row.stage, "new", "and the stage did not change");
+});
+
+await test("a coordinator is blocked from every founder-only page", async () => {
+  const env = makeEnv();
+  const c = await coordinatorSession(env);
+  for (const p of ["/dashboard", "/revenue", "/outreach", "/team", "/freelancers", "/audit", "/retention", "/errors", "/leads/import"]) {
+    const res = await get(env, p, c.session);
+    eq(res.status, 404, `${p} is not reachable`);
+  }
+});
+
+await test("a coordinator cannot approve or send outreach by posting directly", async () => {
+  const env = makeEnv();
+  const c = await coordinatorSession(env);
+  const mine = await makeLead(env, { name: "Tempting", ownerUserId: c.userId, email: "x@tempting.co" });
+  const res = await post(env, `/leads/${mine.id}/outreach/approve`, c.session, c.csrf, {});
+  eq(res.status, 404, "no approve route exists for a coordinator");
+  const row = await env.DB.prepare("SELECT COALESCE(outreach_status,'pending') s FROM leads WHERE id = ?").bind(mine.id).first();
+  eq(row.s, "pending", "and nothing was approved");
+});
+
+await test("a coordinator cannot assign leads to themselves", async () => {
+  const env = makeEnv();
+  const c = await coordinatorSession(env);
+  const other = await makeLead(env, { name: "Grab This", ownerUserId: null });
+  const res = await post(env, `/leads/${other.id}/assign`, c.session, c.csrf, { owner_user_id: String(c.userId) });
+  eq(res.status, 404, "assign is founder-only");
+  const row = await env.DB.prepare("SELECT owner_user_id FROM leads WHERE id = ?").bind(other.id).first();
+  eq(row.owner_user_id, null, "still unassigned");
+});
+
+await test("clients are scoped to the coordinator too", async () => {
+  const env = makeEnv();
+  const c = await coordinatorSession(env);
+  await db.createClient(env, { name: "My Client", owner_user_id: c.userId });
+  await db.createClient(env, { name: "Their Client", owner_user_id: null });
+  const body = await (await get(env, "/clients", c.session)).text();
+  has(body, "My Client", "own client shows");
+  lacks(body, "Their Client", "others hidden");
+  await post(env, "/clients", c.session, c.csrf, { name: "Made By Me" });
+  const row = await env.DB.prepare("SELECT owner_user_id FROM clients WHERE name = 'Made By Me'").first();
+  eq(row.owner_user_id, c.userId, "a client they create is theirs");
+});
+
+await test("the call queue only shows the coordinator's own leads", async () => {
+  const env = makeEnv();
+  const c = await coordinatorSession(env);
+  const mine = await makeLead(env, { name: "Call Me", ownerUserId: c.userId, email: "c@callme.co" });
+  const other = await makeLead(env, { name: "Not Me", ownerUserId: null, email: "n@notme.co" });
+  // open a window on both
+  await db.markOutreachSent(env, mine.id, 18);
+  await db.markOutreachSent(env, other.id, 18);
+  const body = await (await get(env, "/calls", c.session)).text();
+  has(body, "Call Me", "own lead in queue");
+  lacks(body, "Not Me", "other lead not in queue");
+});
+
+await test("a coordinator can log a call on their own lead but not on another's", async () => {
+  const env = makeEnv();
+  const c = await coordinatorSession(env);
+  const mine = await makeLead(env, { name: "Ring Ring", ownerUserId: c.userId, email: "r@ring.co" });
+  const other = await makeLead(env, { name: "Hands Off", ownerUserId: null, email: "h@off.co" });
+  await db.markOutreachSent(env, mine.id, 18);
+  await db.markOutreachSent(env, other.id, 18);
+  await post(env, `/leads/${mine.id}/call/log`, c.session, c.csrf, { outcome: "picked_up_cold", back: "calls" });
+  eq((await env.DB.prepare("SELECT call_outcome FROM leads WHERE id = ?").bind(mine.id).first()).call_outcome, "picked_up_cold", "own call logged");
+  const res = await post(env, `/leads/${other.id}/call/log`, c.session, c.csrf, { outcome: "picked_up_cold", back: "calls" });
+  eq(res.status, 404, "other lead's call is blocked");
+  eq((await env.DB.prepare("SELECT call_outcome FROM leads WHERE id = ?").bind(other.id).first()).call_outcome, null, "and not logged");
+});
+
+await test("a founder assigns a lead to a coordinator, which moves it into their scope", async () => {
+  const env = makeEnv();
+  const f = await founderSession(env);
+  const c = await coordinatorSession(env);
+  const lead = await makeLead(env, { name: "To Hand Over", ownerUserId: null });
+  lacks(await (await get(env, "/leads", c.session)).text(), "To Hand Over", "not visible before assignment");
+  await post(env, `/leads/${lead.id}/assign`, f.session, f.csrf, { owner_user_id: String(c.userId) });
+  has(await (await get(env, "/leads", c.session)).text(), "To Hand Over", "visible after assignment");
+  // unassign
+  await post(env, `/leads/${lead.id}/assign`, f.session, f.csrf, { owner_user_id: "" });
+  lacks(await (await get(env, "/leads", c.session)).text(), "To Hand Over", "hidden again after unassign");
+});
+
+await test("the founder lead page offers the coordinator as an assignment target", async () => {
+  const env = makeEnv();
+  const f = await founderSession(env);
+  const c = await coordinatorSession(env);
+  const lead = await makeLead(env, { name: "Assignable", ownerUserId: null });
+  const body = await (await get(env, `/leads/${lead.id}`, f.session)).text();
+  has(body, "Assigned to", "assign panel present for founder");
+  has(body, "Nikita Mohlala", "coordinator listed as a target");
+});
+
+await test("a founder can create a coordinator account and issue a coordinator invite code", async () => {
+  const env = makeEnv();
+  const f = await founderSession(env);
+  const create = await post(env, "/team", f.session, f.csrf, {
+    name: "Nikita",
+    email: "nikita2@catalyst7.co.za",
+    role: "coordinator",
+  });
+  eq(create.status, 200, "account created");
+  eq((await env.DB.prepare("SELECT role FROM users WHERE email = 'nikita2@catalyst7.co.za'").first()).role, "coordinator", "role is coordinator");
+  const code = await post(env, "/team/codes", f.session, f.csrf, { role: "coordinator", expires_days: "7" });
+  has(await code.text(), "creates a coordinator account", "coordinator invite code issued");
+});
+
+await test("registering with a coordinator invite code creates a coordinator", async () => {
+  const env = makeEnv();
+  const f = await founderSession(env);
+  // issue a code, then read its plaintext from the success page
+  const codeRes = await post(env, "/team/codes", f.session, f.csrf, { role: "coordinator", expires_days: "7" });
+  const m = (await codeRes.text()).match(/class="code-big">([^<]+)</);
+  assert(m, "the plaintext code is shown once");
+  const pw = "a-strong-passphrase-x";
+  const reg = await worker.fetch(
+    req("/register", { method: "POST", form: { code: m[1].trim(), name: "New Coord", email: "newcoord@catalyst7.co.za", password: pw, confirm: pw } }),
+    env
+  );
+  assert(reg.status === 302, "registration succeeds");
+  eq((await env.DB.prepare("SELECT role FROM users WHERE email = 'newcoord@catalyst7.co.za'").first()).role, "coordinator", "the code decided the role");
+});
+
+await test("a coordinator linked to a freelancer profile can use the weekly log", async () => {
+  const env = makeEnv();
+  const c = await coordinatorSession(env, { withProfile: true });
+  const res = await get(env, "/log", c.session);
+  eq(res.status, 200, "log page loads");
+  await post(env, "/log", c.session, c.csrf, { hours: "12", status: "on_track", deliverables: "prospect list" });
+  eq(Number((await env.DB.prepare("SELECT hours FROM weekly_entries WHERE freelancer_id = ?").bind(c.freelancerId).first()).hours), 12, "hours logged");
+});
+
+await test("a coordinator with no freelancer profile gets a clear message on the log page", async () => {
+  const env = makeEnv();
+  const c = await coordinatorSession(env, { email: "noprofile@catalyst7.co.za", withProfile: false });
+  const res = await get(env, "/log", c.session);
+  eq(res.status, 400, "not a hard error, a handled one");
+  has(await res.text(), "linked to a freelancer profile", "explains why");
+});
+
+await test("a coordinator's MCP token is refused business tools, named by their role", async () => {
+  const env = makeEnv();
+  await db.createLead(env, { name: "Board Secret", owner_user_id: null });
+  const c = await coordinatorSession(env);
+  const grant = await connectAsClaude(env, c.session, c.csrf);
+  const r = await rpc(env, grant.access_token, "tools/call", { name: "list_leads", arguments: {} });
+  has(r.body.result.content[0].text, "only available to founders", "blocked like any non-founder");
+  has(r.body.result.content[0].text, "(coordinator)", "and the message names the real role");
+  lacks(r.body.result.content[0].text, "Board Secret", "no pipeline leaks");
+});
+
 // ------------------------------------------------------------------ report --
 
 const total = passed + failures.length;

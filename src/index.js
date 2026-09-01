@@ -437,7 +437,7 @@ async function runMcpTool(name, args, { env, user, ip = null }) {
   if (FOUNDER_ONLY.has(name) && user.role !== "founder") {
     // Same rule as the web UI, enforced server-side rather than by hiding the
     // tool: a freelancer's token cannot read business data.
-    return `That information is only available to founders. You're signed in as ${user.name} (freelancer).`;
+    return `That information is only available to founders. You're signed in as ${user.name} (${user.role}).`;
   }
 
   if (name === "create_leads") {
@@ -1454,7 +1454,8 @@ async function handleRequest(request, env) {
       const csrf = user.session_csrf;
 
       if (path === "/") {
-        return redirect(user.role === "founder" ? "/dashboard" : "/log");
+        const home = user.role === "founder" ? "/dashboard" : user.role === "coordinator" ? "/leads" : "/log";
+        return redirect(home);
       }
 
       // ================= SECURITY / 2FA SELF-SERVICE (any role) =================
@@ -1645,6 +1646,193 @@ async function handleRequest(request, env) {
         return html(views.restrictedPage({ user, theme }), 404);
       }
 
+      // ================= COORDINATOR ROUTES =================
+      // A coordinator sees only what is assigned to them. Every list is scoped
+      // by owner_user_id, and every by-id action re-checks ownership before it
+      // acts -- a hidden menu item is never the boundary, the server is.
+      if (user.role === "coordinator") {
+        // Returns the lead only if it is assigned to this coordinator; null
+        // otherwise, so an unowned or non-existent id is indistinguishable.
+        const ownsLead = async (id) => {
+          const lead = await db.getLeadById(env, id);
+          if (!lead || String(lead.owner_user_id) !== String(user.id)) return null;
+          return lead;
+        };
+        const notYours = () => html(views.errorPage("That lead isn't assigned to you.", 404, theme), 404);
+
+        // ---- Weekly log (a coordinator who also logs hours has a profile) ----
+        if (path === "/log" || path === "/log/history") {
+          if (!user.freelancer_id) {
+            return html(
+              views.errorPage("Your account isn't linked to a freelancer profile, so there's no weekly log yet. Ask a founder to link one.", 400, theme),
+              400
+            );
+          }
+          const freelancer = await db.getFreelancerById(env, user.freelancer_id);
+          if (!freelancer) {
+            return html(views.errorPage("Your linked freelancer profile no longer exists. Ask a founder to fix this.", 400, theme), 400);
+          }
+          if (path === "/log" && method === "GET") {
+            const weekStart = isoWeekStart();
+            const entry = await db.getWeeklyEntry(env, weekStart, freelancer.id);
+            return html(views.logPage({ user, weekStart, entry, freelancer, csrf, theme }));
+          }
+          if (path === "/log" && method === "POST") {
+            const f = await readForm(request);
+            const fail = csrfGuard(user, f, theme);
+            if (fail) return fail;
+            const weekStart = isoWeekStart();
+            await db.upsertWeeklyEntry(env, {
+              week_start: weekStart,
+              freelancer_id: freelancer.id,
+              hours: parseFloat(f.hours || "0"),
+              deliverables: f.deliverables,
+              status: f.status,
+              notes: f.notes,
+            });
+            await db.logAudit(env, user, "weekly_log_submitted", "freelancer", freelancer.id, `${f.hours}h, week ${weekStart}`, reqIp);
+            return redirect("/log");
+          }
+          if (path === "/log/history" && method === "GET") {
+            const rows = await db.getFreelancerHistory(env, freelancer.id);
+            return html(views.historyPage({ user, rows, theme }));
+          }
+        }
+
+        // ---- My leads (scoped) ----
+        if (path === "/leads" && method === "GET") {
+          const [leads, outreach] = await Promise.all([db.getLeadsForOwner(env, user.id), db.getOutreachSummary(env)]);
+          return html(views.leadsPage({ user, leads, csrf, theme, outreach }));
+        }
+        const coordLeadDetail = path.match(/^\/leads\/(\d+)$/);
+        if (coordLeadDetail && method === "GET") {
+          const lead = await ownsLead(coordLeadDetail[1]);
+          if (!lead) return notYours();
+          return html(
+            views.leadDetailPage({
+              user,
+              lead,
+              events: await db.getOutreachForLead(env, lead.id),
+              theme,
+              csrf,
+              webhookReady: makeWebhookConfigured(env),
+              sendingReady: outreachSendingConfigured(env),
+              greetingNow: greetingFor(new Date()),
+              styleWarnings: [],
+            })
+          );
+        }
+        if (path === "/leads" && method === "POST") {
+          const l = await readForm(request);
+          const fail = csrfGuard(user, l, theme);
+          if (fail) return fail;
+          if (!(await claimOnce(env, l))) return redirect("/leads");
+          // owner_user_id is forced to self -- a coordinator can only ever
+          // create leads into their own scope, never assign to someone else.
+          await db.createLead(env, {
+            ...l,
+            value_estimate: l.value_estimate ? parseFloat(l.value_estimate) : null,
+            owner_user_id: user.id,
+          });
+          await db.logAudit(env, user, "lead_created", "lead", null, l.name, reqIp);
+          return redirect("/leads");
+        }
+        const coordStage = path.match(/^\/leads\/(\d+)\/stage$/);
+        if (coordStage && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          const lead = await ownsLead(coordStage[1]);
+          if (!lead) return notYours();
+          if (!views.STAGES.includes(f.stage)) return html(views.errorPage("Not a valid stage.", 400, theme), 400);
+          await db.updateLeadStage(env, lead.id, f.stage);
+          await db.logAudit(env, user, "lead_stage_changed", "lead", lead.id, f.stage, reqIp);
+          return redirect("/leads");
+        }
+
+        // ---- My clients (scoped) ----
+        if (path === "/clients" && method === "GET") {
+          const clients = await db.getClientsForOwner(env, user.id);
+          return html(views.clientsPage({ user, clients, csrf, theme }));
+        }
+        if (path === "/clients" && method === "POST") {
+          const c = await readForm(request);
+          const fail = csrfGuard(user, c, theme);
+          if (fail) return fail;
+          if (!(await claimOnce(env, c))) return redirect("/clients");
+          await db.createClient(env, { ...c, owner_user_id: user.id });
+          await db.logAudit(env, user, "client_created", "client", null, c.name, reqIp);
+          return redirect("/clients");
+        }
+        const coordClientToggle = path.match(/^\/clients\/(\d+)\/toggle$/);
+        if (coordClientToggle && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          // Only among this coordinator's own clients.
+          const clients = await db.getClientsForOwner(env, user.id);
+          const client = clients.find((c) => String(c.id) === coordClientToggle[1]);
+          if (client) {
+            const newStatus = client.status === "active" ? "past" : "active";
+            await db.setClientStatus(env, client.id, newStatus);
+            await db.logAudit(env, user, "client_status_changed", "client", client.id, newStatus, reqIp);
+          }
+          return redirect("/clients");
+        }
+
+        // ---- Calls (scoped to my leads) ----
+        if (path === "/calls" && method === "GET") {
+          return html(
+            views.callQueuePage({
+              user,
+              csrf,
+              theme,
+              queue: await db.getCallQueueForOwner(env, user.id),
+              counts: await db.countCallQueueForOwner(env, user.id),
+              stats: await db.getCallOutcomeStatsForOwner(env, user.id),
+              windowHours: callWindowHours(env),
+            })
+          );
+        }
+        const coordCallLog = path.match(/^\/leads\/(\d+)\/call\/log$/);
+        if (coordCallLog && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          if (!(await claimOnce(env, f))) return redirect(f.back === "calls" ? "/calls" : `/leads/${coordCallLog[1]}`);
+          const lead = await ownsLead(coordCallLog[1]);
+          if (!lead) return notYours();
+          if (!db.CALL_OUTCOMES.includes(f.outcome)) {
+            return html(views.errorPage("Pick one of the listed call outcomes.", 400, theme), 400);
+          }
+          if (!lead.call_due_at) {
+            return html(views.errorPage("No outreach has been sent to that lead yet, so there is no call window to close.", 400, theme), 400);
+          }
+          await db.logCallOutcome(env, {
+            leadId: lead.id,
+            leadEmail: lead.contact_email,
+            outcome: f.outcome,
+            notes: f.notes,
+            actor: user.name,
+          });
+          await db.logAudit(env, user, "call_logged", "lead", lead.id, `${lead.name}: ${f.outcome}`, reqIp);
+          return redirect(f.back === "calls" ? "/calls" : `/leads/${lead.id}`);
+        }
+        const coordCallReopen = path.match(/^\/leads\/(\d+)\/call\/reopen$/);
+        if (coordCallReopen && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          const lead = await ownsLead(coordCallReopen[1]);
+          if (!lead) return notYours();
+          await db.reopenCallWindow(env, lead.id);
+          await db.logAudit(env, user, "call_reopened", "lead", lead.id, `${lead.name}`, reqIp);
+          return redirect(`/leads/${lead.id}`);
+        }
+
+        return html(views.restrictedPage({ user, theme }), 404);
+      }
+
       // ================= FOUNDER ROUTES =================
       if (user.role === "founder") {
         if (path === "/dashboard" && method === "GET") {
@@ -1769,8 +1957,30 @@ async function handleRequest(request, env) {
               sendingReady: outreachSendingConfigured(env),
               greetingNow: greetingFor(new Date()),
               styleWarnings: copyStyleWarnings(lead.email_subject, lead.email_body),
+              coordinators: await db.listCoordinators(env),
             })
           );
+        }
+        // ---- Assign a lead to a coordinator (or unassign) ----
+        // This is what puts a lead into a coordinator's scoped view. Only a
+        // founder can do it, and only to a coordinator account.
+        const leadAssign = path.match(/^\/leads\/(\d+)\/assign$/);
+        if (leadAssign && method === "POST") {
+          const f = await readForm(request);
+          const fail = csrfGuard(user, f, theme);
+          if (fail) return fail;
+          const lead = await db.getLeadById(env, leadAssign[1]);
+          if (!lead) return html(views.errorPage("That lead no longer exists.", 404, theme), 404);
+          let ownerId = null;
+          if (f.owner_user_id) {
+            const coordinators = await db.listCoordinators(env);
+            const chosen = coordinators.find((c) => String(c.id) === String(f.owner_user_id));
+            if (!chosen) return html(views.errorPage("Assign a lead to a coordinator, or leave it unassigned.", 400, theme), 400);
+            ownerId = chosen.id;
+          }
+          await db.assignLeadOwner(env, lead.id, ownerId);
+          await db.logAudit(env, user, ownerId ? "lead_assigned" : "lead_unassigned", "lead", lead.id, `${lead.name}`, reqIp);
+          return redirect(`/leads/${lead.id}`);
         }
         if (path === "/leads" && method === "POST") {
           const l = await readForm(request);
@@ -2108,7 +2318,7 @@ async function handleRequest(request, env) {
 
           const name = (f.name || "").trim();
           const email = (f.email || "").trim().toLowerCase();
-          const role = f.role === "founder" ? "founder" : f.role === "freelancer" ? "freelancer" : null;
+          const role = ["founder", "coordinator", "freelancer"].includes(f.role) ? f.role : null;
 
           if (!name || !email || !role) {
             return html(await teamPage({ error: "Name, email and role are all required." }), 400);
@@ -2118,15 +2328,19 @@ async function handleRequest(request, env) {
           }
 
           // A freelancer login without a freelancer profile can sign in but
-          // lands on an error page, so require the link up front.
+          // lands on an error page, so require the link up front. For a
+          // coordinator the profile is optional -- only needed if they log hours.
           let freelancerId = null;
-          if (role === "freelancer") {
+          if (role === "freelancer" || (role === "coordinator" && f.freelancer_id)) {
             const available = await db.getFreelancersWithoutUser(env);
             const chosen = available.find((x) => String(x.id) === String(f.freelancer_id));
             if (!chosen) {
               return html(
                 await teamPage({
-                  error: "Pick which freelancer profile this login belongs to. Add the profile on the Freelancers page first if it isn't listed.",
+                  error:
+                    role === "freelancer"
+                      ? "Pick which freelancer profile this login belongs to. Add the profile on the Freelancers page first if it isn't listed."
+                      : "That freelancer profile isn't available to link. Add it on the Freelancers page, or leave the profile blank for a coordinator.",
                 }),
                 400
               );
@@ -2201,16 +2415,21 @@ async function handleRequest(request, env) {
           const fail = csrfGuard(user, f, theme);
           if (fail) return fail;
 
-          const role = f.role === "founder" ? "founder" : f.role === "freelancer" ? "freelancer" : null;
+          const role = ["founder", "coordinator", "freelancer"].includes(f.role) ? f.role : null;
           if (!role) return html(await teamPage({ error: "Pick a role for the code." }), 400);
 
           let freelancerId = null;
-          if (role === "freelancer") {
+          if (role === "freelancer" || (role === "coordinator" && f.freelancer_id)) {
             const available = await db.getFreelancersWithoutUser(env);
             const chosen = available.find((x) => String(x.id) === String(f.freelancer_id));
             if (!chosen) {
               return html(
-                await teamPage({ error: "A freelancer code has to name which freelancer profile it's for." }),
+                await teamPage({
+                  error:
+                    role === "freelancer"
+                      ? "A freelancer code has to name which freelancer profile it's for."
+                      : "That freelancer profile isn't available to link. Leave it blank for a coordinator, or add the profile first.",
+                }),
                 400
               );
             }

@@ -95,6 +95,17 @@ const FREELANCER_NAV = [
   ["history", "/log/history", "History"],
   ["security", "/security", "Security"],
 ];
+// A coordinator sees the slice of the pipeline assigned to them, plus their own
+// weekly log. No dashboard money, no outreach send, no team — see the role gates
+// in index.js, which are the real boundary; this only decides the menu.
+const COORDINATOR_NAV = [
+  ["leads", "/leads", "My Leads"],
+  ["clients", "/clients", "My Clients"],
+  ["calls", "/calls", "Calls"],
+  ["log", "/log", "This Week"],
+  ["history", "/log/history", "History"],
+  ["security", "/security", "Security"],
+];
 
 // The one piece of client script on the site, and it is a pure speed
 // optimisation: it makes the light/dark switch instant instead of a page
@@ -138,7 +149,13 @@ export const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0
 function layout({ title, user, active, body, theme = "dark" }) {
   const safeTheme = theme === "light" ? "light" : "dark";
   const themeLabel = safeTheme === "dark" ? "Dark" : "Light";
-  const navList = user ? (user.role === "founder" ? FOUNDER_NAV : FREELANCER_NAV) : [];
+  const navList = user
+    ? user.role === "founder"
+      ? FOUNDER_NAV
+      : user.role === "coordinator"
+        ? COORDINATOR_NAV
+        : FREELANCER_NAV
+    : [];
 
   const desktopLinks = navList
     .map(([key, href, label]) => `<a href="${href}" class="navlink${active === key ? " on" : ""}">${esc(label)}</a>`)
@@ -286,6 +303,7 @@ td.nowrap{white-space:nowrap}
 .pill{display:inline-block;padding:4px 10px;border-radius:var(--radius-pill);font-size:12px;font-weight:600;border:1px solid var(--border);background:var(--panel-2);color:var(--text-muted);text-transform:capitalize}
 .pill-green{border-color:var(--green-text);background:var(--green-tint-bg);color:var(--green-text)}
 .pill-red{border-color:var(--red-text);background:var(--red-tint-bg);color:var(--red-text)}
+.pill-amber{border-color:#B7791F;background:rgba(183,121,31,.14);color:#B7791F}
 /* Pills capitalize by default, which suits one-word statuses like "sent" but
    mangles a phrase into "Overdue By 30 Hours". */
 .pill-plain{text-transform:none}
@@ -902,7 +920,7 @@ export function leadsPage({ user, leads, csrf, theme, outreach = {} }) {
         <div class="page-sub">${leads.length} ${leads.length === 1 ? "lead" : "leads"}</div>
       </div>
       <div class="row-actions">
-        <a href="/leads/import" class="btn">Import</a>
+        ${user.role === "founder" ? `<a href="/leads/import" class="btn">Import</a>` : ""}
         <label for="add-toggle" class="btn btn-primary"><span class="toggle-open">Add lead</span><span class="toggle-close">Close</span></label>
       </div>
     </div>
@@ -1058,6 +1076,36 @@ export function outreachQueuePage({ user, csrf, theme, queue, counts, recent, un
   });
 }
 
+// ---------- Founder: assign a lead to a coordinator ----------
+// This is the mechanism behind the framework's "leads assigned specifically to
+// him". Setting owner_user_id is what puts a lead into a coordinator's scoped
+// view; clearing it returns the lead to founders-only.
+function assignPanel(lead, csrf, coordinators) {
+  const current = lead.owner_user_id || "";
+  const opts =
+    `<option value="">Unassigned (founders only)</option>` +
+    coordinators
+      .map((c) => `<option value="${c.id}" ${String(c.id) === String(current) ? "selected" : ""}>${esc(c.name)}</option>`)
+      .join("");
+  return `<div class="panel">
+    <div class="panel-head">Assigned to</div>
+    <div class="security-body">
+      ${
+        coordinators.length
+          ? `<form method="post" action="/leads/${lead.id}/assign" class="plain">
+              ${csrfField(csrf)}
+              <div class="row-actions" style="justify-content:flex-start;gap:10px">
+                <select name="owner_user_id" class="stage-select">${opts}</select>
+                <button type="submit" class="btn btn-sm">Save</button>
+              </div>
+              <div class="hint" style="margin-top:8px">A coordinator sees only the leads and clients assigned to them.</div>
+            </form>`
+          : `<div class="security-copy">No coordinators yet. Add one on the Team page to assign leads.</div>`
+      }
+    </div>
+  </div>`;
+}
+
 // ---------- Founder: single lead + outreach timeline ----------
 // Step 1 of the CRM work: HQ shows what Make actually did, per lead.
 // The draft the founder reads before approving. This is what makes the
@@ -1157,7 +1205,10 @@ function callPanel(lead, csrf) {
   </div>`;
 }
 
-export function leadDetailPage({ user, lead, events, theme, webhookReady, csrf, sendingReady = false, greetingNow = "Good day", styleWarnings = [] }) {
+export function leadDetailPage({ user, lead, events, theme, webhookReady, csrf, sendingReady = false, greetingNow = "Good day", styleWarnings = [], coordinators = [] }) {
+  // Drafting and the approve/send gate are founder-only. A coordinator manages
+  // the deal (stage, notes, the follow-up call) but never authorises an email.
+  const isFounder = user.role === "founder";
   const kindPill = (k) =>
     k === "reply"
       ? pill("reply", "green")
@@ -1217,6 +1268,9 @@ export function leadDetailPage({ user, lead, events, theme, webhookReady, csrf, 
       }</div></div>
     </div>
 
+    ${
+      isFounder
+        ? `${assignPanel(lead, csrf, coordinators)}
     ${draftPanel(lead, csrf, greetingNow, styleWarnings)}
 
     <div class="panel">
@@ -1261,7 +1315,15 @@ export function leadDetailPage({ user, lead, events, theme, webhookReady, csrf, 
             : ""
         }
       </div>
-    </div>
+    </div>`
+        : `<div class="panel"><div class="panel-head">Outreach</div><div class="security-body"><div class="security-copy">${
+            lead.outreach_status === "approved"
+              ? "Approved for outreach by a founder."
+              : lead.outreach_status === "rejected"
+                ? "A founder has held this one back from outreach."
+                : "Not yet cleared for outreach. A founder approves and sends; you carry the deal and the follow-up call."
+          }</div></div></div>`
+    }
 
     ${callPanel(lead, csrf)}
 
@@ -1541,7 +1603,13 @@ export function teamPage({
         </form>
       </td>
       <td class="muted">${esc(u.email)}</td>
-      <td>${u.role === "founder" ? pill("founder", "green") : pill("freelancer")}</td>
+      <td>${
+        u.role === "founder"
+          ? pill("founder", "green")
+          : u.role === "coordinator"
+            ? pill("coordinator", "amber")
+            : pill("freelancer")
+      }</td>
       <td>${statusPill(u)}</td>
       <td class="muted nowrap">${u.totp_enabled ? "2FA on" : "&mdash;"}${u.google_linked ? " &middot; Google" : ""}</td>
       <td class="right">
@@ -1600,17 +1668,18 @@ export function teamPage({
           <div class="field"><label>Role &mdash; what they can access</label>
             <select name="role">
               <option value="founder">Founder &mdash; full access</option>
+              <option value="coordinator">Coordinator &mdash; only their assigned leads and clients</option>
               <option value="freelancer">Freelancer &mdash; own weekly log only</option>
             </select>
           </div>
-          <div class="field"><label>Freelancer profile (freelancers only)</label>
+          <div class="field"><label>Freelancer profile (freelancers, or coordinators who log hours)</label>
             <select name="freelancer_id">
               <option value="">&mdash;</option>
               ${freelancerOptions}
             </select>
             <span class="hint">${
               unlinkedFreelancers.length
-                ? "Required if the role is Freelancer, so their weekly log points at the right person."
+                ? "Required for a Freelancer, so their weekly log points at the right person. Optional for a Coordinator who also logs hours."
                 : "No unlinked freelancer profiles. Add one on the Freelancers page first."
             }</span>
           </div>
@@ -1653,10 +1722,11 @@ export function teamPage({
             <div class="field"><label>Role this code creates</label>
               <select name="role">
                 <option value="founder">Founder &mdash; full access</option>
+                <option value="coordinator">Coordinator &mdash; only their assigned leads and clients</option>
                 <option value="freelancer">Freelancer &mdash; own weekly log only</option>
               </select>
             </div>
-            <div class="field"><label>Freelancer profile (freelancer codes only)</label>
+            <div class="field"><label>Freelancer profile (freelancer codes; optional for coordinators)</label>
               <select name="freelancer_id">
                 <option value="">&mdash;</option>
                 ${unlinkedFreelancers.map((f) => `<option value="${f.id}">${esc(f.name)}</option>`).join("")}
@@ -1710,6 +1780,7 @@ export function teamPage({
     <div class="panel"><div class="security-body">
       <div class="security-copy" style="max-width:640px">
         <strong>Founder</strong> sees everything &mdash; dashboard, revenue, clients, leads, the audit log, and this page.<br/><br/>
+        <strong>Coordinator</strong> sees only the leads and clients <em>assigned to them</em>, their call queue, and their own weekly log. No revenue, no outreach approval or sending, no team management, and never another person's pipeline. Assign leads to a coordinator on each lead's page.<br/><br/>
         <strong>Freelancer</strong> only ever sees their own weekly log and history. They cannot reach any founder page, and cannot see another freelancer's hours.<br/><br/>
         Nobody can change their own role, and roles are checked on the server for every request &mdash; not just hidden in the menu.
       </div>
@@ -1991,7 +2062,9 @@ export function callQueuePage({ user, csrf, theme, queue, counts, stats, windowH
       }. Because every lead is called regardless of response, these three buckets are directly comparable across a batch.
     </div>
 
-    <p style="margin-top:24px"><a href="/outreach" class="btn btn-sm">Back to outreach</a></p>
+    <p style="margin-top:24px"><a href="${user.role === "founder" ? "/outreach" : "/leads"}" class="btn btn-sm">${
+      user.role === "founder" ? "Back to outreach" : "Back to my leads"
+    }</a></p>
   `,
   });
 }

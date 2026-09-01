@@ -136,6 +136,21 @@ await db.logCallOutcome(env, {
   actor: "Thembalethu",
 });
 
+// A coordinator (Nikita), linked to a freelancer roster profile so he can also
+// log hours, with two leads assigned to him -- so his scoped /leads, /calls and
+// lead pages have something to show. Sign in at /login to see his view:
+//   nikita@catalyst7.test / preview-only-password
+await db.createFreelancer(env, { name: "Nikita Mohlala", email: "nikita-roster@example.com", role_title: "Ops Coordinator", rate_type: "hourly", rate_amount: 135 });
+const nikitaProfile = (await db.getFreelancers(env)).find((f) => f.name === "Nikita Mohlala");
+await env.DB.prepare("INSERT INTO users (email, name, role, title, freelancer_id) VALUES ('nikita@catalyst7.test', 'Nikita Mohlala', 'coordinator', 'Company Operations Coordinator', ?)")
+  .bind(nikitaProfile.id)
+  .run();
+const nikita = await env.DB.prepare("SELECT * FROM users WHERE email = 'nikita@catalyst7.test'").first();
+await setPassword(env, nikita.id, "preview-only-password");
+for (const n of ["Thandi Mokoena", "Fatima Patel"]) {
+  await db.assignLeadOwner(env, byName(n).id, nikita.id);
+}
+
 const monday = new Date();
 monday.setUTCDate(monday.getUTCDate() - ((monday.getUTCDay() || 7) - 1));
 const weekStart = monday.toISOString().slice(0, 10);

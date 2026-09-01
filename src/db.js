@@ -31,10 +31,28 @@ export async function getClients(env) {
 
 export async function createClient(env, c) {
   return env.DB.prepare(
-    `INSERT INTO clients (name, status, contact_name, contact_email, source, notes) VALUES (?, ?, ?, ?, ?, ?)`
+    `INSERT INTO clients (name, status, contact_name, contact_email, source, notes, owner_user_id) VALUES (?, ?, ?, ?, ?, ?, ?)`
   )
-    .bind(c.name, c.status || "active", c.contact_name || null, c.contact_email || null, c.source || null, c.notes || null)
+    .bind(
+      c.name,
+      c.status || "active",
+      c.contact_name || null,
+      c.contact_email || null,
+      c.source || null,
+      c.notes || null,
+      c.owner_user_id || null
+    )
     .run();
+}
+
+// The clients a coordinator sees: only the ones assigned to them.
+export async function getClientsForOwner(env, userId) {
+  const { results } = await env.DB.prepare(
+    "SELECT * FROM clients WHERE owner_user_id = ? ORDER BY status ASC, name ASC"
+  )
+    .bind(userId)
+    .all();
+  return results;
 }
 
 export async function setClientStatus(env, id, status) {
@@ -43,7 +61,7 @@ export async function setClientStatus(env, id, status) {
 
 export async function getLeads(env) {
   const { results } = await env.DB.prepare(
-    `SELECT id, name, company, contact_email, stage, value_estimate, source, owner, notes,
+    `SELECT id, name, company, contact_email, stage, value_estimate, source, owner, owner_user_id, notes,
             created_at, updated_at,
             COALESCE(outreach_status,'pending') AS outreach_status,
             outreach_approved_by, outreach_approved_at, outreach_last_sent_at,
@@ -56,7 +74,7 @@ export async function getLeads(env) {
 
 export async function createLead(env, l) {
   return env.DB.prepare(
-    `INSERT INTO leads (name, company, contact_email, stage, value_estimate, source, owner, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO leads (name, company, contact_email, stage, value_estimate, source, owner, notes, owner_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
   )
     .bind(
       l.name,
@@ -66,9 +84,46 @@ export async function createLead(env, l) {
       l.value_estimate || null,
       l.source || null,
       l.owner || null,
-      l.notes || null
+      l.notes || null,
+      l.owner_user_id || null
     )
     .run();
+}
+
+// Every lead assigned to one account -- the scoped pipeline a coordinator sees.
+// Same column list and ordering as getLeads() so the leads table renders the
+// same way whether it was filtered here or not.
+export async function getLeadsForOwner(env, userId) {
+  const { results } = await env.DB.prepare(
+    `SELECT id, name, company, contact_email, stage, value_estimate, source, owner, owner_user_id, notes,
+            created_at, updated_at,
+            COALESCE(outreach_status,'pending') AS outreach_status,
+            outreach_approved_by, outreach_approved_at, outreach_last_sent_at,
+            call_due_at, call_outcome, call_logged_at, call_logged_by,
+            email_subject, email_body, drafted_at, drafted_by
+     FROM leads WHERE owner_user_id = ?
+     ORDER BY CASE stage WHEN 'won' THEN 1 WHEN 'lost' THEN 1 ELSE 0 END, updated_at DESC`
+  )
+    .bind(userId)
+    .all();
+  return results;
+}
+
+// Assigns (or, with null, unassigns) a lead to an account. This is the only
+// thing that puts a lead into a coordinator's scoped view.
+export async function assignLeadOwner(env, id, ownerUserId) {
+  return env.DB.prepare("UPDATE leads SET owner_user_id = ?, updated_at = datetime('now') WHERE id = ?")
+    .bind(ownerUserId || null, id)
+    .run();
+}
+
+// The accounts a lead can be assigned to. Coordinators only: a lead assigned to
+// a founder is just "unassigned" as far as scoping goes, since founders see all.
+export async function listCoordinators(env) {
+  const { results } = await env.DB.prepare(
+    "SELECT id, name FROM users WHERE role = 'coordinator' ORDER BY name"
+  ).all();
+  return results;
 }
 
 // Both dedupe keys for the importer, fetched once rather than per row: an
@@ -655,7 +710,7 @@ export async function findLeadByEmail(env, email) {
 
 export async function getLeadById(env, id) {
   return env.DB.prepare(
-    `SELECT id, name, company, contact_email, stage, value_estimate, source, owner, notes,
+    `SELECT id, name, company, contact_email, stage, value_estimate, source, owner, owner_user_id, notes,
             created_at, updated_at,
             COALESCE(outreach_status,'pending') AS outreach_status,
             outreach_approved_by, outreach_approved_at, outreach_last_sent_at,
@@ -836,6 +891,54 @@ export async function getCallOutcomeStats(env) {
     `SELECT call_outcome AS outcome, COUNT(*) AS n
        FROM leads WHERE call_outcome IS NOT NULL GROUP BY call_outcome`
   ).all();
+  const by = Object.fromEntries(results.map((r) => [r.outcome, r.n]));
+  const counts = Object.fromEntries(CALL_OUTCOMES.map((o) => [o, by[o] || 0]));
+  counts.comparable = counts.picked_up_cold + counts.replied_first + counts.no_response;
+  return counts;
+}
+
+// The same three call functions, scoped to one account's assigned leads -- what
+// a coordinator's /calls shows. Kept as separate functions rather than an
+// optional argument so a missing filter can never silently widen the queue.
+export async function getCallQueueForOwner(env, userId, limit = 200) {
+  const { results } = await env.DB.prepare(
+    `SELECT l.id, l.name, l.company, l.contact_email, l.stage, l.owner, l.source,
+            l.value_estimate, l.outreach_last_sent_at, l.call_due_at,
+            l.call_due_at <= datetime('now') AS due_now,
+            EXISTS (
+              SELECT 1 FROM outreach_events o
+               WHERE o.lead_id = l.id AND o.kind = 'reply'
+                 AND o.occurred_at >= COALESCE(l.outreach_last_sent_at, '0000')
+            ) AS replied_since_send
+       FROM leads l
+      WHERE l.owner_user_id = ? AND l.call_due_at IS NOT NULL AND l.call_outcome IS NULL
+      ORDER BY l.call_due_at ASC
+      LIMIT ?`
+  )
+    .bind(userId, limit)
+    .all();
+  return results;
+}
+
+export async function countCallQueueForOwner(env, userId) {
+  const row = await env.DB.prepare(
+    `SELECT
+       SUM(call_due_at <= datetime('now')) AS due,
+       SUM(call_due_at >  datetime('now')) AS waiting
+     FROM leads WHERE owner_user_id = ? AND call_due_at IS NOT NULL AND call_outcome IS NULL`
+  )
+    .bind(userId)
+    .first();
+  return { due: row?.due || 0, waiting: row?.waiting || 0 };
+}
+
+export async function getCallOutcomeStatsForOwner(env, userId) {
+  const { results } = await env.DB.prepare(
+    `SELECT call_outcome AS outcome, COUNT(*) AS n
+       FROM leads WHERE owner_user_id = ? AND call_outcome IS NOT NULL GROUP BY call_outcome`
+  )
+    .bind(userId)
+    .all();
   const by = Object.fromEntries(results.map((r) => [r.outcome, r.n]));
   const counts = Object.fromEntries(CALL_OUTCOMES.map((o) => [o, by[o] || 0]));
   counts.comparable = counts.picked_up_cold + counts.replied_first + counts.no_response;
